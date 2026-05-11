@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["telesthete", "telesthete-c", "examples/consumer-rs"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "MIT"
+repository = "https://github.com/Bake-Ware/telesthete"
+authors = ["Bake-Ware <jamixzol@gmail.com>"]
+
+[workspace.dependencies]
+telesthete = { path = "telesthete", version = "0.1" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmp-serde = "1"
+tracing = "0.1"
+thiserror = "2"
+bytes = "1"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand_core = "0.6"
+bitflags = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

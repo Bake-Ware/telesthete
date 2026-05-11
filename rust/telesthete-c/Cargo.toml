@@ -1,0 +1,22 @@
+[package]
+name = "telesthete-c"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "C ABI for the Telesthete v1.1 reference Rust crate. Producers in C/C++ link this cdylib and #include <telesthete.h> instead of re-implementing crypto/framing/SCM_RIGHTS."
+
+[lib]
+name = "telesthete"
+crate-type = ["cdylib", "staticlib"]
+path = "src/lib.rs"
+
+[dependencies]
+telesthete.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+
+[build-dependencies]
+cbindgen = "0.27"

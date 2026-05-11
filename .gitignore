@@ -34,3 +34,11 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Rust
+target/
+**/target/
+*.rs.bk
+
+# C build artifacts
+rust/examples/c-producer/tlt-c-producer

@@ -1,0 +1,29 @@
+[package]
+name = "telesthete"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Telesthete v1.1 reference Rust crate — encrypted P2P transport for window/desktop sharing (AF_UNIX local, UDP planned)."
+
+[dependencies]
+tokio.workspace = true
+bytes.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+rand_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bitflags.workspace = true
+tokio-stream = "0.1"
+nix = { version = "0.30", features = ["socket", "uio", "fs"] }
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = "3"
