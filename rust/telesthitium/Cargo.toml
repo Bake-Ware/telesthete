@@ -1,0 +1,19 @@
+[package]
+name = "telesthitium"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Discovery + relay hub for the Telesthete wire protocol (SPEC §10)."
+
+[[bin]]
+name = "telesthete-hub"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["telesthete", "telesthete-c", "examples/consumer-rs"]
+members = ["telesthete", "telesthete-c", "telesthitium", "examples/consumer-rs"]
 
 [workspace.package]
 version = "0.1.0"

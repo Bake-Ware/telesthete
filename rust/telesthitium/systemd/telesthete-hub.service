@@ -1,0 +1,36 @@
+[Unit]
+Description=Telesthete Hub — discovery + relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=telesthete
+Group=telesthete
+ExecStart=/usr/local/bin/telesthete-hub
+Restart=on-failure
+RestartSec=3s
+Environment=RUST_LOG=info
+Environment=HUB_BIND=0.0.0.0:7474
+
+# Sandboxing
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+AmbientCapabilities=
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
