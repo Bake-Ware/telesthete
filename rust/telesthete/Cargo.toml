@@ -6,12 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Telesthete v1.1 reference Rust crate — encrypted P2P transport for window/desktop sharing (AF_UNIX local, UDP planned)."
+description = "Telesthete v1.2 reference Rust crate — encrypted P2P transport (ChaCha20-Poly1305 / AES-256-GCM, AF_UNIX local, UDP)."
 
 [dependencies]
 tokio.workspace = true
 bytes.workspace = true
 chacha20poly1305.workspace = true
+aes-gcm = "0.10"
 hkdf.workspace = true
 sha2.workspace = true
 rand_core.workspace = true

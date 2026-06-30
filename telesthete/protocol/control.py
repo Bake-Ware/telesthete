@@ -8,6 +8,7 @@ import json
 import time
 import logging
 from typing import Callable, Optional, Dict, Any
+from collections import defaultdict
 from enum import IntEnum
 
 from .framing import pack_control_message, unpack_packet, ChannelType
@@ -58,6 +59,10 @@ class ControlChannel:
         # Keepalive tracking
         self._last_keepalive_sent = 0
         self._keepalive_interval = 5.0  # seconds
+
+        # Replay protection: highest accepted sequence per peer (SPEC §3.3).
+        # Control is monotonic per sender, so a watermark is exact.
+        self._recv_watermark: Dict[tuple, int] = defaultdict(lambda: -1)
 
     def add_destination(self, peer_addr: tuple):
         """Add peer destination"""
@@ -182,11 +187,22 @@ class ControlChannel:
                 logger.warning(f"Wrong channel type: {packet.channel_type}")
                 return
 
+            # Replay protection (SPEC §3.3): reject seq <= high-water mark.
+            if packet.sequence <= self._recv_watermark[peer_addr]:
+                logger.debug(
+                    f"Dropping replayed/stale control packet: seq={packet.sequence}, "
+                    f"watermark={self._recv_watermark[peer_addr]}")
+                return
+
             # Build AAD
             aad = bytes([ChannelType.CONTROL, 0, 0])
 
-            # Decrypt
+            # Decrypt (raises on auth failure -> watermark not advanced, so a
+            # forged high-seq packet cannot wedge the mark)
             message_bytes = self.crypto.decrypt(packet.sequence, packet.ciphertext, aad)
+
+            # Authenticated: advance the watermark.
+            self._recv_watermark[peer_addr] = packet.sequence
 
             # Decode JSON
             message = json.loads(message_bytes.decode('utf-8'))

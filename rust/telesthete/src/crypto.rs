@@ -12,6 +12,7 @@
 //! real AEAD associated data. Must stay byte-identical to the Python
 //! reference — see tests/vectors.json.
 
+use aes_gcm::Aes256Gcm;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key as ChaChaKey, Nonce};
 use hkdf::Hkdf;
@@ -70,10 +71,36 @@ pub fn derive_key(psk: &[u8]) -> Key {
 }
 
 /// Build the 12-byte nonce: 4 zero bytes, then sequence as 8 BE bytes. SPEC §3.2.
-fn nonce_from_seq(seq: u64) -> Nonce {
+fn nonce_bytes(seq: u64) -> [u8; NONCE_LEN] {
     let mut n = [0u8; NONCE_LEN];
     n[4..].copy_from_slice(&seq.to_be_bytes());
-    Nonce::clone_from_slice(&n)
+    n
+}
+
+/// AEAD suites (SPEC §3.2). `ChaCha20Poly1305` is the mandatory baseline;
+/// `Aes256Gcm` is optional. Both share the 12-byte nonce, 3-byte AAD, 16-byte tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Suite {
+    ChaCha20Poly1305,
+    Aes256Gcm,
+}
+
+impl Suite {
+    /// Map a `cipher_id` to a suite (`None` for unknown ids).
+    pub fn from_id(cipher_id: &str) -> Option<Suite> {
+        match cipher_id {
+            "chacha20-poly1305" => Some(Suite::ChaCha20Poly1305),
+            "aes256-gcm" => Some(Suite::Aes256Gcm),
+            _ => None,
+        }
+    }
+    /// The `cipher_id` string used on the wire and in key derivation.
+    pub fn id(self) -> &'static str {
+        match self {
+            Suite::ChaCha20Poly1305 => "chacha20-poly1305",
+            Suite::Aes256Gcm => "aes256-gcm",
+        }
+    }
 }
 
 /// 3-byte AAD: `[channel_type, channel_id_hi, channel_id_lo]`. SPEC §3.2.
@@ -81,45 +108,59 @@ pub fn build_aad(channel_type: u8, channel_id: u16) -> [u8; 3] {
     [channel_type, (channel_id >> 8) as u8, channel_id as u8]
 }
 
-/// Encrypt `plaintext` with the given key + sequence + AAD.
-/// Returns ciphertext + 16-byte Poly1305 tag concatenated.
-pub fn encrypt(
+/// Encrypt under an explicit suite. `key` MUST be derived with the matching
+/// `cipher_id` (`derive_key_for`). Returns ciphertext || 16-byte tag.
+pub fn encrypt_suite(
+    suite: Suite,
     key: &Key,
     seq: u64,
     aad: &[u8; 3],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    let cipher = ChaCha20Poly1305::new(ChaChaKey::from_slice(key));
-    let nonce = nonce_from_seq(seq);
-    cipher
-        .encrypt(
-            &nonce,
-            Payload {
-                msg: plaintext,
-                aad,
-            },
-        )
-        .map_err(|_| CryptoError::Encrypt)
+    let n = nonce_bytes(seq);
+    match suite {
+        Suite::ChaCha20Poly1305 => ChaCha20Poly1305::new(ChaChaKey::from_slice(key))
+            .encrypt(Nonce::from_slice(&n), Payload { msg: plaintext, aad })
+            .map_err(|_| CryptoError::Encrypt),
+        Suite::Aes256Gcm => {
+            let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| CryptoError::Encrypt)?;
+            cipher
+                .encrypt(aes_gcm::Nonce::from_slice(&n), Payload { msg: plaintext, aad })
+                .map_err(|_| CryptoError::Encrypt)
+        }
+    }
 }
 
-/// Decrypt + authenticate. `ciphertext` is body || 16-byte tag.
-pub fn decrypt(
+/// Decrypt + authenticate under an explicit suite. `ciphertext` is body || tag.
+pub fn decrypt_suite(
+    suite: Suite,
     key: &Key,
     seq: u64,
     aad: &[u8; 3],
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    let cipher = ChaCha20Poly1305::new(ChaChaKey::from_slice(key));
-    let nonce = nonce_from_seq(seq);
-    cipher
-        .decrypt(
-            &nonce,
-            Payload {
-                msg: ciphertext,
-                aad,
-            },
-        )
-        .map_err(|_| CryptoError::Decrypt)
+    let n = nonce_bytes(seq);
+    match suite {
+        Suite::ChaCha20Poly1305 => ChaCha20Poly1305::new(ChaChaKey::from_slice(key))
+            .decrypt(Nonce::from_slice(&n), Payload { msg: ciphertext, aad })
+            .map_err(|_| CryptoError::Decrypt),
+        Suite::Aes256Gcm => {
+            let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| CryptoError::Decrypt)?;
+            cipher
+                .decrypt(aes_gcm::Nonce::from_slice(&n), Payload { msg: ciphertext, aad })
+                .map_err(|_| CryptoError::Decrypt)
+        }
+    }
+}
+
+/// Baseline encrypt (`chacha20-poly1305`). SPEC §3.2.
+pub fn encrypt(key: &Key, seq: u64, aad: &[u8; 3], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    encrypt_suite(Suite::ChaCha20Poly1305, key, seq, aad, plaintext)
+}
+
+/// Baseline decrypt (`chacha20-poly1305`). SPEC §3.2.
+pub fn decrypt(key: &Key, seq: u64, aad: &[u8; 3], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    decrypt_suite(Suite::ChaCha20Poly1305, key, seq, aad, ciphertext)
 }
 
 #[cfg(test)]
@@ -207,14 +248,17 @@ mod tests {
             "band_id diverged"
         );
 
-        let key = derive_key_for(psk, "chacha20-poly1305");
-        assert_eq!(
-            to_hex(&key),
-            v["keys"]["chacha20-poly1305"].as_str().unwrap(),
-            "baseline key diverged"
-        );
+        // Per-cipher key derivation (both suites).
+        for (cipher_id, key_hex) in v["keys"].as_object().unwrap() {
+            Suite::from_id(cipher_id).expect("known cipher in vectors");
+            let key = derive_key_for(psk, cipher_id);
+            assert_eq!(to_hex(&key), key_hex.as_str().unwrap(), "key diverged: {cipher_id}");
+        }
 
         for case in v["aead"].as_array().unwrap() {
+            let cipher_id = case["cipher"].as_str().unwrap();
+            let suite = Suite::from_id(cipher_id).expect("known cipher");
+            let key = derive_key_for(psk, cipher_id);
             let seq = case["seq"].as_u64().unwrap();
             let ct = case["channel_type"].as_u64().unwrap() as u8;
             let cid = case["channel_id"].as_u64().unwrap() as u16;
@@ -222,9 +266,13 @@ mod tests {
             assert_eq!(to_hex(&aad), case["aad_hex"].as_str().unwrap());
             let pt = from_hex(case["plaintext_hex"].as_str().unwrap());
             let want = case["ciphertext_hex"].as_str().unwrap();
-            let got = encrypt(&key, seq, &aad, &pt).unwrap();
-            assert_eq!(to_hex(&got), want, "ciphertext diverged at seq={seq}");
-            assert_eq!(decrypt(&key, seq, &aad, &got).unwrap(), pt, "roundtrip seq={seq}");
+            let got = encrypt_suite(suite, &key, seq, &aad, &pt).unwrap();
+            assert_eq!(to_hex(&got), want, "ciphertext diverged: {cipher_id} seq={seq}");
+            assert_eq!(
+                decrypt_suite(suite, &key, seq, &aad, &got).unwrap(),
+                pt,
+                "roundtrip {cipher_id} seq={seq}"
+            );
         }
     }
 }

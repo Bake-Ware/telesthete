@@ -28,10 +28,10 @@ def test_band_id():
     assert crypto.derive_band_id(v["psk"]).hex() == v["band_id_hex"]
 
 
-def test_baseline_key():
+def test_keys():
     v = load()
-    cid = "chacha20-poly1305"
-    assert crypto.derive_encryption_key(v["psk"], cid).hex() == v["keys"][cid]
+    for cipher_id, key_hex in v["keys"].items():
+        assert crypto.derive_encryption_key(v["psk"], cipher_id).hex() == key_hex, cipher_id
 
 
 def test_aead_vectors():
@@ -48,6 +48,6 @@ def test_aead_vectors():
 
 if __name__ == "__main__":
     test_band_id()
-    test_baseline_key()
+    test_keys()
     test_aead_vectors()
-    print("conformance vectors: PASS (Python matches tests/vectors.json)")
+    print("conformance vectors: PASS (Python matches tests/vectors.json — chacha + aes)")

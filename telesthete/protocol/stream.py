@@ -148,14 +148,11 @@ class Stream:
                 logger.warning(f"Wrong stream ID: {packet.channel_id}")
                 return
 
-            # Check high-water mark (drop stale packets)
+            # Check high-water mark (drop stale/replayed packets, SPEC §3.3)
             watermark = self._recv_watermark[peer_addr]
             if packet.sequence <= watermark:
                 logger.debug(f"Dropping stale packet: seq={packet.sequence}, watermark={watermark}")
                 return
-
-            # Update watermark
-            self._recv_watermark[peer_addr] = packet.sequence
 
             # Build AAD for decryption
             aad = bytes([
@@ -164,8 +161,12 @@ class Stream:
                 self.stream_id & 0xFF
             ])
 
-            # Decrypt
+            # Decrypt (raises on auth failure before we advance the watermark,
+            # so a forged high-seq packet cannot wedge the mark)
             payload = self.crypto.decrypt(packet.sequence, packet.ciphertext, aad)
+
+            # Authenticated and fresh: advance the watermark.
+            self._recv_watermark[peer_addr] = packet.sequence
 
             # Extract priority and timestamp
             priority = payload[0]

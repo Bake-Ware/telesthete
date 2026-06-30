@@ -3,6 +3,7 @@
 //! Always reliable. Payload is JSON-encoded `{ "type": <u8>, "payload": {...} }`.
 //! M0 supports HELLO / HELLO_ACK / KEEPALIVE / GOODBYE.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -108,7 +109,17 @@ impl ControlChannel {
         let mut raw = transport.route(ChannelType::Control).await;
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
+            // Replay protection (SPEC §3.3): highest accepted sequence per peer.
+            // Transport already authenticated the packet, so a forged seq never
+            // reaches here; advancing on receipt is safe.
+            let mut watermark: HashMap<SocketAddr, u64> = HashMap::new();
             while let Some(pkt) = raw.recv().await {
+                let seq = pkt.header.sequence;
+                if matches!(watermark.get(&pkt.from), Some(&wm) if seq <= wm) {
+                    debug!("drop replayed/stale control seq={seq} from {}", pkt.from);
+                    continue;
+                }
+                watermark.insert(pkt.from, seq);
                 match serde_json::from_slice::<ControlEnvelope>(&pkt.payload) {
                     Ok(env) => {
                         let event = match env.type_ {
