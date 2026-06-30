@@ -56,6 +56,18 @@ def derive_encryption_key(psk: str, cipher_id: str = BASELINE_CIPHER) -> bytes:
     return okm  # 32 bytes
 
 
+def select_cipher(initiator_prefs, responder_supported) -> str:
+    """Pick the negotiated AEAD suite per SPEC §3.5: the first entry in the
+    *initiator's* ordered preference list that the *responder* also supports.
+    Falls back to the mandatory baseline (which both MUST support), so this
+    never fails."""
+    supported = set(responder_supported)
+    for cid in initiator_prefs:
+        if cid in supported:
+            return cid
+    return BASELINE_CIPHER
+
+
 def build_aad(channel_type: int, channel_id: int) -> bytes:
     """3-byte AAD: [channel_type, channel_id_hi, channel_id_lo]. SPEC §3.2."""
     return bytes([channel_type & 0xFF,

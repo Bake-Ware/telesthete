@@ -12,6 +12,7 @@ from collections import defaultdict
 from enum import IntEnum
 
 from .framing import pack_control_message, unpack_packet, ChannelType
+from .crypto import BASELINE_CIPHER
 
 logger = logging.getLogger(__name__)
 
@@ -34,18 +35,24 @@ class ControlChannel:
     Always reliable (we'll add retransmission later if needed)
     """
 
-    def __init__(self, band_id: bytes, crypto, transport):
+    def __init__(self, band_id: bytes, crypto=None, transport=None, crypto_for=None):
         """
         Initialize control channel
 
         Args:
             band_id: Band identifier
-            crypto: BandCrypto instance
+            crypto: a single BandCrypto (single-cipher / tests)
             transport: UDPTransport instance
+            crypto_for: optional resolver(peer_addr, cipher_id=None) -> BandCrypto
+                for per-peer negotiated ciphers (SPEC §3.5)
         """
         self.band_id = band_id
-        self.crypto = crypto
         self.transport = transport
+        if crypto_for is not None:
+            self._crypto_for = crypto_for
+        else:
+            self._crypto_for = lambda addr, cipher_id=None: crypto
+        self.crypto = crypto
 
         # Sequence number
         self._send_sequence = 0
@@ -88,7 +95,7 @@ class ControlChannel:
             self._handlers[msg_type] = []
         self._handlers[msg_type].append(handler)
 
-    def send_message(self, msg_type: ControlMessageType, payload: Dict[str, Any], dest: Optional[tuple] = None):
+    def send_message(self, msg_type: ControlMessageType, payload: Dict[str, Any], dest: Optional[tuple] = None, baseline: bool = False):
         """
         Send a control message
 
@@ -98,47 +105,48 @@ class ControlChannel:
             dest: Specific destination, or None to broadcast to all peers
         """
 
-        # Increment sequence
+        # Increment sequence (shared across destinations)
         sequence = self._send_sequence
         self._send_sequence += 1
 
-        # Build message
         message = {
             "type": int(msg_type),
             "timestamp": int(time.time() * 1000),
             "payload": payload
         }
-
-        # Encode as JSON
         message_bytes = json.dumps(message).encode('utf-8')
-
-        # AAD for AEAD
         aad = bytes([ChannelType.CONTROL, 0, 0])
 
-        # Encrypt
-        ciphertext = self.crypto.encrypt(sequence, message_bytes, aad)
-
-        # Pack
-        packet = pack_control_message(self.band_id, sequence, ciphertext)
-
-        # Send
-        destinations = [dest] if dest else self._destinations
+        # HELLO/HELLO_ACK bootstrap on the baseline suite (SPEC §3.5); all
+        # other messages use each peer's negotiated suite. Encrypt per
+        # destination because peers may have negotiated different ciphers.
+        cipher_id = BASELINE_CIPHER if baseline else None
+        destinations = [dest] if dest else list(self._destinations)
         for d in destinations:
+            crypto = self._crypto_for(d, cipher_id)
+            ciphertext = crypto.encrypt(sequence, message_bytes, aad)
+            packet = pack_control_message(self.band_id, sequence, ciphertext)
             self.transport.send(d, packet)
 
-    def send_hello(self, hostname: str, dest: tuple):
-        """
-        Send HELLO to a peer
+    def send_hello(self, hostname: str, dest: tuple,
+                   capabilities=None, ciphers=None):
+        """Send HELLO with mandatory capabilities + ordered ciphers (SPEC §4.3).
+        Always on the baseline suite."""
+        self.send_message(ControlMessageType.HELLO, {
+            "hostname": hostname,
+            "capabilities": capabilities or [],
+            "ciphers": ciphers or [BASELINE_CIPHER],
+        }, dest, baseline=True)
 
-        Args:
-            hostname: This machine's hostname
-            dest: Peer address
-        """
-        self.send_message(ControlMessageType.HELLO, {"hostname": hostname}, dest)
-
-    def send_hello_ack(self, hostname: str, dest: tuple):
-        """Send HELLO_ACK to a peer"""
-        self.send_message(ControlMessageType.HELLO_ACK, {"hostname": hostname}, dest)
+    def send_hello_ack(self, hostname: str, dest: tuple,
+                       capabilities=None, ciphers=None, cipher=None):
+        """Send HELLO_ACK committing the negotiated `cipher` (SPEC §4.4)."""
+        self.send_message(ControlMessageType.HELLO_ACK, {
+            "hostname": hostname,
+            "capabilities": capabilities or [],
+            "ciphers": ciphers or [BASELINE_CIPHER],
+            "cipher": cipher or BASELINE_CIPHER,
+        }, dest, baseline=True)
 
     def send_keepalive(self):
         """Send keepalive to all peers"""
@@ -169,6 +177,18 @@ class ControlChannel:
         """Send goodbye before disconnect"""
         self.send_message(ControlMessageType.GOODBYE, {})
 
+    def _decrypt_control(self, peer_addr: tuple, sequence: int, ciphertext: bytes, aad: bytes) -> bytes:
+        """Decrypt with the peer's negotiated suite, falling back to baseline
+        (HELLO/HELLO_ACK always use baseline). Raises if both fail."""
+        negotiated = self._crypto_for(peer_addr)
+        try:
+            return negotiated.decrypt(sequence, ciphertext, aad)
+        except Exception:
+            baseline = self._crypto_for(peer_addr, BASELINE_CIPHER)
+            if baseline is negotiated:
+                raise
+            return baseline.decrypt(sequence, ciphertext, aad)
+
     def handle_packet(self, peer_addr: tuple, packet_bytes: bytes):
         """
         Handle received control packet
@@ -197,9 +217,10 @@ class ControlChannel:
             # Build AAD
             aad = bytes([ChannelType.CONTROL, 0, 0])
 
-            # Decrypt (raises on auth failure -> watermark not advanced, so a
-            # forged high-seq packet cannot wedge the mark)
-            message_bytes = self.crypto.decrypt(packet.sequence, packet.ciphertext, aad)
+            # Decrypt with negotiated suite, baseline fallback (SPEC §3.5).
+            # Raises on auth failure -> watermark not advanced, so a forged
+            # high-seq packet cannot wedge the mark.
+            message_bytes = self._decrypt_control(peer_addr, packet.sequence, packet.ciphertext, aad)
 
             # Authenticated: advance the watermark.
             self._recv_watermark[peer_addr] = packet.sequence

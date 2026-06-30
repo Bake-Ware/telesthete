@@ -108,6 +108,19 @@ pub fn build_aad(channel_type: u8, channel_id: u16) -> [u8; 3] {
     [channel_type, (channel_id >> 8) as u8, channel_id as u8]
 }
 
+/// Pick the negotiated AEAD suite per SPEC §3.5: the first entry in the
+/// *initiator's* ordered preference list that the *responder* also supports.
+/// Falls back to the mandatory baseline (both MUST support it), so it never
+/// fails. Mirrors `telesthete.protocol.crypto.select_cipher`.
+pub fn select_cipher(initiator_prefs: &[String], responder_supported: &[String]) -> String {
+    for cid in initiator_prefs {
+        if responder_supported.iter().any(|s| s == cid) {
+            return cid.clone();
+        }
+    }
+    BASELINE_CIPHER.to_string()
+}
+
 /// Encrypt under an explicit suite. `key` MUST be derived with the matching
 /// `cipher_id` (`derive_key_for`). Returns ciphertext || 16-byte tag.
 pub fn encrypt_suite(

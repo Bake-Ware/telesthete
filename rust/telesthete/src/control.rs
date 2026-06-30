@@ -22,14 +22,17 @@ pub const TYPE_FOCUS_CHANGE: u8 = 0x04;
 pub const TYPE_METACONTROL: u8 = 0x05;
 pub const TYPE_GOODBYE: u8 = 0x06;
 
-/// Capability strings advertised in HELLO / HELLO_ACK per Telesthete v1.1
-/// §12.5. Forward-compatible: peers ignore unknown capabilities, and a
-/// peer that omits the field is treated as an empty list (i.e. v1.0).
+/// Capability strings advertised in HELLO / HELLO_ACK per Telesthete §12.5.
+/// As of v1.2 capability announce is mandatory; unknown capabilities are
+/// still ignored (forward-compatible).
 pub mod capability {
     pub const DMABUF_V1: &str = "dmabuf-v1";
     pub const AF_UNIX: &str = "af-unix";
     pub const SYNC_FILE: &str = "sync-file";
     pub const REUSE_V1: &str = "reuse-v1";
+    pub const WEBTRANSPORT: &str = "webtransport";
+    pub const KEYFRAME_REQ: &str = "keyframe-req";
+    pub const RATE_HINT: &str = "rate-hint";
 }
 
 /// Sentinel PSK for the local trust profile (v1.1 §3.4). Cleartext on
@@ -48,17 +51,24 @@ pub enum ControlError {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Hello {
     pub hostname: String,
-    /// Telesthete v1.1 §12.5. Omitted on the wire when empty so v1.0
-    /// peers parse without complaint.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Mandatory as of v1.2 (§12.5). `default` on parse for robustness.
+    #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Ordered AEAD preference list (§3.5). MUST include the baseline.
+    #[serde(default)]
+    pub ciphers: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct HelloAck {
     pub hostname: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub ciphers: Vec<String>,
+    /// Committed negotiated suite, chosen by the responder (§3.5).
+    #[serde(default)]
+    pub cipher: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -73,11 +83,14 @@ pub enum ControlEvent {
         from: SocketAddr,
         hostname: String,
         capabilities: Vec<String>,
+        ciphers: Vec<String>,
     },
     HelloAck {
         from: SocketAddr,
         hostname: String,
         capabilities: Vec<String>,
+        ciphers: Vec<String>,
+        cipher: String,
     },
     Keepalive {
         from: SocketAddr,
@@ -128,6 +141,7 @@ impl ControlChannel {
                                     from: pkt.from,
                                     hostname: h.hostname,
                                     capabilities: h.capabilities,
+                                    ciphers: h.ciphers,
                                 },
                                 Err(e) => {
                                     debug!("bad HELLO: {e}");
@@ -140,6 +154,8 @@ impl ControlChannel {
                                     from: pkt.from,
                                     hostname: h.hostname,
                                     capabilities: h.capabilities,
+                                    ciphers: h.ciphers,
+                                    cipher: h.cipher,
                                 },
                                 Err(e) => {
                                     debug!("bad HELLO_ACK: {e}");
@@ -169,16 +185,20 @@ impl ControlChannel {
         }
     }
 
+    /// Send a HELLO with baseline-only ciphers and no extra capabilities.
     pub async fn send_hello(&self, peer: SocketAddr, hostname: &str) -> Result<(), ControlError> {
-        self.send_hello_with_caps(peer, hostname, &[]).await
+        self.send_hello_full(peer, hostname, &[], &[crate::crypto::BASELINE_CIPHER])
+            .await
     }
 
-    /// v1.1 §12.5: send a HELLO advertising capability strings.
-    pub async fn send_hello_with_caps(
+    /// v1.2 §3.5/§12.5: HELLO advertising capabilities + ordered ciphers
+    /// (which MUST include the baseline).
+    pub async fn send_hello_full(
         &self,
         peer: SocketAddr,
         hostname: &str,
         capabilities: &[&str],
+        ciphers: &[&str],
     ) -> Result<(), ControlError> {
         self.send_typed(
             peer,
@@ -186,24 +206,36 @@ impl ControlChannel {
             &Hello {
                 hostname: hostname.into(),
                 capabilities: capabilities.iter().map(|s| (*s).to_string()).collect(),
+                ciphers: ciphers.iter().map(|s| (*s).to_string()).collect(),
             },
         )
         .await
     }
 
+    /// Send a HELLO_ACK committing the baseline suite.
     pub async fn send_hello_ack(
         &self,
         peer: SocketAddr,
         hostname: &str,
     ) -> Result<(), ControlError> {
-        self.send_hello_ack_with_caps(peer, hostname, &[]).await
+        self.send_hello_ack_full(
+            peer,
+            hostname,
+            &[],
+            &[crate::crypto::BASELINE_CIPHER],
+            crate::crypto::BASELINE_CIPHER,
+        )
+        .await
     }
 
-    pub async fn send_hello_ack_with_caps(
+    /// v1.2 §3.5: HELLO_ACK committing the negotiated `cipher`.
+    pub async fn send_hello_ack_full(
         &self,
         peer: SocketAddr,
         hostname: &str,
         capabilities: &[&str],
+        ciphers: &[&str],
+        cipher: &str,
     ) -> Result<(), ControlError> {
         self.send_typed(
             peer,
@@ -211,6 +243,8 @@ impl ControlChannel {
             &HelloAck {
                 hostname: hostname.into(),
                 capabilities: capabilities.iter().map(|s| (*s).to_string()).collect(),
+                ciphers: ciphers.iter().map(|s| (*s).to_string()).collect(),
+                cipher: cipher.into(),
             },
         )
         .await
@@ -256,46 +290,59 @@ impl ControlChannel {
 mod tests {
     use super::*;
 
-    #[test]
-    fn hello_omits_capabilities_when_empty() {
-        // v1.0 wire compat: a v1.0 peer parses {"hostname": "x"} only.
-        let h = Hello {
-            hostname: "alice".into(),
-            capabilities: Vec::new(),
-        };
-        let json = serde_json::to_string(&h).unwrap();
-        assert_eq!(json, r#"{"hostname":"alice"}"#);
-    }
+    use crate::crypto::select_cipher;
 
     #[test]
-    fn hello_includes_capabilities_when_set() {
+    fn hello_serializes_capabilities_and_ciphers() {
         let h = Hello {
             hostname: "alice".into(),
-            capabilities: vec![capability::DMABUF_V1.into(), capability::AF_UNIX.into()],
+            capabilities: vec![capability::AF_UNIX.into(), capability::WEBTRANSPORT.into()],
+            ciphers: vec!["aes256-gcm".into(), "chacha20-poly1305".into()],
         };
-        let json = serde_json::to_string(&h).unwrap();
-        let parsed: Hello = serde_json::from_str(&json).unwrap();
+        let parsed: Hello = serde_json::from_str(&serde_json::to_string(&h).unwrap()).unwrap();
         assert_eq!(parsed.hostname, "alice");
         assert_eq!(parsed.capabilities, h.capabilities);
+        assert_eq!(parsed.ciphers, h.ciphers);
     }
 
     #[test]
-    fn hello_parses_v1_0_payload() {
-        // v1.1 peer must accept v1.0 HELLO (no `capabilities` field).
-        let v1_0_json = r#"{"hostname":"bob"}"#;
-        let parsed: Hello = serde_json::from_str(v1_0_json).unwrap();
+    fn hello_parse_tolerates_missing_fields() {
+        // serde(default) keeps parsing robust to a minimal payload.
+        let parsed: Hello = serde_json::from_str(r#"{"hostname":"bob"}"#).unwrap();
         assert_eq!(parsed.hostname, "bob");
         assert!(parsed.capabilities.is_empty());
+        assert!(parsed.ciphers.is_empty());
     }
 
     #[test]
     fn hello_ignores_unknown_capabilities() {
-        let json = r#"{"hostname":"x","capabilities":["something-weird","dmabuf-v1"]}"#;
+        let json =
+            r#"{"hostname":"x","capabilities":["weird","dmabuf-v1"],"ciphers":["chacha20-poly1305"]}"#;
         let parsed: Hello = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.capabilities.len(), 2);
-        assert!(parsed
-            .capabilities
-            .iter()
-            .any(|c| c == capability::DMABUF_V1));
+        assert!(parsed.capabilities.iter().any(|c| c == capability::DMABUF_V1));
+    }
+
+    #[test]
+    fn hello_ack_carries_committed_cipher() {
+        let a = HelloAck {
+            hostname: "b".into(),
+            capabilities: vec![],
+            ciphers: vec!["chacha20-poly1305".into()],
+            cipher: "aes256-gcm".into(),
+        };
+        let parsed: HelloAck = serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
+        assert_eq!(parsed.cipher, "aes256-gcm");
+    }
+
+    #[test]
+    fn select_cipher_matches_spec() {
+        let aes = "aes256-gcm".to_string();
+        let cha = "chacha20-poly1305".to_string();
+        // initiator's top mutually-supported choice
+        assert_eq!(select_cipher(&[aes.clone(), cha.clone()], &[cha.clone(), aes.clone()]), aes);
+        assert_eq!(select_cipher(&[cha.clone(), aes.clone()], &[cha.clone(), aes.clone()]), cha);
+        // no overlap -> baseline
+        assert_eq!(select_cipher(&[aes.clone()], &[cha.clone()]), cha);
     }
 }

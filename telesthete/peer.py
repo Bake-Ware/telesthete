@@ -36,6 +36,11 @@ class Peer:
         # Peer capabilities/settings
         self.settings: Dict[str, Any] = {}
 
+        # Negotiated state (SPEC §3.5, §12.5). `cipher` is None until the
+        # handshake commits one; callers treat None as the baseline.
+        self.capabilities: list = []
+        self.cipher: Optional[str] = None
+
         # Focus state
         self.has_focus = False
 

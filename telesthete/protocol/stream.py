@@ -27,9 +27,10 @@ class Stream:
         self,
         band_id: bytes,
         stream_id: int,
-        crypto,
-        transport,
-        priority: int = 128
+        crypto=None,
+        transport=None,
+        priority: int = 128,
+        crypto_for=None
     ):
         """
         Initialize a Stream
@@ -37,12 +38,18 @@ class Stream:
         Args:
             band_id: Band identifier (16 bytes)
             stream_id: Stream identifier (0-65535)
-            crypto: BandCrypto instance for encryption
+            crypto: a single BandCrypto (single-cipher / tests)
             transport: UDPTransport instance for sending
             priority: Priority level (0 = highest, 255 = lowest)
+            crypto_for: optional resolver(peer_addr, cipher_id=None) -> BandCrypto
+                for per-peer negotiated ciphers (SPEC §3.5)
         """
         self.band_id = band_id
         self.stream_id = stream_id
+        if crypto_for is not None:
+            self._crypto_for = crypto_for
+        else:
+            self._crypto_for = lambda addr, cipher_id=None: crypto
         self.crypto = crypto
         self.transport = transport
         self.priority = priority
@@ -105,14 +112,12 @@ class Stream:
         timestamp = int(time.time() * 1000) & 0xFFFFFFFF  # 32-bit milliseconds
         payload = bytes([self.priority]) + timestamp.to_bytes(4, 'big') + data
 
-        # Encrypt
-        ciphertext = self.crypto.encrypt(sequence, payload, aad)
-
-        # Pack
-        packet = pack_stream_message(self.band_id, self.stream_id, sequence, ciphertext)
-
-        # Send to all destinations
+        # Encrypt per destination under that peer's negotiated suite (SPEC §3.5)
+        # and send. Sequence is shared across destinations.
         for dest in self._destinations:
+            crypto = self._crypto_for(dest)
+            ciphertext = crypto.encrypt(sequence, payload, aad)
+            packet = pack_stream_message(self.band_id, self.stream_id, sequence, ciphertext)
             self.transport.send(dest, packet)
 
     def on_receive(self, callback: Callable[[bytes, tuple, int], None]):
@@ -161,9 +166,10 @@ class Stream:
                 self.stream_id & 0xFF
             ])
 
-            # Decrypt (raises on auth failure before we advance the watermark,
-            # so a forged high-seq packet cannot wedge the mark)
-            payload = self.crypto.decrypt(packet.sequence, packet.ciphertext, aad)
+            # Decrypt under the sender's negotiated suite (raises on auth
+            # failure before we advance the watermark, so a forged high-seq
+            # packet cannot wedge the mark)
+            payload = self._crypto_for(peer_addr).decrypt(packet.sequence, packet.ciphertext, aad)
 
             # Authenticated and fresh: advance the watermark.
             self._recv_watermark[peer_addr] = packet.sequence

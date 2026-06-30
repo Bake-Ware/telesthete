@@ -9,7 +9,7 @@ import logging
 import socket
 from typing import Optional, Dict, Callable, List
 
-from .protocol.crypto import BandCrypto
+from .protocol.crypto import BandCrypto, select_cipher, BASELINE_CIPHER
 from .protocol.stream import Stream
 from .protocol.control import ControlChannel, ControlMessageType
 from .protocol.framing import ChannelType
@@ -31,7 +31,9 @@ class Band:
         psk: str,
         hostname: Optional[str] = None,
         bind_address: str = "0.0.0.0",
-        bind_port: int = 9999
+        bind_port: int = 9999,
+        capabilities: Optional[List[str]] = None,
+        ciphers: Optional[List[str]] = None
     ):
         """
         Initialize a Band
@@ -41,21 +43,32 @@ class Band:
             hostname: This machine's hostname (auto-detected if None)
             bind_address: Address to bind UDP socket
             bind_port: Port to bind UDP socket
+            capabilities: capability strings to advertise (SPEC §12.5)
+            ciphers: ordered AEAD preference list (SPEC §3.5); baseline is
+                always included
         """
         self.psk = psk
         self.hostname = hostname or socket.gethostname()
         self.bind_address = bind_address
         self.bind_port = bind_port
 
-        # Crypto
-        self.crypto = BandCrypto(psk)
+        # Capabilities + ordered cipher preferences (SPEC §3.5, §12.5).
+        self.capabilities = list(capabilities) if capabilities else []
+        self.ciphers = list(ciphers) if ciphers else [BASELINE_CIPHER]
+        if BASELINE_CIPHER not in self.ciphers:
+            self.ciphers.append(BASELINE_CIPHER)  # baseline is mandatory
+
+        # Per-cipher BandCrypto cache (band_id is cipher-independent).
+        self._cryptos: Dict[str, BandCrypto] = {}
+        self.crypto = self._crypto_for_cipher(BASELINE_CIPHER)
         self.band_id = self.crypto.band_id
 
         # Transport
         self.transport = UDPTransport(bind_address, bind_port)
 
-        # Control channel
-        self.control = ControlChannel(self.band_id, self.crypto, self.transport)
+        # Control channel (per-peer negotiated cipher resolver)
+        self.control = ControlChannel(self.band_id, transport=self.transport,
+                                      crypto_for=self.crypto_for_peer)
 
         # Peers
         self.peers: Dict[tuple, Peer] = {}
@@ -70,6 +83,21 @@ class Band:
 
         # Register transport handlers
         self._setup_handlers()
+
+    def _crypto_for_cipher(self, cipher_id: str) -> BandCrypto:
+        c = self._cryptos.get(cipher_id)
+        if c is None:
+            c = BandCrypto(self.psk, cipher_id)
+            self._cryptos[cipher_id] = c
+        return c
+
+    def crypto_for_peer(self, peer_addr: tuple, cipher_id: Optional[str] = None) -> BandCrypto:
+        """Resolve the BandCrypto for a peer's negotiated suite (SPEC §3.5).
+        `cipher_id` overrides (used for the baseline HELLO bootstrap)."""
+        if cipher_id is None:
+            peer = self.peers.get(peer_addr)
+            cipher_id = peer.cipher if (peer and peer.cipher) else BASELINE_CIPHER
+        return self._crypto_for_cipher(cipher_id)
 
     def _setup_handlers(self):
         """Setup packet handlers for transport"""
@@ -113,42 +141,40 @@ class Band:
         self.control.register_handler(ControlMessageType.KEEPALIVE, self._on_keepalive)
         self.control.register_handler(ControlMessageType.GOODBYE, self._on_goodbye)
 
-    def _on_hello(self, peer_addr: tuple, payload: dict):
-        """Handle HELLO from peer"""
-        hostname = payload.get("hostname", str(peer_addr))
-
-        if peer_addr not in self.peers:
-            logger.info(f"New peer joined: {hostname} at {peer_addr}")
+    def _ensure_peer(self, peer_addr: tuple, hostname: str) -> Peer:
+        peer = self.peers.get(peer_addr)
+        if peer is None:
+            logger.info(f"Peer joined: {hostname} at {peer_addr}")
             peer = Peer(peer_addr, hostname)
             self.peers[peer_addr] = peer
-
-            # Add to control destinations
             self.control.add_destination(peer_addr)
-
-            # Add to all stream destinations
             for stream in self.streams.values():
                 stream.add_destination(peer_addr)
+        return peer
 
-            # Send HELLO_ACK
-            self.control.send_hello_ack(self.hostname, peer_addr)
-        else:
-            self.peers[peer_addr].update_last_seen()
+    def _on_hello(self, peer_addr: tuple, payload: dict):
+        """Handle HELLO: as responder, select the cipher and commit it (§3.5)."""
+        hostname = payload.get("hostname", str(peer_addr))
+        init_ciphers = payload.get("ciphers", [BASELINE_CIPHER])
+        selected = select_cipher(init_ciphers, self.ciphers)
+
+        peer = self._ensure_peer(peer_addr, hostname)
+        peer.capabilities = payload.get("capabilities", [])
+        peer.cipher = selected
+        peer.update_last_seen()
+
+        # Commit the negotiated suite back to the initiator.
+        self.control.send_hello_ack(self.hostname, peer_addr,
+                                    capabilities=self.capabilities,
+                                    ciphers=self.ciphers, cipher=selected)
 
     def _on_hello_ack(self, peer_addr: tuple, payload: dict):
-        """Handle HELLO_ACK from peer"""
+        """Handle HELLO_ACK: adopt the cipher the responder committed (§3.5)."""
         hostname = payload.get("hostname", str(peer_addr))
-
-        if peer_addr not in self.peers:
-            logger.info(f"Peer ack: {hostname} at {peer_addr}")
-            peer = Peer(peer_addr, hostname)
-            self.peers[peer_addr] = peer
-
-            # Add to control destinations
-            self.control.add_destination(peer_addr)
-
-            # Add to all stream destinations
-            for stream in self.streams.values():
-                stream.add_destination(peer_addr)
+        peer = self._ensure_peer(peer_addr, hostname)
+        peer.capabilities = payload.get("capabilities", [])
+        peer.cipher = payload.get("cipher", BASELINE_CIPHER)
+        peer.update_last_seen()
 
     def _on_keepalive(self, peer_addr: tuple, payload: dict):
         """Handle KEEPALIVE from peer"""
@@ -193,8 +219,9 @@ class Band:
         if stream_id in self.streams:
             return self.streams[stream_id]
 
-        # Create new stream
-        stream = Stream(self.band_id, stream_id, self.crypto, self.transport, priority)
+        # Create new stream (per-peer negotiated cipher resolver)
+        stream = Stream(self.band_id, stream_id, transport=self.transport,
+                        priority=priority, crypto_for=self.crypto_for_peer)
 
         # Add all current peers as destinations
         for peer_addr in self.peers.keys():
@@ -215,8 +242,9 @@ class Band:
         """
         peer_addr = (host, port)
 
-        # Send HELLO
-        self.control.send_hello(self.hostname, peer_addr)
+        # Send HELLO advertising our capabilities + ordered ciphers (§3.5)
+        self.control.send_hello(self.hostname, peer_addr,
+                                capabilities=self.capabilities, ciphers=self.ciphers)
         logger.info(f"Connecting to peer at {peer_addr}")
 
     def get_peers(self) -> List[Peer]:

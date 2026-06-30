@@ -95,7 +95,11 @@ impl Band {
         use crate::transport::Outbound;
         let env = serde_json::json!({
             "type": TYPE_HELLO,
-            "payload": Hello { hostname: self.hostname.clone(), capabilities: Vec::new() }
+            "payload": Hello {
+                hostname: self.hostname.clone(),
+                capabilities: Vec::new(),
+                ciphers: vec![crate::crypto::BASELINE_CIPHER.to_string()],
+            }
         });
         let bytes = serde_json::to_vec(&env).map_err(crate::control::ControlError::from)?;
         self.transport
