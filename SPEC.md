@@ -45,7 +45,7 @@ Every Telesthete packet on the wire has the same outer frame:
 | 16     | 1 B     | `channel_type` | uint8          | Cleartext. Multiplexing selector.    |
 | 17     | 2 B     | `channel_id`   | uint16 BE      | Cleartext. Sub-channel identifier.   |
 | 19     | 8 B     | `sequence`     | uint64 BE      | Cleartext. Monotonic per-sender. Also used as AEAD nonce. |
-| 27     | var     | `ciphertext`   | XChaCha20-Poly1305 output | Encrypted payload + 16-byte auth tag. |
+| 27     | var     | `ciphertext`   | AEAD suite output (§3.2) | Encrypted payload + 16-byte auth tag. |
 
 **Header size:** 27 bytes fixed.
 **Minimum packet size:** 27 (header) + 16 (auth tag) + 0 (empty payload) = 43 bytes.
@@ -83,44 +83,78 @@ All derived from a single Pre-Shared Key (PSK) string.
 
 ```
 band_id = SHA256(PSK)[:16]                          # 16 bytes, cleartext routing
-key     = HKDF-SHA256(salt="telesthete-v1",          # 32 bytes, encryption key
+key     = HKDF-SHA256(salt="telesthete-v1",          # 32 bytes, per-cipher key
                        ikm=PSK,
-                       info="encryption")
+                       info="encryption-" + cipher_id)
 ```
 
-Both peers with the same PSK derive identical `band_id` and `key`.
-The relay (Telesthetium) sees `band_id` for routing but never possesses
-the PSK and cannot decrypt traffic.
+`cipher_id` is the negotiated AEAD suite name (§3.2, e.g.
+`"chacha20-poly1305"` or `"aes256-gcm"`). Binding key derivation to the
+cipher means the ChaCha key and the AES key are distinct 32-byte values,
+so a packet under one suite can never be confused with another on the
+same band. `band_id` does **not** depend on the cipher — it is constant
+per PSK, so the hub routes regardless of which suite a pair negotiates.
+
+Both peers with the same PSK and the same negotiated cipher derive
+identical `key`. The relay (Telesthetium) sees `band_id` for routing but
+never possesses the PSK and cannot decrypt traffic.
 
 ### 3.2 AEAD Construction
 
-**Algorithm:** XChaCha20-Poly1305
+**Algorithm:** a negotiated AEAD suite (§3.5). Every conformant peer
+MUST implement the baseline; the rest are optional:
 
-**Nonce:** 24 bytes. Constructed from the 64-bit `sequence` number,
-zero-padded on the left:
+| `cipher_id`         | Algorithm                          | Status             |
+|---------------------|------------------------------------|--------------------|
+| `chacha20-poly1305` | ChaCha20-Poly1305 (IETF, RFC 8439) | MANDATORY baseline |
+| `aes256-gcm`        | AES-256-GCM                        | OPTIONAL           |
+
+All suites share the same nonce, AAD, and 16-byte tag, so they are
+drop-in for one another — only the cipher core differs. ChaCha20-Poly1305
+is the baseline because it is the universal *software* AEAD (constant-time
+everywhere, no hardware dependency, embedded-friendly, an IETF standard).
+`aes256-gcm` is offered for peers that prefer a hardware-accelerated
+(AES-NI) or browser-native (WebCrypto) path. New suites may be added to
+the registry without a wire change; they are reached by capability (§12.5).
+
+**Nonce:** 12 bytes (96 bits — the size both suites use). Constructed
+from the 64-bit `sequence` number, zero-padded on the left:
 
 ```
-nonce = 0x0000000000000000 || 0x0000000000000000 || sequence(8 bytes BE)
-        ^^^^^^^^^^^^^^^^     ^^^^^^^^^^^^^^^^     ^^^^^^^^^^^^^^^^^^
-        8 bytes zero         8 bytes zero         8 bytes sequence
+nonce = 0x00000000 || sequence(8 bytes BE)
+        ^^^^^^^^^^     ^^^^^^^^^^^^^^^^^^
+        4 bytes zero   8 bytes sequence
 ```
+
+A 96-bit nonce holds the monotonic 64-bit sequence with room to spare and
+never repeats, so no extended-nonce (XChaCha-style) construction is needed
+— Telesthete never uses random nonces.
 
 **Associated Authenticated Data (AAD):** 3 bytes, not encrypted but
-authenticated:
+authenticated. It is passed to the cipher's real AAD parameter, NOT
+prepended to the plaintext:
 
 ```
 AAD = [channel_type (1B)] [channel_id high byte] [channel_id low byte]
 ```
 
-**Ciphertext output:** Encrypted plaintext + 16-byte Poly1305 auth tag.
+**Ciphertext output:** Encrypted plaintext + a 16-byte auth tag
+(Poly1305 for ChaCha20-Poly1305, GMAC for AES-256-GCM).
 
 ### 3.3 Security Notes
 
 - Sequence numbers MUST be monotonically increasing per sender per Band.
-  Reuse of a sequence number with the same key breaks XChaCha20-Poly1305 security.
+  Reuse of a sequence number with the same key is catastrophic for any
+  AEAD (both ChaCha20-Poly1305 and AES-256-GCM).
 - The 64-bit sequence space (2^64 packets) is effectively inexhaustible.
-- Receivers SHOULD reject packets with sequence numbers at or below
-  their high-water mark to prevent replay.
+- Receivers **MUST** reject packets whose sequence number is at or below
+  the per-(peer, channel_type, channel_id) high-water mark, and advance
+  the mark on each accepted packet. This is replay protection; it is the
+  same freshness mechanism Streams use (§5.2). *(SHOULD → MUST in v1.2.)*
+- Cipher negotiation (§3.5) is downgrade-resistant: HELLO/HELLO_ACK are
+  encrypted under the mandatory baseline key, which an attacker without
+  the PSK cannot forge or tamper. Telesthete has no anonymous key
+  exchange, so the classic TLS downgrade attacks do not apply.
 
 ### 3.4 Local crypto profile (v1.1)
 
@@ -134,8 +168,41 @@ process with the same fixed PSK can spoof. The kernel's filesystem
 permissions on the AF_UNIX socket path (§9.4) are the real access
 control.
 
-XChaCha20-Poly1305 of a 32-byte descriptor is ≤1 µs on a Cortex-A53.
+ChaCha20-Poly1305 of a 32-byte descriptor is ≤1 µs on a Cortex-A53.
 Carving a separate "no-crypto" lane is not justified by profiling.
+
+### 3.5 Cipher negotiation (v1.2)
+
+The AEAD suite is negotiated **end-to-end per peer-pair** via the
+mandatory capability handshake (§4.3, §12.5). It is NOT a per-transport
+or per-hop property: the hub relays opaque ciphertext between peers that
+may be on different transports and never decrypts, so both endpoints of a
+conversation must share one suite.
+
+Rules:
+
+1. **Bootstrap.** HELLO and HELLO_ACK are ALWAYS encrypted with the
+   mandatory baseline (`chacha20-poly1305`), so first contact always
+   succeeds.
+2. **Advertise.** Each peer's HELLO/HELLO_ACK carries an ordered
+   `ciphers` list (highest preference first). It MUST contain
+   `chacha20-poly1305`. A peer orders the list by what is best on its
+   platform/transport — a browser/WebCrypto or AES-NI peer puts
+   `aes256-gcm` first; an embedded peer puts `chacha20-poly1305` first.
+   This is how "AES on the browser side, ChaCha elsewhere" emerges
+   without binding a cipher to a transport.
+3. **Select.** The chosen suite is the first entry in the *initiator's*
+   `ciphers` list that the *responder* also lists. The responder echoes
+   the chosen `cipher_id` in HELLO_ACK (`cipher` field) to commit it. If
+   there is no overlap beyond the baseline, the baseline is used — it is
+   mandatory, so selection never fails.
+4. **Apply.** Every packet after the handshake completes uses the
+   selected suite and its derived key (§3.1). Selection is session state
+   per (peer, band); there is **no cipher identifier on the wire**,
+   keeping the frame header and minimal clients simple.
+
+A minimal client MAY implement only the baseline: it advertises
+`["chacha20-poly1305"]` and interoperates with everyone.
 
 ---
 
@@ -174,19 +241,30 @@ older peer silently drops them rather than erroring.
 ### 4.3 HELLO (0x01)
 
 ```json
-{"type": 1, "payload": {"hostname": "machine-name", "capabilities": ["..."]}}
+{"type": 1, "payload": {"hostname": "machine-name",
+                         "capabilities": ["af-unix", "webtransport"],
+                         "ciphers": ["aes256-gcm", "chacha20-poly1305"]}}
 ```
 
-The `capabilities` field is **optional** (added in v1.1). When absent,
-the peer is treated as v1.0. See §12.5.
+`capabilities` and `ciphers` are **mandatory** as of v1.2 — capability
+announce is foundational (§12.5). `ciphers` is an ordered preference list
+and MUST contain the baseline `chacha20-poly1305` (§3.5). HELLO itself is
+always encrypted with the baseline suite. A peer that omits these fields
+is non-conformant.
 
 ### 4.4 HELLO_ACK (0x02)
 
 ```json
-{"type": 2, "payload": {"hostname": "responder-name", "capabilities": ["..."]}}
+{"type": 2, "payload": {"hostname": "responder-name",
+                         "capabilities": ["..."],
+                         "ciphers": ["..."],
+                         "cipher": "aes256-gcm"}}
 ```
 
-`capabilities` field semantics match §4.3.
+`capabilities` and `ciphers` semantics match §4.3 (mandatory). The
+responder additionally sets `cipher` to the single `cipher_id` it has
+selected per §3.5, committing the suite both peers use for the rest of
+the session.
 
 ### 4.5 KEEPALIVE (0x03)
 
@@ -481,6 +559,40 @@ CLOSED → SYN_SENT → ESTABLISHED → FIN_SENT → CLOSED
                 └── (incoming SYN) ─────┘
 ```
 
+### 6.6 Message fragmentation (v1.2)
+
+A logical message larger than one packet's payload is split into chunks,
+each carried inside its own Channel frame and AEAD-encrypted
+independently. The fragmentation envelope is the **first bytes of the
+Channel plaintext** (inside the ciphertext), ahead of the chunk data:
+
+```
+Offset  Size  Field
+0       1 B   version       0x01
+1       16 B  fragment_id   random per logical message
+17      2 B   seq           uint16 BE, 0-based chunk index
+19      2 B   total         uint16 BE, total chunk count (>= 1)
+21      var   data          raw chunk bytes
+```
+
+- Envelope overhead is `FRAG_HEADER_LEN = 21` bytes; max chunk data is
+  `MAX_CHUNK_PAYLOAD = MAX_CHANNEL_DATA - 21 = 1003` bytes.
+- A message that fits one chunk (including the empty message) still uses
+  the envelope with `seq=0, total=1`, so the parser stays stateless.
+- At most 65535 chunks per message.
+
+**Reassembly:** buffer chunks by `fragment_id`; emit the concatenation in
+`seq` order once `total` distinct chunks have arrived. Receivers MUST drop
+chunks shorter than the header, or with `version != 0x01`, `total == 0`,
+or `seq >= total`; ignore duplicate `seq`; and reset a buffer if a
+`fragment_id`'s `total` changes mid-message (corrupt sender). Bound
+memory: cap concurrent in-flight messages (reference: 256, evict oldest)
+and discard partial reassemblies older than a timeout (reference: 30 s).
+
+Streams (§5) do NOT use this envelope; they fragment codec frames with
+the §5.4.1 `FRAGMENT_CONT` flag instead. This envelope is for Channel
+messages only.
+
 ---
 
 ## 7. Board (type 0x03) — Future
@@ -517,12 +629,14 @@ UDP broadcast. Packet format:
 ```
 Offset  Size  Field
 0       4 B   magic             0x54454C45 ("TELE")
-4       1 B   version           protocol version (currently 1)
+4       1 B   version           = PROTOCOL_VERSION (§12.4)
 5       var   hostname          UTF-8 string, null-terminated
 var     2 B   port              uint16 BE, listening port
 ```
 
 Broadcast interval: 5 seconds. Duplicate detection by (hostname, ip, port).
+There is a single wire version number (§12.4); this field carries it so a
+peer can ignore broadcasts it cannot speak.
 
 ### 9.3 WebSocket (Legacy fallback) — Future
 
@@ -679,7 +793,7 @@ field of Channel and Stream payloads.
 │ (reliability, ordering, priority)            │
 ├──────────────────────────────────────────────┤
 │ Telesthete Framing + Crypto                  │
-│ (27B header, XChaCha20-Poly1305)             │
+│ (27B header, ChaCha20-Poly1305/AES-GCM)      │
 ├──────────────────────────────────────────────┤
 │ UDP / AF_UNIX / WebTransport / WebSocket     │
 └──────────────────────────────────────────────┘
@@ -713,13 +827,17 @@ negotiation). Any language can implement a conformant peer.
 
 A minimal client needs:
 1. Pack/unpack the 27-byte frame header
-2. XChaCha20-Poly1305 encrypt/decrypt (libsodium available everywhere)
-3. Derive band_id and key from PSK (SHA256 + HKDF)
-4. WebSocket transport (if not on LAN)
+2. ChaCha20-Poly1305 (IETF) encrypt/decrypt — the mandatory baseline
+   suite (libsodium, `@noble/ciphers`, Go x/crypto, etc.)
+3. Derive band_id and key from PSK (SHA256 + HKDF, §3.1)
+4. A mandatory HELLO announcing `ciphers: ["chacha20-poly1305"]` and its
+   `capabilities` (§4.3, §12.5)
+5. A transport (UDP on LAN; WebTransport or WebSocket otherwise)
 
-That's it. No need to implement Channel reliability, Board replication,
-or the full multiplexer. A WebSocket-only client that speaks Streams
-and Control is a first-class peer.
+That's it. No need to implement `aes256-gcm`, Channel reliability, Board
+replication, or the full multiplexer. A client that speaks the baseline
+cipher, the mandatory handshake, Streams, and Control is a first-class
+peer.
 
 ### 12.2 Implementation Estimates
 
@@ -742,15 +860,21 @@ little-endian to match DRM tooling.
 
 ```
 HEADER_SIZE        = 27
-AUTH_TAG_SIZE      = 16
+NONCE_LEN          = 12      (v1.2; 4 zero bytes || 8-byte BE sequence)
+AUTH_TAG_SIZE      = 16      (Poly1305 or GMAC; both suites)
 MIN_PACKET_SIZE    = 43      (header + tag)
 MAGIC_DISCOVERY    = 0x54454C45
-PROTOCOL_VERSION   = 3       (was 2 in v1.1; frame format unchanged, all v1.2 additions are capability-gated)
+PROTOCOL_VERSION   = 3       (single wire version; maps 1.0->1, 1.1->2, 1.2->3.
+                             v1.2 is BREAKING vs 1.0/1.1: new AEAD suites,
+                             12-byte nonce, mandatory capability + cipher negotiation.)
+BASELINE_CIPHER    = "chacha20-poly1305"   (v1.2; mandatory AEAD, §3.2)
 KEEPALIVE_INTERVAL = 5       (seconds)
 PEER_TIMEOUT       = 15      (seconds, 3x keepalive)
 DEFAULT_WINDOW     = 32      (packets)
 DEFAULT_RTO        = 500     (milliseconds)
 MAX_CHANNEL_DATA   = 1024    (bytes per Channel packet)
+FRAG_HEADER_LEN    = 21      (v1.2; Channel fragmentation envelope, §6.6)
+MAX_CHUNK_PAYLOAD  = 1003    (v1.2; MAX_CHANNEL_DATA - FRAG_HEADER_LEN)
 MAX_FDS_PER_PACKET = 5       (v1.1; 4 planes + 1 fence)
 LOCAL_PSK          = "telesthete-local"   (v1.1 sentinel for §3.4)
 STREAM_HEADER_LEN  = 8       (v1.1 §5.4)
@@ -760,14 +884,20 @@ WT_STREAM_LEN_PREFIX = 2     (v1.2; uint16 BE per-packet length on reliable WT s
 MAX_DATAGRAM_SIZE  = 1200    (v1.2; conservative QUIC datagram payload budget)
 ```
 
-A v1.1 peer detecting a v1.0 peer (no `capabilities` in HELLO) MUST
-restrict itself to v1.0 behaviour for that peer. Mixed Bands work
-fine; the constraint is per-peer, not per-Band.
+v1.2 is a breaking wire revision: capability announce and cipher
+negotiation are mandatory, so there is no v1.0/v1.1 fallback. The only
+deployed consumer (Rook) is upgraded in lockstep. Feature compatibility
+*within* v1.2 is handled per-peer by capabilities (§12.5), not by version
+fallback.
 
-### 12.5 Capability negotiation (v1.1)
+### 12.5 Capability negotiation (foundational, v1.2)
 
-`HELLO` and `HELLO_ACK` payloads (§4.3, §4.4) carry an optional
-`capabilities` field — an array of strings. Defined strings:
+Capability announce is **mandatory**. Every peer's `HELLO`/`HELLO_ACK`
+(§4.3, §4.4) MUST carry a `capabilities` array and an ordered `ciphers`
+list. This is the foundation for cipher (§3.5), transport, and feature
+selection; a peer that omits them is non-conformant.
+
+Defined `capabilities` strings:
 
 | Capability   | Meaning                                                         |
 |--------------|-----------------------------------------------------------------|
@@ -775,20 +905,23 @@ fine; the constraint is per-peer, not per-Band.
 | `af-unix`    | Peer reachable via AF_UNIX (§9.4).                              |
 | `sync-file`  | Peer honors `WITH_FENCE`. Implies `dmabuf-v1`.                  |
 | `reuse-v1`   | Peer honors `REUSE`. Implies `dmabuf-v1`.                       |
-| `webtransport` | Peer reachable via WebTransport (§9.6). (v1.2)                |
-| `keyframe-req` | Producer honors `KEYFRAME_REQ` (§4.9). (v1.2)                |
-| `rate-hint`  | Producer honors `RATE_HINT` (§4.10). (v1.2)                     |
+| `webtransport` | Peer reachable via WebTransport (§9.6).                       |
+| `keyframe-req` | Producer honors `KEYFRAME_REQ` (§4.9).                       |
+| `rate-hint`  | Producer honors `RATE_HINT` (§4.10).                            |
 
-Absent capability = not supported. Senders MUST fall back to v1.0
-behaviour (§5.1 Stream payload, UDP) if a peer omits the capability
-they need.
+An absent capability = not supported: the sender MUST NOT use that
+feature with the peer and falls back to the baseline the feature extends
+(e.g. §5.1 Stream payload over UDP). Capability strings are
+forward-extensible; unknown ones are ignored.
 
-Capability strings are forward-extensible. Unknown capabilities are
-ignored.
+The `ciphers` list is the AEAD suites the peer supports (§3.2), ordered
+by preference; it MUST include the baseline `chacha20-poly1305`.
+Selection follows §3.5. Cipher is a separate ordered field, not a
+capability string, because preference order is significant.
 
 Codec selection (H.264 / HEVC / AV1) for §5.4 codec Streams is **not** a
-transport capability — it is negotiated by the application (Rook, KVM)
-via `METACONTROL` (§4.7) or out of band, so the transport stays codec-
+capability — it is negotiated by the application (Rook, KVM) via
+`METACONTROL` (§4.7) or out of band, so the transport stays codec-
 agnostic. `webtransport` advertises reachability only; a peer may speak
 WebTransport and UDP simultaneously and the sender picks per §9.5-style
 preference (direct UDP > WebTransport > WebSocket).
@@ -797,40 +930,42 @@ preference (direct UDP > WebTransport > WebSocket).
 
 ## 13. Compatibility Matrix
 
-|                        | v1.0 peer            | v1.1 peer (no caps)     | v1.1 peer (full caps) |
-|------------------------|----------------------|-------------------------|-----------------------|
-| Frame parse            | OK                   | OK                      | OK                    |
-| §5.1 Stream payload    | OK                   | OK                      | OK                    |
-| §5.4 StreamHeader      | reject               | reject (no `dmabuf-v1`) | OK                    |
-| `DMABUF` flag          | reject (unknown bit) | reject (no cap)         | OK                    |
-| AF_UNIX                | n/a (UDP only)       | UDP only                | OK                    |
-| `WITH_FENCE`           | reject               | reject                  | OK                    |
-| §9.6 WebTransport      | n/a                  | n/a                     | OK †                  |
-| `KEYFRAME_REQ` / `RATE_HINT` | ignore ‡       | ignore ‡                | OK †                  |
+v1.2 is a clean breaking revision; v1.0/v1.1 peers do not interoperate
+(different AEAD, different nonce, optional-vs-mandatory capabilities) and
+were never deployed beyond development. Within v1.2, all feature
+compatibility is by capability (§12.5), negotiated per peer — a feature
+is used with a peer only if it advertises the matching capability/cipher.
 
-A v1.0 peer never sees a v1.1-only flag because the v1.1 peer checks
-capabilities before sending.
+| Feature                       | Required to use it with a peer    |
+|-------------------------------|-----------------------------------|
+| Baseline AEAD + frame parse   | always (mandatory)                |
+| §5.1 Stream payload (UDP)     | always (mandatory baseline)       |
+| `aes256-gcm` suite            | `aes256-gcm` in peer's `ciphers`  |
+| §5.4 StreamHeader / `DMABUF`  | `dmabuf-v1`                       |
+| `WITH_FENCE` / `REUSE`        | `sync-file` / `reuse-v1`          |
+| AF_UNIX transport             | `af-unix`                        |
+| WebTransport transport        | `webtransport`                   |
+| `KEYFRAME_REQ` / `RATE_HINT`  | `keyframe-req` / `rate-hint`     |
 
-† Requires a v1.2 peer advertising the matching capability
-(`webtransport`, `keyframe-req`, `rate-hint`). The "v1.1 peer (full
-caps)" column reads OK because v1.2 is a strict superset; a v1.1-only
-peer simply never advertises these and is never sent them.
-
-‡ Control messages with an unrecognized `type` are silently ignored
-(§4.2), so 0x07/0x08 are safe to send at a peer that predates them — but
-without the capability the producer will not act on them.
+Absent capability ⇒ the sender restricts itself to the baseline the
+feature extends. Unknown capabilities/ciphers are ignored, so the set is
+forward-extensible without a version bump.
 
 ---
 
 ## 14. Dependencies
 
 Reference implementations:
-- **Python** (`telesthete/`) — PyNaCl (XChaCha20-Poly1305), Python 3.10+
-- **Rust** (`rust/telesthete/`) — `chacha20poly1305`, `hkdf`, `sha2`,
-  `nix` (AF_UNIX + SCM_RIGHTS), `tokio`
+- **Python** (`telesthete/`) — ChaCha20-Poly1305 IETF baseline via PyNaCl
+  bindings (`crypto_aead_chacha20poly1305_ietf_*`) or `cryptography`;
+  `aes256-gcm` optional via the same. Python 3.10+
+- **Rust** (`rust/telesthete/`) — `chacha20poly1305` (use the
+  `ChaCha20Poly1305` IETF type, not `XChaCha20Poly1305`), `aes-gcm`
+  (optional), `hkdf`, `sha2`, `nix` (AF_UNIX + SCM_RIGHTS), `tokio`
 
-Cross-language: any libsodium binding (C, Rust, Go, JS, Java,
-Kotlin, Swift, etc.).
+Cross-language: the baseline needs ChaCha20-Poly1305 (IETF, RFC 8439),
+in every libsodium binding, Go `x/crypto`, Node `crypto`,
+`@noble/ciphers`, etc. `aes256-gcm` is optional.
 
 ---
 
@@ -875,4 +1010,4 @@ Kotlin, Swift, etc.).
 |---------|------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | 1.0     | 2026-04-07 | Initial spec from Python reference implementation.                                                                                                                                                                     |
 | 1.1     | 2026-05-11 | Added §3.4 local crypto profile, §5.4 StreamHeader + dmabuf descriptor (capability-gated), §9.4 AF_UNIX transport, §9.5 send-loop priority across transports, §12.5 capability negotiation. `PROTOCOL_VERSION` → 2. Backwards-compatible: v1.0 peers continue to interoperate. |
-| 1.2     | 2026-06-30 | Added §9.6 WebTransport (preferred browser/edge transport: Stream→datagrams, Channel→reliable QUIC streams, length-prefixed), §5.5 decoder/WebCodecs consumption of §5.4 codec Streams, §4.9 `KEYFRAME_REQ` + §4.10 `RATE_HINT` (application congestion/recovery loop for lossy media), `webtransport`/`keyframe-req`/`rate-hint` capabilities (§12.5), and the §9.3 TCP head-of-line caveat. `PROTOCOL_VERSION` → 3. Frame format unchanged; all additions capability-gated and backwards-compatible. |
+| 1.2     | 2026-06-30 | **Breaking wire revision** (collapsed into 1.2 — pre-adoption, sole consumer Rook upgraded in lockstep; no version spam). **Browser/edge:** §9.6 WebTransport (Stream→datagrams, Channel/Control→reliable QUIC streams, length-prefixed), §5.5 WebCodecs decode of §5.4 codec Streams, §4.9 `KEYFRAME_REQ` + §4.10 `RATE_HINT`, §9.3 TCP head-of-line caveat. **Crypto remediation:** AEAD is now a negotiated suite — ChaCha20-Poly1305 (IETF) mandatory baseline + AES-256-GCM optional (§3.2); 12-byte nonce (was 24); per-cipher key derivation (§3.1); real AEAD AAD (the pre-v1.2 Python reference wrongly used XSalsa20/`SecretBox` with AAD prepended — non-interoperable with the spec/Rust). **Capability announce is now foundational/mandatory** with an ordered `ciphers` list and end-to-end cipher negotiation (§3.5, §4.3, §12.5). Replay protection §3.3 SHOULD→MUST. Rook's Channel fragmentation envelope promoted to §6.6. Version fields reconciled to one `PROTOCOL_VERSION` (= 3; 1.0→1, 1.1→2, 1.2→3). |
