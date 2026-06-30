@@ -1,0 +1,46 @@
+{
+  "_comment": "Cross-impl conformance vectors. Python and Rust MUST both reproduce these. See SPEC.md \u00a73.",
+  "psk": "telesthete-conformance-psk",
+  "band_id_hex": "0afe84fe0416416254215e739fc04cd9",
+  "keys": {
+    "chacha20-poly1305": "f15909c11e7ec020d7f5449fd2f2aeeb9efc66ebdf6f947bde8f3d7b921b3948"
+  },
+  "aead": [
+    {
+      "cipher": "chacha20-poly1305",
+      "seq": 1,
+      "channel_type": 1,
+      "channel_id": 48879,
+      "aad_hex": "01beef",
+      "plaintext_hex": "68656c6c6f20776f726c64",
+      "ciphertext_hex": "2555c5cc87a9144923e7f15d358c39be9b413ab18bf129ab00d369"
+    },
+    {
+      "cipher": "chacha20-poly1305",
+      "seq": 0,
+      "channel_type": 0,
+      "channel_id": 0,
+      "aad_hex": "000000",
+      "plaintext_hex": "",
+      "ciphertext_hex": "8659d2e94835ac379948c6bfd4a1668e"
+    },
+    {
+      "cipher": "chacha20-poly1305",
+      "seq": 42,
+      "channel_type": 2,
+      "channel_id": 1,
+      "aad_hex": "020001",
+      "plaintext_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      "ciphertext_hex": "835c3ddefd8270ed93279e672c3c35aef6718021211ba8875d87b3bd3fa7b1e4f7a932fe9b4203f302f8d781b319016c5db597624b4699069439301b390f75da2e9d002f01c9ddcdb5a310ca9e205abe"
+    },
+    {
+      "cipher": "chacha20-poly1305",
+      "seq": 18446744073709551615,
+      "channel_type": 1,
+      "channel_id": 65535,
+      "aad_hex": "01ffff",
+      "plaintext_hex": "6d61782073657175656e63652065646765",
+      "ciphertext_hex": "14a09a77dc66b572438274563f25138926ae26d879af85cd2d53bca328137f176f"
+    }
+  ]
+}
