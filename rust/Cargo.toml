@@ -3,7 +3,7 @@ resolver = "2"
 members = ["telesthete", "telesthete-c", "telesthitium", "examples/consumer-rs"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.78"
 license = "MIT"
@@ -11,7 +11,7 @@ repository = "https://github.com/Bake-Ware/telesthete"
 authors = ["Bake-Ware <jamixzol@gmail.com>"]
 
 [workspace.dependencies]
-telesthete = { path = "telesthete", version = "0.1" }
+telesthete = { path = "telesthete", version = "0.2" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

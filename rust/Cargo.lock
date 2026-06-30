@@ -813,7 +813,7 @@ dependencies = [
 
 [[package]]
 name = "telesthete"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "bitflags",
@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "telesthete-c"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cbindgen",
  "telesthete",
@@ -845,7 +845,7 @@ dependencies = [
 
 [[package]]
 name = "telesthitium"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "tokio",

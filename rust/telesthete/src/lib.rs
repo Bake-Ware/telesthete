@@ -1,4 +1,4 @@
-//! Telesthete v1.1 — encrypted P2P transport for window/desktop sharing.
+//! Telesthete v1.2 — encrypted P2P transport for window/desktop sharing.
 //!
 //! Wire spec: `SPEC.md` at the repo root. The crate exposes the band/channel/
 //! stream session layer plus on-the-wire types under [`mod@wire`].

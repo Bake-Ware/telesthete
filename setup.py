@@ -9,13 +9,14 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="telesthete",
-    version="0.1.0",
+    version="0.2.0",
     author="Bake-Ware",
     author_email="jamixzol@gmail.com",
-    description="Lightweight P2P communication library with encrypted streams",
+    description="Lightweight, encrypted, peer-to-peer transport (Telesthete wire v1.2)",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/Bake-Ware/telesthete",
+    license="MIT",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 3 - Alpha",
@@ -29,6 +30,10 @@ setup(
     ],
     python_requires=">=3.10",
     install_requires=[
-        "PyNaCl>=1.5.0",
+        "PyNaCl>=1.5.0",  # baseline ChaCha20-Poly1305 (IETF)
     ],
+    extras_require={
+        # Optional AES-256-GCM suite (SPEC §3.2); baseline works without it.
+        "aes": ["cryptography>=42.0"],
+    },
 )
