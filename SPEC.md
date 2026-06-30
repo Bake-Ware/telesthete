@@ -1,12 +1,15 @@
-# Telesthete Wire Protocol Specification v1.1
+# Telesthete Wire Protocol Specification v1.2
 
 Telesthete is a lightweight, encrypted, peer-to-peer transport library.
 This document defines the byte-level wire format for all communication.
 
 **Design principles:** Binary wire format. UDP primary, AF_UNIX for
-same-host peers, WebSocket fallback. PSK-based encryption. No
-timestamps from peers — receiver stamps on arrival. Simple enough to
-implement a minimal client in ~200 LOC in any language.
+same-host peers, WebTransport for browsers, WebSocket as the legacy
+fallback. PSK-based encryption. No timestamps from peers — receiver
+stamps on arrival. Simple enough to implement a minimal client in
+~200 LOC in any language. The same 27-byte frame rides every transport
+unchanged, so a peer is defined by the frame it speaks, not the socket
+it speaks it on.
 
 ---
 
@@ -161,6 +164,12 @@ JSON-encoded UTF-8 string:
 | 0x04  | FOCUS_CHANGE  | peer→peer   | Focus state change (KVM application) |
 | 0x05  | METACONTROL   | peer→peer   | Settings/config sync                 |
 | 0x06  | GOODBYE       | peer→peer   | Graceful disconnect                  |
+| 0x07  | KEYFRAME_REQ  | consumer→producer | Request a fresh INIT+IDR for a Stream (v1.2) |
+| 0x08  | RATE_HINT     | consumer→producer | Bitrate / loss feedback for a lossy Stream (v1.2) |
+
+Receivers MUST ignore Control messages with an unrecognized `type`.
+This makes new message types (e.g. 0x07/0x08) forward-compatible: an
+older peer silently drops them rather than erroring.
 
 ### 4.3 HELLO (0x01)
 
@@ -206,6 +215,46 @@ Freeform settings dictionary. Application-defined.
 ```json
 {"type": 6, "payload": {}}
 ```
+
+### 4.9 KEYFRAME_REQ (0x07) — v1.2
+
+```json
+{"type": 7, "payload": {"stream_id": <uint16>}}
+```
+
+Sent by a Stream **consumer** to the **producer**. The producer SHOULD
+emit a fresh `INIT` followed by a `KEYFRAME` (§5.4.1) for the named
+`stream_id` at its next opportunity.
+
+This is the recovery path for lossy video. Because Streams are
+fire-and-forget (§5.2, watermark drop), a consumer that loses the
+packets carrying a reference frame cannot decode subsequent deltas; it
+requests a new IDR rather than stalling. This is the role WebRTC fills
+with PLI/FIR. Carried on Control (reliable), so the request itself is
+not subject to Stream drop.
+
+Honored only by peers advertising the `keyframe-req` capability
+(§12.5). A producer that does not advertise it MAY still emit keyframes
+on its own cadence.
+
+### 4.10 RATE_HINT (0x08) — v1.2
+
+```json
+{"type": 8, "payload": {"stream_id": <uint16>, "target_bps": <uint32>, "loss": <float 0..1>}}
+```
+
+Consumer→producer feedback for **application-level congestion control**
+of a lossy Stream. `target_bps` is the consumer's suggested encoder
+bitrate ceiling; `loss` is the observed fraction of dropped packets
+since the last hint (0.0–1.0). The producer SHOULD adapt its encoder
+accordingly. Advisory; a producer MAY clamp or ignore.
+
+Rationale: reliable Channels inherit QUIC/Channel congestion control,
+but lossy Streams (§5, and WebTransport datagrams §9.6) are never
+retransmitted and have no built-in rate feedback. RATE_HINT is the
+deliberate, minimal substitute — the application closes the loop the
+transport intentionally leaves open. Honored only with the `rate-hint`
+capability (§12.5).
 
 ---
 
@@ -331,6 +380,41 @@ a re-import.
 'X', 'R', '2', '4' are stored as `0x34325258` so `read32_le` yields
 'XR24'). Spec the field as LE explicitly to avoid a foot-gun.
 
+### 5.5 Consuming codec Streams (decoder mapping) — v1.2
+
+This subsection is informative. The §5.4.1 flags exist precisely to
+drive a generic hardware video decoder, so the mapping is specified to
+keep producers and consumers honest. The canonical browser consumer is
+the WebCodecs `VideoDecoder`, but the same shape applies to any
+push-style decoder (`avcodec`, VideoToolbox, MediaCodec).
+
+A §5.4 Stream with the `DMABUF` flag **clear** carries a decoder-ready
+elementary stream. Reassemble and submit per `frame_id`:
+
+| StreamHeader state | Decoder action |
+|--------------------|----------------|
+| `INIT`             | Configure the decoder. Annex-B in-band SPS/PPS → WebCodecs `configure({codec})` with no `description` (annex-b mode); e.g. `avc1.640028`, `hev1.1.6.L93.B0`, `av01.0.08M.08`. |
+| `KEYFRAME`         | First chunk after INIT; submit as a **key** access unit (`EncodedVideoChunk{type:'key'}`). |
+| neither, not `INIT`| Delta access unit (`{type:'delta'}`). |
+| `FRAGMENT_CONT`    | Append bytes to the in-progress `frame_id` buffer without inserting a new start code. |
+| `END_FRAME`        | The `frame_id` is complete; submit exactly one chunk to the decoder. |
+
+**Loss handling.** Watermark drop (§5.2) means a consumer may receive a
+delta whose reference frame never arrived. On a decode error or a
+detected `frame_id` gap across a non-keyframe boundary, the consumer
+MUST discard deltas until the next `KEYFRAME` and SHOULD send a
+`KEYFRAME_REQ` (§4.9). Do not feed a decoder deltas with a missing
+reference; you get corruption, not recovery.
+
+**Why this beats bridging to WebRTC for the browser edge.** The
+producer hardware-encodes once (e.g. NVENC); the browser
+hardware-decodes the same elementary stream via WebCodecs and renders
+the `VideoFrame` to a canvas / WebGL texture. No SDP, no SRTP, no
+transcode — the bytes on §9.6 WebTransport datagrams are already what
+the decoder wants. Audio rides a parallel Stream and is fed to
+`AudioDecoder` the same way. Input returns on a Stream at priority 0
+(§5.3); decoder feedback returns on Control (§4.9, §4.10).
+
 ---
 
 ## 6. Channel (type 0x02)
@@ -440,11 +524,22 @@ var     2 B   port              uint16 BE, listening port
 
 Broadcast interval: 5 seconds. Duplicate detection by (hostname, ip, port).
 
-### 9.3 WebSocket (Fallback) — Future
+### 9.3 WebSocket (Legacy fallback) — Future
 
-For hostile networks (corporate firewalls, symmetric NAT). Connect outbound
-to Telesthetium hub over WSS (port 443). Same frame format as UDP, carried
-as WebSocket binary frames. Not yet implemented.
+For hostile networks (corporate firewalls, symmetric NAT) and browsers
+that lack WebTransport (§9.6). Connect outbound to Telesthetium hub over
+WSS (port 443). Same frame format as UDP, carried as WebSocket binary
+frames — boundaries are preserved by the WS frame, so no extra length
+prefix is needed. Not yet implemented.
+
+**Caveat (the reason §9.6 exists):** WebSocket runs over TCP. A lossy
+Stream (§5) carried over TCP is silently turned reliable and
+in-order — a single lost segment head-of-line-blocks every Channel and
+Stream multiplexed on that socket, and "drop the late frame" (§5.2)
+becomes "retransmit the frame you wanted dropped." Acceptable on a LAN
+with near-zero loss; pathological for real-time video over a lossy
+path. Prefer §9.6 WebTransport whenever the client supports it; fall
+back to §9.3 only when it does not.
 
 ### 9.4 AF_UNIX (v1.1)
 
@@ -486,6 +581,70 @@ MTU and ACK pacing.
 This is a SHOULD, not a MUST. Implementations that maintain only one
 transport at a time can ignore it.
 
+### 9.6 WebTransport (Preferred browser/edge transport) — v1.2
+
+WebTransport (HTTP/3 over QUIC) is the preferred transport for any peer
+that cannot open a raw UDP socket — first and foremost the browser, but
+also any HTTP/3-reachable client behind a proxy. It is the browser-side
+analogue of Telesthete's own duality: QUIC gives the browser
+**unreliable datagrams** *and* **reliable ordered streams**, encrypted,
+multiplexed without cross-stream head-of-line blocking. That is a near
+1:1 fit with Stream and Channel, and it does not have §9.3's TCP
+problem.
+
+**Connection.** Outbound to the Telesthetium hub (or a host terminating
+HTTP/3 directly) over UDP/443, ALPN `h3`:
+
+```
+https://<hub-or-host>/telesthete?band=<band_id_hex>
+```
+
+The server matches the `band_id` exactly as the UDP/WS relay does
+(§10) — it routes opaque ciphertext and never holds the PSK. A peer
+authenticates the *transport* with TLS (public CA cert), or, for direct
+host-terminated WebTransport with a self-signed cert, via the browser
+`serverCertificateHashes` mechanism (ECDSA P-256, validity ≤ 14 days —
+a browser constraint, not ours).
+
+**Channel-type → WebTransport mapping:**
+
+| Telesthete         | WebTransport carrier                                  | Framing |
+|--------------------|------------------------------------------------------|---------|
+| Stream (0x01)      | Datagrams (`writeDatagram` / `datagrams.readable`)   | One datagram = one Telesthete packet. Boundaries preserved; **no** length prefix. |
+| Channel (0x02)     | One bidirectional QUIC stream per `channel_id`        | Byte stream — **length-prefix each packet** (see below). |
+| Control (0x00)     | A single dedicated reliable bidi stream              | Length-prefixed, same as Channel. |
+
+**Length prefix on reliable carriers (foot-gun).** QUIC streams are
+byte streams, not message streams: unlike UDP, AF_UNIX `SEQPACKET`, WS
+binary frames, or QUIC *datagrams*, they do **not** preserve packet
+boundaries. On any WebTransport reliable stream, every Telesthete
+packet MUST be preceded by a 2-byte big-endian length
+(`WT_STREAM_LEN_PREFIX = 2`) giving the byte count of the frame that
+follows. The reader loops: read 2 bytes, read that many, parse one
+frame, repeat. Datagrams need none of this.
+
+**Datagram size.** QUIC datagrams are path-MTU bound and typically
+smaller than Ethernet UDP — budget `MAX_DATAGRAM_SIZE = 1200` bytes for
+the whole Telesthete packet (27-byte header + tag + payload) unless the
+session's reported `maxDatagramSize` is larger. Producers fragment via
+`FRAGMENT_CONT` (§5.4.1) to fit, exactly as on UDP.
+
+**Loss & ordering.** Datagrams are unreliable and unordered, matching
+Stream semantics exactly: §5.2 watermark drop applies unchanged.
+Because each Channel is its own QUIC stream, loss on one Channel — or on
+the datagram flow — never blocks another. This is the specific defect
+§9.3 cannot avoid.
+
+**Congestion control.** QUIC supplies congestion control for the
+reliable streams (Channels, Control) for free. The datagram flow
+(Streams/video) is paced by QUIC but never retransmitted — so real-time
+rate control is the application's job, via the `RATE_HINT` /
+`KEYFRAME_REQ` loop (§4.9, §4.10). This split is deliberate: bulk
+transfer rides QUIC's loop; latency-critical media rides ours.
+
+Advertise reachability with the `webtransport` capability (§12.5). Not
+yet implemented.
+
 ---
 
 ## 10. Telesthetium Hub — Future
@@ -498,6 +657,12 @@ Connection modes:
 - **LAN:** Direct UDP, no hub needed.
 - **Tunnel:** Both peers connect to hub, traffic relayed.
 - **Hybrid:** Try LAN first, fall back to hub, prefer direct.
+
+The hub is also the default HTTP/3 terminator for WebTransport (§9.6)
+and the WSS terminator for the legacy WebSocket fallback (§9.3): a
+browser peer reaches the band by connecting to the hub over UDP/443,
+and the hub bridges it to UDP/AF_UNIX peers in the same band. Routing
+is by `band_id` only; the hub still cannot decrypt.
 
 ---
 
@@ -516,9 +681,16 @@ field of Channel and Stream payloads.
 │ Telesthete Framing + Crypto                  │
 │ (27B header, XChaCha20-Poly1305)             │
 ├──────────────────────────────────────────────┤
-│ UDP / AF_UNIX / WebSocket                    │
+│ UDP / AF_UNIX / WebTransport / WebSocket     │
 └──────────────────────────────────────────────┘
 ```
+
+The transport row is interchangeable: the application and the
+Channel/Stream layer above it are identical whether the bytes ride UDP,
+an AF_UNIX `SEQPACKET` socket, WebTransport datagrams+streams, or a
+WebSocket. A browser dashboard is a first-class peer — it speaks the
+same frame over §9.6 WebTransport and decodes §5.4 codec Streams with
+WebCodecs (§5.5). No gateway transcode, no second protocol.
 
 ### 11.1 Rook Protocol
 
@@ -558,6 +730,7 @@ and Control is a first-class peer.
 | Kotlin/Android  | OkHttp WebSocket   | ~500     | Stream + Control only        |
 | ESP32/C         | WebSocket          | ~300     | Stream + Control only        |
 | Browser/JS      | Native WebSocket   | ~200     | Stream + Control only        |
+| Browser/JS      | WebTransport       | ~300     | Stream (datagrams) + Channel (streams) + Control; pairs with WebCodecs for video (§5.5) |
 
 ### 12.3 Byte Order
 
@@ -572,7 +745,7 @@ HEADER_SIZE        = 27
 AUTH_TAG_SIZE      = 16
 MIN_PACKET_SIZE    = 43      (header + tag)
 MAGIC_DISCOVERY    = 0x54454C45
-PROTOCOL_VERSION   = 2       (was 1 in v1.0)
+PROTOCOL_VERSION   = 3       (was 2 in v1.1; frame format unchanged, all v1.2 additions are capability-gated)
 KEEPALIVE_INTERVAL = 5       (seconds)
 PEER_TIMEOUT       = 15      (seconds, 3x keepalive)
 DEFAULT_WINDOW     = 32      (packets)
@@ -581,6 +754,10 @@ MAX_CHANNEL_DATA   = 1024    (bytes per Channel packet)
 MAX_FDS_PER_PACKET = 5       (v1.1; 4 planes + 1 fence)
 LOCAL_PSK          = "telesthete-local"   (v1.1 sentinel for §3.4)
 STREAM_HEADER_LEN  = 8       (v1.1 §5.4)
+WEBTRANSPORT_ALPN  = "h3"    (v1.2 §9.6)
+WEBTRANSPORT_PORT  = 443     (v1.2; QUIC/UDP)
+WT_STREAM_LEN_PREFIX = 2     (v1.2; uint16 BE per-packet length on reliable WT streams)
+MAX_DATAGRAM_SIZE  = 1200    (v1.2; conservative QUIC datagram payload budget)
 ```
 
 A v1.1 peer detecting a v1.0 peer (no `capabilities` in HELLO) MUST
@@ -598,6 +775,9 @@ fine; the constraint is per-peer, not per-Band.
 | `af-unix`    | Peer reachable via AF_UNIX (§9.4).                              |
 | `sync-file`  | Peer honors `WITH_FENCE`. Implies `dmabuf-v1`.                  |
 | `reuse-v1`   | Peer honors `REUSE`. Implies `dmabuf-v1`.                       |
+| `webtransport` | Peer reachable via WebTransport (§9.6). (v1.2)                |
+| `keyframe-req` | Producer honors `KEYFRAME_REQ` (§4.9). (v1.2)                |
+| `rate-hint`  | Producer honors `RATE_HINT` (§4.10). (v1.2)                     |
 
 Absent capability = not supported. Senders MUST fall back to v1.0
 behaviour (§5.1 Stream payload, UDP) if a peer omits the capability
@@ -605,6 +785,13 @@ they need.
 
 Capability strings are forward-extensible. Unknown capabilities are
 ignored.
+
+Codec selection (H.264 / HEVC / AV1) for §5.4 codec Streams is **not** a
+transport capability — it is negotiated by the application (Rook, KVM)
+via `METACONTROL` (§4.7) or out of band, so the transport stays codec-
+agnostic. `webtransport` advertises reachability only; a peer may speak
+WebTransport and UDP simultaneously and the sender picks per §9.5-style
+preference (direct UDP > WebTransport > WebSocket).
 
 ---
 
@@ -618,9 +805,20 @@ ignored.
 | `DMABUF` flag          | reject (unknown bit) | reject (no cap)         | OK                    |
 | AF_UNIX                | n/a (UDP only)       | UDP only                | OK                    |
 | `WITH_FENCE`           | reject               | reject                  | OK                    |
+| §9.6 WebTransport      | n/a                  | n/a                     | OK †                  |
+| `KEYFRAME_REQ` / `RATE_HINT` | ignore ‡       | ignore ‡                | OK †                  |
 
 A v1.0 peer never sees a v1.1-only flag because the v1.1 peer checks
 capabilities before sending.
+
+† Requires a v1.2 peer advertising the matching capability
+(`webtransport`, `keyframe-req`, `rate-hint`). The "v1.1 peer (full
+caps)" column reads OK because v1.2 is a strict superset; a v1.1-only
+peer simply never advertises these and is never sent them.
+
+‡ Control messages with an unrecognized `type` are silently ignored
+(§4.2), so 0x07/0x08 are safe to send at a peer that predates them — but
+without the capability the producer will not act on them.
 
 ---
 
@@ -655,6 +853,19 @@ Kotlin, Swift, etc.).
    `SO_PEERCRED` checks on connect? Likely yes for any
    "untrusted-producer" scenario; out of scope for v1.1 if
    everything runs as the same UID.
+6. (v1.2) WebTransport endpoint topology: is the hub always the HTTP/3
+   terminator, or do individual hosts terminate WebTransport directly?
+   Hub-terminated is the default (one public cert, reuses §10 routing).
+   Direct host-terminated WT needs the `serverCertificateHashes`
+   short-lived-ECDSA dance per browser; deferred unless a use case
+   demands hub-less browser access.
+7. (v1.2) Should lossy video over WebTransport datagrams rely on QUIC
+   pacing alone, or is the §4.10 RATE_HINT loop mandatory? Advisory in
+   v1.2; revisit if real deployments show encoder overrun on congested
+   paths.
+8. (v1.2) WebTransport datagram MTU: fixed `MAX_DATAGRAM_SIZE = 1200`
+   or probe the session's `maxDatagramSize` and grow? Start fixed and
+   conservative; probing is a later optimization.
 
 ---
 
@@ -664,3 +875,4 @@ Kotlin, Swift, etc.).
 |---------|------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | 1.0     | 2026-04-07 | Initial spec from Python reference implementation.                                                                                                                                                                     |
 | 1.1     | 2026-05-11 | Added §3.4 local crypto profile, §5.4 StreamHeader + dmabuf descriptor (capability-gated), §9.4 AF_UNIX transport, §9.5 send-loop priority across transports, §12.5 capability negotiation. `PROTOCOL_VERSION` → 2. Backwards-compatible: v1.0 peers continue to interoperate. |
+| 1.2     | 2026-06-30 | Added §9.6 WebTransport (preferred browser/edge transport: Stream→datagrams, Channel→reliable QUIC streams, length-prefixed), §5.5 decoder/WebCodecs consumption of §5.4 codec Streams, §4.9 `KEYFRAME_REQ` + §4.10 `RATE_HINT` (application congestion/recovery loop for lossy media), `webtransport`/`keyframe-req`/`rate-hint` capabilities (§12.5), and the §9.3 TCP head-of-line caveat. `PROTOCOL_VERSION` → 3. Frame format unchanged; all additions capability-gated and backwards-compatible. |
