@@ -6,6 +6,7 @@ use std::ffi::c_char;
 
 pub const TEL_OK: i32 = 0;
 pub const TEL_ERR_NULL: i32 = -1;
+#[allow(dead_code)]
 pub const TEL_ERR_CONNECT: i32 = -2;
 pub const TEL_ERR_DEAD: i32 = -3;
 
