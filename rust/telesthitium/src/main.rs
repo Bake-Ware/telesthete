@@ -1,45 +1,15 @@
-//! Telesthete Hub — band-id based UDP relay.
+//! Telesthete Hub (`telesthete-hub`) — the reference relay for the Telesthete
+//! wire protocol, SPEC §10.
 //!
-//! Per SPEC §10, the hub is a dumb forwarder. It sees the 16-byte cleartext
-//! `band_id` prefix of every packet and bridges packets to every other peer
-//! that has spoken the same `band_id` recently. No decryption, no PSK, no
-//! identity beyond network address.
-//!
-//! Wire frame parsed: first 16 bytes (band_id). Everything else is opaque.
-//! Min legal Telesthete packet is 27 (header) + 16 (auth tag) = 43 bytes,
-//! but we accept anything ≥ 27 to stay robust against future header tweaks.
+//! Matches peers by the cleartext `band_id` and bridges opaque ciphertext
+//! between them across UDP (§9.1), WSS (§9.3), WebTransport (§9.6), and AF_UNIX
+//! (§9.4). Holds no PSK; cannot decrypt. See `CONFORMANCE.md` for the
+//! claim-by-claim inventory and the library crate (`lib.rs`) for the internals.
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use tokio::net::UdpSocket;
-use tokio::signal;
-use tokio::sync::RwLock;
-use tokio::time;
-use tracing::{debug, info, warn};
-
-type BandId = [u8; 16];
-
-#[derive(Clone, Copy)]
-struct PeerEntry {
-    addr: SocketAddr,
-    last_seen: Instant,
-}
-
-struct State {
-    bands: RwLock<HashMap<BandId, Vec<PeerEntry>>>,
-    peer_ttl: Duration,
-}
-
-fn hex16(b: &BandId) -> String {
-    let mut s = String::with_capacity(32);
-    for byte in b {
-        s.push_str(&format!("{:02x}", byte));
-    }
-    s
-}
+use telesthitium::{Config, Registry};
+use tokio::sync::watch;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -50,136 +20,134 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let bind = std::env::var("HUB_BIND").unwrap_or_else(|_| "0.0.0.0:7474".to_string());
-    let ttl_secs: u64 = std::env::var("HUB_PEER_TTL_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(60);
-    let prune_secs: u64 = std::env::var("HUB_PRUNE_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
+    let cfg = Config::from_env();
+    tracing::info!(
+        udp = ?cfg.udp_bind,
+        ws = ?cfg.ws_bind,
+        wt = ?cfg.wt_bind,
+        unix = ?cfg.unix_dir,
+        peer_ttl_secs = cfg.peer_ttl.as_secs(),
+        "telesthete-hub starting"
+    );
 
-    let sock = Arc::new(UdpSocket::bind(&bind).await?);
-    let local = sock.local_addr()?;
-    info!(%local, peer_ttl_secs = ttl_secs, prune_secs, "telesthete-hub listening");
+    let registry = Arc::new(Registry::new(cfg.limits));
 
-    let state = Arc::new(State {
-        bands: RwLock::new(HashMap::new()),
-        peer_ttl: Duration::from_secs(ttl_secs),
-    });
-
+    // Prune sweep.
     {
-        let state = state.clone();
+        let registry = registry.clone();
+        let ttl = cfg.peer_ttl;
+        let interval = cfg.prune_interval;
         tokio::spawn(async move {
-            let mut ticker = time::interval(Duration::from_secs(prune_secs));
+            let mut ticker = tokio::time::interval(interval);
             loop {
                 ticker.tick().await;
-                prune(&state).await;
+                let (evicted, bands) = registry.prune(ttl);
+                if evicted > 0 {
+                    tracing::info!(evicted, bands, "prune cycle");
+                }
             }
         });
     }
 
-    let recv_state = state.clone();
-    let recv_sock = sock.clone();
-    let recv_task = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65_535];
-        loop {
-            let (n, src) = match recv_sock.recv_from(&mut buf).await {
-                Ok(x) => x,
-                Err(e) => {
-                    warn!(error = %e, "recv_from failed");
-                    continue;
-                }
-            };
-            if n < 27 {
-                debug!(n, %src, "short packet, ignoring");
-                continue;
-            }
-            let mut band: BandId = [0u8; 16];
-            band.copy_from_slice(&buf[0..16]);
-            // Cheap clone — typical Telesthete packets are <1500 bytes.
-            let packet = buf[..n].to_vec();
-            let state = recv_state.clone();
-            let sock = recv_sock.clone();
-            tokio::spawn(async move {
-                relay(&state, &sock, band, src, packet).await;
-            });
-        }
-    });
+    // Resolve a TLS identity once if any secure transport needs it.
+    let cert = if cfg.needs_tls() {
+        let c = cfg.tls_identity()?;
+        tracing::info!(cert_sha256 = %c.sha256_hex(), "TLS identity ready");
+        Some(c)
+    } else {
+        None
+    };
 
-    tokio::select! {
-        _ = signal::ctrl_c() => info!("SIGINT received, shutting down"),
-        _ = sigterm() => info!("SIGTERM received, shutting down"),
-        _ = recv_task => warn!("recv task exited unexpectedly"),
+    // Fan the shutdown signal out to every transport.
+    let (sd_tx, sd_rx) = watch::channel(false);
+    let mut tasks = Vec::new();
+
+    if let Some(bind) = cfg.udp_bind {
+        let (registry, mut rx, q) = (registry.clone(), sd_rx.clone(), cfg.conn_queue);
+        tasks.push(tokio::spawn(async move {
+            let sd = async {
+                let _ = rx.wait_for(|v| *v).await;
+            };
+            if let Err(e) = telesthitium::udp::serve(bind, registry, q, sd).await {
+                tracing::error!(error = %e, "udp transport failed");
+            }
+        }));
     }
 
+    if let Some(bind) = cfg.ws_bind {
+        let (registry, mut rx, q, path) =
+            (registry.clone(), sd_rx.clone(), cfg.conn_queue, cfg.ws_path.clone());
+        let tls = if cfg.ws_tls { cert.clone() } else { None };
+        tasks.push(tokio::spawn(async move {
+            let sd = async {
+                let _ = rx.wait_for(|v| *v).await;
+            };
+            if let Err(e) = telesthitium::ws::serve(bind, registry, q, path, tls, sd).await {
+                tracing::error!(error = %e, "ws transport failed");
+            }
+        }));
+    }
+
+    if let Some(bind) = cfg.wt_bind {
+        let wt_cert = cert.clone().expect("needs_tls() guarantees a cert when wt is enabled");
+        let (registry, mut rx, q) = (registry.clone(), sd_rx.clone(), cfg.conn_queue);
+        tasks.push(tokio::spawn(async move {
+            let sd = async {
+                let _ = rx.wait_for(|v| *v).await;
+            };
+            if let Err(e) = telesthitium::wt::serve(bind, registry, q, wt_cert, sd).await {
+                tracing::error!(error = %e, "webtransport transport failed");
+            }
+        }));
+    }
+
+    if let Some(dir) = cfg.unix_dir.clone() {
+        let (registry, mut rx, q) = (registry.clone(), sd_rx.clone(), cfg.conn_queue);
+        tasks.push(tokio::spawn(async move {
+            let sd = async {
+                let _ = rx.wait_for(|v| *v).await;
+            };
+            if let Err(e) = telesthitium::unix::serve(dir, registry, q, sd).await {
+                tracing::error!(error = %e, "af_unix transport failed");
+            }
+        }));
+    }
+
+    if tasks.is_empty() {
+        tracing::warn!("no transports enabled");
+    }
+
+    shutdown_signal().await;
+    tracing::info!("shutdown signal received; stopping transports");
+    let _ = sd_tx.send(true);
+    for t in tasks {
+        let _ = t.await;
+    }
+
+    tracing::info!("telesthete-hub stopped");
     Ok(())
 }
 
-async fn sigterm() {
-    if let Ok(mut s) = signal::unix::signal(signal::unix::SignalKind::terminate()) {
-        s.recv().await;
-    } else {
-        std::future::pending::<()>().await;
-    }
-}
-
-async fn relay(state: &State, sock: &UdpSocket, band: BandId, src: SocketAddr, packet: Vec<u8>) {
-    let dests: Vec<SocketAddr> = {
-        let mut bands = state.bands.write().await;
-        let entries = bands.entry(band).or_default();
-        let mut found = false;
-        let now = Instant::now();
-        for e in entries.iter_mut() {
-            if e.addr == src {
-                e.last_seen = now;
-                found = true;
-                break;
+/// Resolves on SIGINT or SIGTERM.
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = ctrl_c => tracing::info!("SIGINT received"),
+                    _ = term.recv() => tracing::info!("SIGTERM received"),
+                }
+            }
+            Err(_) => {
+                let _ = ctrl_c.await;
             }
         }
-        if !found {
-            info!(band = %hex16(&band), peer = %src, n_peers = entries.len() + 1, "peer joined band");
-            entries.push(PeerEntry {
-                addr: src,
-                last_seen: now,
-            });
-        }
-        entries
-            .iter()
-            .filter(|e| e.addr != src)
-            .map(|e| e.addr)
-            .collect()
-    };
-
-    for d in dests {
-        if let Err(e) = sock.send_to(&packet, d).await {
-            warn!(error = %e, dest = %d, "send_to failed");
-        }
     }
-}
-
-async fn prune(state: &State) {
-    let now = Instant::now();
-    let mut bands = state.bands.write().await;
-    let mut empty: Vec<BandId> = Vec::new();
-    let mut evicted = 0usize;
-    for (band, entries) in bands.iter_mut() {
-        let before = entries.len();
-        entries.retain(|e| now.duration_since(e.last_seen) <= state.peer_ttl);
-        let removed = before - entries.len();
-        if removed > 0 {
-            debug!(band = %hex16(band), removed, "pruned stale peers");
-            evicted += removed;
-        }
-        if entries.is_empty() {
-            empty.push(*band);
-        }
-    }
-    for b in empty {
-        bands.remove(&b);
-    }
-    if evicted > 0 {
-        info!(evicted, n_bands = bands.len(), "prune cycle");
+    #[cfg(not(unix))]
+    {
+        let _ = ctrl_c.await;
     }
 }
