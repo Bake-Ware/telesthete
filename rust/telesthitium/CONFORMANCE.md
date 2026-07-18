@@ -40,10 +40,10 @@ correct WebTransport carrier (§9.6). Everything from offset 27 on is opaque.
 
 | ID | Claim | Test |
 |----|-------|------|
-| C1+C2 | Idle peers are evicted; empty bands are reaped. | `registry::prune_evicts_stale_and_reaps` |
-| C3 | Activity within TTL keeps a peer alive across sweeps. | `registry::active_peer_survives_prune` |
+| C1+C2 | Idle **UDP** peers are evicted; empty bands are reaped. | `registry::prune_evicts_stale_udp_and_reaps` |
+| C3 | Activity within TTL keeps a UDP peer alive across sweeps. | `registry::active_udp_peer_survives_prune` |
 | C4 | Default TTL = `PEER_TIMEOUT` (15 s, §12.4); env-overridable. | `config::default_ttl_is_peer_timeout` |
-| C5 | Connection peers are removed immediately on disconnect. | `registry::remove_on_disconnect` |
+| C5 | Connection peers are removed on disconnect, and are **never** idle-pruned while connected (a receive-only listener stays reachable). | `registry::remove_on_disconnect`, `registry::conn_peer_survives_prune_while_connected` |
 
 ## D. Robustness / anti-abuse (hardening required of a reference)
 
@@ -52,7 +52,7 @@ correct WebTransport carrier (§9.6). Everything from offset 27 on is opaque.
 | D1 | Bands are capped; a new band beyond the cap is refused. | `registry::band_cap_enforced` |
 | D2 | Peers-per-band are capped; overflow refused. | `registry::peer_cap_enforced` |
 | D3 | A slow peer's outbound queue is bounded; overflow drops (logged). | `registry::slow_peer_queue_bounded` |
-| D4 | UDP return-routability: a source is not a destination until it has sent `udp_validation_packets` (default 2) — defeats single-spoofed-packet reflection. | `registry::udp_dest_requires_validation`, `registry::udp_validation_disabled_when_one` |
+| D4 | A UDP source is not a relay destination until it has sent `udp_validation_packets` (default 2). This is a mild robustness gate, **not** a return-routability proof — see the caveat under Deviations. | `registry::udp_dest_requires_validation`, `registry::udp_validation_disabled_when_one` |
 | D5 | Connection peers (WSS/WT/AF_UNIX) are eligible destinations immediately. | `registry::conn_peer_eligible_immediately` |
 
 ## E. UDP transport (§9.1) — `src/udp.rs`, `tests/it_udp.rs`
@@ -122,6 +122,21 @@ correct WebTransport carrier (§9.6). Everything from offset 27 on is opaque.
 - **UDP min-packet.** The hub enforces `MIN_PACKET_SIZE` = 43 (§1), rejecting the
   27..42-byte range the earlier prototype accepted, since such packets are
   malformed per §1.
-- **UDP return-routability (D4)** is a hardening measure the spec does not mandate;
-  it defaults on (`udp_validation_packets = 2`) and is disableable via env
-  (`HUB_UDP_VALIDATION_PACKETS=1`).
+- **UDP validation gate (D4)** is a minor hardening measure the spec does not
+  mandate; it defaults on (`udp_validation_packets = 2`) and is disableable via
+  env (`HUB_UDP_VALIDATION_PACKETS=1`). It is **not** a true return-routability
+  check: a determined spoofer can send N forged-source packets as cheaply as
+  one, so it does not defend against deliberate reflection/amplification — real
+  return-routability needs an echoed cryptographic cookie, which a blind relay
+  cannot issue. It only stops a single stray packet from making the hub a
+  reflector for that address.
+- **Connection peers are not idle-pruned.** TTL eviction (C1) applies only to UDP
+  peers; a WSS/WebTransport/AF_UNIX peer's liveness is its transport connection
+  (removed on disconnect, plus a WS ping/idle-timeout for dead-but-unclosed
+  sockets), so a legitimate receive-only listener is never silently dropped.
+- **Connections are pinned to one band.** Although §10 routes purely by
+  `band_id`, each WSS/WebTransport/AF_UNIX connection is bound to the band of its
+  first frame (or, for WebTransport, its `?band=` query); frames naming a
+  different `band_id` are dropped rather than relayed cross-band (defense in
+  depth — `band_id` is still the routing capability, so this removes no ability
+  a peer couldn't get by connecting to that band directly).

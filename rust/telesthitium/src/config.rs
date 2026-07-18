@@ -80,7 +80,7 @@ fn env_bool(name: &str) -> bool {
 fn opt_addr(name: &str) -> Option<SocketAddr> {
     match env(name) {
         None => None,
-        Some(v) if v.eq_ignore_ascii_case("off") => None,
+        Some(v) if v.trim().eq_ignore_ascii_case("off") => None,
         Some(v) => match v.trim().parse() {
             Ok(a) => Some(a),
             Err(_) => {
@@ -91,21 +91,30 @@ fn opt_addr(name: &str) -> Option<SocketAddr> {
     }
 }
 
+/// Resolve the `HUB_BIND` directive. `None` = UDP disabled; `Some` = bind
+/// address (falling back to the default on empty/invalid input). Trims before
+/// every comparison so `" off"` disables rather than failing open. Pure, for
+/// testability.
+fn resolve_udp_bind(raw: Option<&str>) -> Option<SocketAddr> {
+    let default = || DEFAULT_UDP_BIND.parse().ok();
+    match raw.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("off") => None,
+        Some("") => default(),
+        Some(v) => match v.parse() {
+            Ok(addr) => Some(addr),
+            Err(_) => {
+                tracing::warn!(value = %v, "invalid HUB_BIND, using default");
+                default()
+            }
+        },
+        None => default(),
+    }
+}
+
 impl Config {
     /// Build config from the environment, warning (not failing) on bad values.
     pub fn from_env() -> Self {
-        let udp_bind = match std::env::var("HUB_BIND") {
-            Ok(v) if v.eq_ignore_ascii_case("off") => None,
-            Ok(v) if v.trim().is_empty() => Self::default_bind(),
-            Ok(v) => match v.trim().parse() {
-                Ok(addr) => Some(addr),
-                Err(_) => {
-                    tracing::warn!(value = %v, "invalid HUB_BIND, using default");
-                    Self::default_bind()
-                }
-            },
-            Err(_) => Self::default_bind(),
-        };
+        let udp_bind = resolve_udp_bind(std::env::var("HUB_BIND").ok().as_deref());
 
         let unix_dir = match env("HUB_UNIX_DIR") {
             Some(v) if v.eq_ignore_ascii_case("off") => None,
@@ -114,7 +123,15 @@ impl Config {
         };
 
         let tls_sans = env("HUB_TLS_SANS")
-            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            // A value like "," yields no SANs; fall back to the default rather
+            // than an empty list that could make identity generation fail (J1).
+            .filter(|v| !v.is_empty())
             .unwrap_or_else(|| vec!["localhost".to_string()]);
 
         Config {
@@ -204,6 +221,19 @@ mod tests {
         assert_eq!(parse_or::<u64>(Some("42".into()), 15), 42);
         assert_eq!(parse_or::<u64>(Some("  7 ".into()), 15), 7);
         assert_eq!(parse_or::<u64>(None, 15), 15);
+    }
+
+    #[test]
+    fn hub_bind_off_is_honored_despite_whitespace() {
+        // #3 regression — " off" must disable UDP, not fail open to 0.0.0.0.
+        let dflt = DEFAULT_UDP_BIND.parse().ok();
+        assert_eq!(resolve_udp_bind(Some(" off")), None);
+        assert_eq!(resolve_udp_bind(Some("OFF\n")), None);
+        assert_eq!(resolve_udp_bind(Some("\toff ")), None);
+        assert_eq!(resolve_udp_bind(Some("127.0.0.1:9")), "127.0.0.1:9".parse().ok());
+        assert_eq!(resolve_udp_bind(Some("  ")), dflt); // empty -> default
+        assert_eq!(resolve_udp_bind(Some("garbage")), dflt); // invalid -> default
+        assert_eq!(resolve_udp_bind(None), dflt);
     }
 
     #[test]

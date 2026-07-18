@@ -27,6 +27,33 @@ async fn udp_serve_stops_on_shutdown() {
 }
 
 #[tokio::test]
+async fn udp_serve_stops_on_shutdown_with_registered_peer() {
+    // #4 regression — a registered UDP peer holds a Sink::Udp clone of the
+    // writer's channel; shutdown must not block waiting for it to drain.
+    let reg = registry_open();
+    let addr = free_udp_addr().await;
+    let (tx, rx) = oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        telesthitium::udp::serve(addr, reg, 1024, async {
+            let _ = rx.await;
+        })
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Register a peer so a Sink::Udp clone lives in the registry.
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    peer.connect(addr).await.unwrap();
+    peer.send(&frame(1, 1, 0xAA)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let _ = tx.send(());
+    let out = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    assert!(out.is_ok(), "udp serve hung on shutdown with a registered peer");
+    assert!(out.unwrap().unwrap().is_ok());
+}
+
+#[tokio::test]
 async fn ws_serve_stops_on_shutdown() {
     let reg = registry_open();
     let port = free_tcp_port().await;

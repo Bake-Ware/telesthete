@@ -13,6 +13,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -30,6 +31,14 @@ use crate::tls::HubCert;
 
 /// Default endpoint path a peer connects to.
 pub const DEFAULT_WS_PATH: &str = "/band";
+
+/// How often the hub pings an otherwise-quiet WS connection. Connection peers
+/// are not idle-pruned from the registry, so liveness must come from the
+/// transport: a dead-but-unclosed TCP peer is detected via missed pongs.
+const WS_PING_INTERVAL: Duration = Duration::from_secs(20);
+/// Close a WS connection that sends nothing (not even a pong) for this long.
+/// Comfortably longer than the ping interval and the 5 s protocol keepalive.
+const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Serve WS/WSS until `shutdown` resolves.
 ///
@@ -60,7 +69,10 @@ pub async fn serve(
             let (tcp, peer) = match listener.accept().await {
                 Ok(x) => x,
                 Err(e) => {
+                    // Back off so a persistent accept error (e.g. EMFILE under
+                    // fd exhaustion) doesn't spin the loop at 100% CPU.
                     tracing::warn!(error = %e, "ws accept failed");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }
             };
@@ -132,32 +144,63 @@ where
     let (mut ws_tx, mut ws_rx) = ws.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Arc<[u8]>>(conn_queue.max(64));
 
-    // Writer: one WS binary message per relayed frame (F2 — no length prefix).
+    // Writer: one WS binary message per relayed frame (F2 — no length prefix),
+    // plus periodic pings so a dead-but-unclosed peer is detected.
     let writer = tokio::spawn(async move {
-        while let Some(frame) = out_rx.recv().await {
-            if ws_tx
-                .send(Message::Binary(Bytes::copy_from_slice(&frame)))
-                .await
-                .is_err()
-            {
-                break;
+        let mut ping = tokio::time::interval(WS_PING_INTERVAL);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ping.tick().await; // consume the immediate first tick
+        loop {
+            tokio::select! {
+                frame = out_rx.recv() => match frame {
+                    Some(f) => {
+                        if ws_tx
+                            .send(Message::Binary(Bytes::copy_from_slice(&f)))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    None => break, // registry dropped our sink -> peer gone
+                },
+                _ = ping.tick() => {
+                    if ws_tx.send(Message::Ping(Bytes::new())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
         let _ = ws_tx.close().await;
     });
 
-    // Reader: learn band from the first frame, relay every frame.
+    // Reader: learn the band from the first frame and pin the session to it;
+    // relay every frame. An idle timeout detects a dead connection — any inbound
+    // message (data, or a pong reply to our ping) resets it.
     let mut registered: Option<(telesthete::BandId, PeerKey)> = None;
-    while let Some(msg) = ws_rx.next().await {
-        let Ok(msg) = msg else { break };
+    loop {
+        let msg = match tokio::time::timeout(WS_IDLE_TIMEOUT, ws_rx.next()).await {
+            Ok(Some(Ok(m))) => m,
+            Ok(Some(Err(_))) | Ok(None) => break, // errored / closed
+            Err(_) => {
+                tracing::debug!("ws peer idle timeout; closing");
+                break;
+            }
+        };
         match msg {
             Message::Binary(data) => {
                 let Some(info) = frame::route_info(&data) else {
                     continue; // malformed; drop
                 };
                 let key = match registered {
-                    Some((_, k)) => {
-                        registry.touch(&info.band_id, &k);
+                    Some((band, k)) => {
+                        // Pin the session to its first band (#2): a frame naming a
+                        // different band_id is dropped, never relayed cross-band.
+                        if info.band_id != band {
+                            tracing::debug!("ws frame band_id != session band; dropping");
+                            continue;
+                        }
+                        registry.touch(&band, &k);
                         k
                     }
                     None => {
@@ -176,7 +219,7 @@ where
                 registry.forward(&info.band_id, &key, pkt);
             }
             Message::Close(_) => break,
-            _ => {} // Ping/Pong handled by the library; Text ignored
+            _ => {} // Ping auto-ponged by the library; Pong/Text reset idle only
         }
     }
 

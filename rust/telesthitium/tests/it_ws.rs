@@ -116,6 +116,43 @@ async fn ws_udp_bridge() {
 }
 
 #[tokio::test]
+async fn band_pinning_drops_cross_band() {
+    // #2 regression — a peer registered in band A cannot inject into band B.
+    let (port, _stop) = start_ws(registry_open(), None).await;
+    let mut a = ws_connect(port).await; // will pin to band 10
+    let mut c = ws_connect(port).await; // legitimate band-11 sender
+    let (mut b_tx, mut b_rx) = ws_connect(port).await.split(); // band-11 receiver
+
+    a.send(Message::Binary(Bytes::from(frame(10, 1, 0x01)))).await.unwrap(); // A -> band 10
+    b_tx.send(Message::Binary(Bytes::from(frame(11, 1, 0x02)))).await.unwrap(); // B -> band 11
+    c.send(Message::Binary(Bytes::from(frame(11, 1, 0x03)))).await.unwrap(); // C -> band 11
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    // A (pinned to band 10) tries to inject into band 11 — must be dropped.
+    a.send(Message::Binary(Bytes::from(frame(11, 1, 0xAA)))).await.unwrap();
+    // C legitimately sends into band 11 — must arrive.
+    c.send(Message::Binary(Bytes::from(frame(11, 1, 0xCC)))).await.unwrap();
+
+    // Collect B's inbound markers until the legitimate one; the injected one
+    // must never appear.
+    let mut seen = Vec::new();
+    for _ in 0..12 {
+        match tokio::time::timeout(Duration::from_millis(400), b_rx.next()).await {
+            Ok(Some(Ok(Message::Binary(d)))) if d.len() >= 43 => {
+                seen.push(d[42]);
+                if d[42] == 0xCC {
+                    break;
+                }
+            }
+            Ok(Some(Ok(_))) => continue,
+            _ => break,
+        }
+    }
+    assert!(seen.contains(&0xCC), "legitimate same-band frame must arrive");
+    assert!(!seen.contains(&0xAA), "cross-band injected frame must be dropped");
+}
+
+#[tokio::test]
 async fn wss_native_tls() {
     // F4 — native TLS terminates in-hub and relays.
     let cert = telesthitium::tls::self_signed(&["localhost"], 14).unwrap();

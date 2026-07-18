@@ -98,10 +98,14 @@ sudo systemctl enable --now telesthete-hub
 
 - **No keys, no plaintext.** The hub cannot decrypt; a compromised hub leaks
   only traffic patterns (who is on which band, and when), never payloads.
-- **Return-routability.** A UDP source must prove it can receive before the hub
-  will relay a band's traffic to it, defeating single-spoofed-packet reflection
-  (`HUB_UDP_VALIDATION_PACKETS`). Connection transports prove routability via
-  their handshake.
+- **UDP validation gate.** A UDP source must send a few packets before the hub
+  will relay a band's traffic to it (`HUB_UDP_VALIDATION_PACKETS`, default 2).
+  This is a mild robustness measure, **not** a return-routability proof — a
+  determined spoofer can send several forged-source packets as cheaply as one,
+  so it does not defend against deliberate reflection/amplification (a blind
+  relay cannot issue the echoed cookie that would). Connection transports
+  (WSS/WebTransport/AF_UNIX) prove routability via their handshake and are bound
+  to a single band per connection.
 - **Bounded memory.** Band and per-band peer caps, plus bounded per-connection
   queues (drop-on-overflow), cap resource use under flood.
 

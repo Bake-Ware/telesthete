@@ -124,28 +124,42 @@ fn bind_seqpacket(path: &Path) -> io::Result<Socket> {
     Ok(sock)
 }
 
-/// Accept SEQPACKET connections on one band's socket; each becomes a peer.
+/// Receive buffer per connection. A datagram larger than this is detected via
+/// MSG_TRUNC and dropped (never relayed truncated), rather than silently
+/// corrupting the frame.
+const RECV_BUF: usize = 128 * 1024;
+
+/// Accept SEQPACKET connections on one band's socket; each becomes a peer. A
+/// transient `accept` error must not permanently kill this band's socket, so we
+/// back off and retry rather than exiting the loop (#10).
 async fn accept_loop(
     afd: AsyncFd<Socket>,
     registry: Arc<Registry>,
     conn_queue: usize,
     band: BandId,
 ) {
-    while let Ok(sock) = accept(&afd).await {
-        if sock.set_nonblocking(true).is_err() {
-            continue;
-        }
-        match AsyncFd::new(sock) {
-            Ok(conn) => {
-                tokio::spawn(serve_peer(conn, registry.clone(), conn_queue, band));
+    loop {
+        match accept(&afd).await {
+            Ok(sock) => {
+                if sock.set_nonblocking(true).is_err() {
+                    continue;
+                }
+                match AsyncFd::new(sock) {
+                    Ok(conn) => {
+                        tokio::spawn(serve_peer(conn, registry.clone(), conn_queue, band));
+                    }
+                    Err(e) => tracing::debug!(error = %e, "af_unix conn registration failed"),
+                }
             }
-            Err(e) => tracing::debug!(error = %e, "af_unix conn registration failed"),
+            Err(e) => {
+                tracing::debug!(error = %e, "af_unix accept error; backing off and retrying");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
     }
 }
 
 async fn serve_peer(afd: AsyncFd<Socket>, registry: Arc<Registry>, conn_queue: usize, band: BandId) {
-    let afd = Arc::new(afd);
     let key = PeerKey::Conn(registry.next_conn_id());
     let (out_tx, mut out_rx) = mpsc::channel::<Arc<[u8]>>(conn_queue.max(64));
     if registry.connect(band, key, Sink::Conn(out_tx)).is_err() {
@@ -153,35 +167,49 @@ async fn serve_peer(afd: AsyncFd<Socket>, registry: Arc<Registry>, conn_queue: u
     }
     tracing::info!(band = %frame::band_hex(&band), "af_unix peer joined");
 
-    // Writer: one SEQPACKET message per relayed frame (boundaries preserved).
-    let writer = {
-        let afd = afd.clone();
-        tokio::spawn(async move {
-            while let Some(frame) = out_rx.recv().await {
-                if send_msg(&afd, &frame).await.is_err() {
-                    break;
-                }
-            }
-        })
-    };
-
-    // Reader: one message = one frame (I2).
-    let mut buf = vec![0u8; 65_536];
+    // One task drives both directions. A failed send (e.g. EMSGSIZE on an
+    // oversized frame) or a closed socket breaks the loop and tears the peer
+    // down — so a write-dead peer never lingers registered but undeliverable
+    // (#9). SEQPACKET preserves message boundaries: one recv = one frame (I2).
+    let mut buf = vec![0u8; RECV_BUF];
     loop {
-        match recv_msg(&afd, &mut buf).await {
-            Ok(0) => break, // peer closed
-            Ok(n) => {
-                if let Some(info) = frame::route_info(&buf[..n]) {
-                    registry.touch(&band, &key);
-                    registry.forward(&info.band_id, &key, Arc::from(&buf[..n]));
+        tokio::select! {
+            r = recv_msg(&afd, &mut buf) => match r {
+                // 0 = orderly close, or an invalid empty datagram; either way,
+                // close the connection (an empty message is never a valid frame).
+                Ok(0) => break,
+                // MSG_TRUNC reports the true datagram length; if it exceeds the
+                // buffer the frame is incomplete (missing its AEAD tag) — drop
+                // it rather than relay corruption (#8), and keep serving.
+                Ok(n) if n > buf.len() => {
+                    tracing::warn!(bytes = n, cap = buf.len(), "af_unix frame exceeds buffer; dropping");
                 }
-            }
-            Err(_) => break,
+                Ok(n) => {
+                    if let Some(info) = frame::route_info(&buf[..n]) {
+                        // Pin the connection to its band (#2): a frame for a
+                        // different band_id is dropped, not relayed cross-band.
+                        if info.band_id == band {
+                            registry.touch(&band, &key);
+                            registry.forward(&band, &key, Arc::from(&buf[..n]));
+                        } else {
+                            tracing::debug!("af_unix frame band_id != socket band; dropping");
+                        }
+                    }
+                }
+                Err(_) => break,
+            },
+            out = out_rx.recv() => match out {
+                Some(f) => {
+                    if send_msg(&afd, &f).await.is_err() {
+                        break; // send failed -> tear down (do not linger deaf)
+                    }
+                }
+                None => break, // registry dropped our sink
+            },
         }
     }
 
     registry.disconnect(&band, &key);
-    writer.abort();
 }
 
 // -- async SEQPACKET primitives over AsyncFd --------------------------------
@@ -207,16 +235,19 @@ async fn send_msg(afd: &AsyncFd<Socket>, data: &[u8]) -> io::Result<usize> {
     }
 }
 
+/// Receive one SEQPACKET message. Returns the datagram's **true** length (via
+/// `MSG_TRUNC`) even when it exceeds `buf`, so the caller can detect and drop a
+/// truncated frame rather than relay one missing its tail.
 async fn recv_msg(afd: &AsyncFd<Socket>, buf: &mut [u8]) -> io::Result<usize> {
     loop {
         let mut guard = afd.readable().await?;
         // socket2's recv wants `[MaybeUninit<u8>]`; `u8` and `MaybeUninit<u8>`
-        // share layout, and we only ever read back the `n` bytes recv reports
-        // written, so viewing the initialized buffer as uninit is sound.
+        // share layout, and we only ever read back the bytes recv actually
+        // wrote, so viewing the initialized buffer as uninit is sound.
         let uninit: &mut [MaybeUninit<u8>] = unsafe {
             std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<MaybeUninit<u8>>(), buf.len())
         };
-        match guard.try_io(|inner| inner.get_ref().recv(uninit)) {
+        match guard.try_io(|inner| inner.get_ref().recv_with_flags(uninit, libc::MSG_TRUNC)) {
             Ok(res) => return res,
             Err(_would_block) => continue,
         }

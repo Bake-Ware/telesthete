@@ -29,9 +29,16 @@ pub struct Limits {
     pub max_bands: usize,
     /// Maximum peers per band (conformance D2).
     pub max_peers_per_band: usize,
-    /// A UDP source must have sent this many packets before it becomes an
-    /// eligible relay *destination* — return-routability against single
-    /// spoofed-source reflection (conformance D4). `<= 1` disables the gate.
+    /// A UDP source must send this many packets before it becomes an eligible
+    /// relay *destination*. `<= 1` disables the gate.
+    ///
+    /// NOTE: this is a mild robustness measure, **not** a return-routability
+    /// proof. A determined spoofer can send N forged-source packets as cheaply
+    /// as one, so it does not defend against deliberate reflection/amplification
+    /// — that would require a cryptographic cookie the source echoes, which a
+    /// blind relay (holding no key, injecting no plaintext) cannot issue. It
+    /// only raises the bar against a single stray/one-off packet turning the hub
+    /// into a reflector for that address.
     pub udp_validation_packets: u32,
 }
 
@@ -235,15 +242,25 @@ impl Registry {
         }
     }
 
-    /// Evict peers idle longer than `ttl` and reap empty bands (conformance
-    /// C1/C2). Returns `(peers_evicted, bands_remaining)`.
+    /// Evict idle **UDP** peers and reap empty bands (conformance C1/C2).
+    /// Returns `(peers_evicted, bands_remaining)`.
+    ///
+    /// Connection-oriented peers (WSS/WebTransport/AF_UNIX) are **never** evicted
+    /// by idle TTL — their liveness is the transport connection itself, and they
+    /// are removed explicitly by [`Registry::disconnect`] when it closes. TTL is
+    /// a UDP notion (there is no connection to signal a UDP peer's departure);
+    /// applying it to connections would silently drop a legitimate receive-only
+    /// peer whose socket is still open, with no way for it to re-register.
     pub fn prune(&self, ttl: Duration) -> (usize, usize) {
         let now = Instant::now();
         let mut bands = self.bands.lock().unwrap();
         let mut evicted = 0usize;
         bands.retain(|_band, peers| {
             let before = peers.len();
-            peers.retain(|_k, p| now.duration_since(p.last_seen) <= ttl);
+            peers.retain(|k, p| match k {
+                PeerKey::Conn(_) => true,
+                PeerKey::Udp(_) => now.duration_since(p.last_seen) <= ttl,
+            });
             evicted += before - peers.len();
             !peers.is_empty()
         });
@@ -468,10 +485,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prune_evicts_stale_and_reaps() {
-        // C1 + C2
-        let r = Registry::new(big());
-        r.connect(band(1), PeerKey::Conn(1), conn(8).0).unwrap();
+    async fn prune_evicts_stale_udp_and_reaps() {
+        // C1 + C2 — TTL eviction applies to UDP peers.
+        let r = Registry::new(Limits {
+            udp_validation_packets: 1,
+            ..big()
+        });
+        let addr: SocketAddr = "127.0.0.1:6100".parse().unwrap();
+        r.observe_udp(band(1), addr, udp(8, addr).0).unwrap();
         assert_eq!(r.peer_count(&band(1)), 1);
         std::thread::sleep(Duration::from_millis(20));
         let (evicted, remaining) = r.prune(Duration::from_millis(5));
@@ -481,15 +502,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_peer_survives_prune() {
-        // C3
+    async fn active_udp_peer_survives_prune() {
+        // C3 — recent activity keeps a UDP peer alive across a sweep.
+        let r = Registry::new(Limits {
+            udp_validation_packets: 1,
+            ..big()
+        });
+        let addr: SocketAddr = "127.0.0.1:6101".parse().unwrap();
+        let key = PeerKey::Udp(addr);
+        r.observe_udp(band(1), addr, udp(8, addr).0).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        r.observe_udp(band(1), addr, udp(8, addr).0).unwrap(); // fresh activity
+        let (evicted, _) = r.prune(Duration::from_millis(50));
+        assert_eq!(evicted, 0);
+        assert!(r.contains(&band(1), &key));
+    }
+
+    #[tokio::test]
+    async fn conn_peer_survives_prune_while_connected() {
+        // Regression: connection peers are NOT idle-evicted, even when silent
+        // far longer than the TTL — their transport connection is their liveness
+        // (removal happens via disconnect). A receive-only listener must not go
+        // deaf.
         let r = Registry::new(big());
         let k = PeerKey::Conn(1);
         r.connect(band(1), k, conn(8).0).unwrap();
         std::thread::sleep(Duration::from_millis(20));
-        r.touch(&band(1), &k); // fresh activity
-        let (evicted, _) = r.prune(Duration::from_millis(50));
-        assert_eq!(evicted, 0);
+        let (evicted, remaining) = r.prune(Duration::from_millis(1)); // TTL far exceeded
+        assert_eq!(evicted, 0, "connection peer must not be TTL-evicted");
+        assert_eq!(remaining, 1);
         assert!(r.contains(&band(1), &k));
     }
 

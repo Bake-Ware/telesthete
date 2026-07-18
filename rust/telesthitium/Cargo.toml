@@ -42,5 +42,7 @@ bytes = { workspace = true }
 wtransport = "0.7"
 url = "2"
 # AF_UNIX SOCK_SEQPACKET (§9.4) — tokio has no native async SEQPACKET, so we
-# drive a socket2 socket through tokio's AsyncFd.
+# drive a socket2 socket through tokio's AsyncFd. libc supplies MSG_TRUNC so an
+# oversized datagram is detected and dropped, never relayed truncated.
 socket2 = { version = "0.5", features = ["all"] }
+libc = "0.2"

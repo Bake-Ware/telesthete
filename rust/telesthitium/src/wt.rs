@@ -44,6 +44,10 @@ use crate::tls::HubCert;
 pub const DEFAULT_WT_PATH: &str = "/telesthete";
 /// Per-packet length prefix on reliable WT streams (§12.4).
 const WT_STREAM_LEN_PREFIX: usize = 2;
+/// Cap on concurrent hub-opened Channel streams per WT peer. `channel_id` is a
+/// u16 the upstream influences, so the map is bounded and FIFO-evicted to stop a
+/// peer from exhausting QUIC streams / hub memory (#7).
+const MAX_EGRESS_CHANNELS: usize = 64;
 
 /// Serve WebTransport until `shutdown` resolves. Requires a TLS identity (QUIC
 /// mandates TLS 1.3).
@@ -152,6 +156,7 @@ async fn egress_writer(
     key: PeerKey,
 ) {
     let mut channels: HashMap<u16, SendStream> = HashMap::new();
+    let mut order: std::collections::VecDeque<u16> = std::collections::VecDeque::new();
     let mut control: Option<SendStream> = None;
 
     while let Some(frame) = out_rx.recv().await {
@@ -161,6 +166,16 @@ async fn egress_writer(
         match info.channel_type {
             Some(ChannelType::Stream) => {
                 // Unreliable datagram, one per frame, no length prefix (G2).
+                // QUIC datagrams are path-MTU bound (~1200B); a larger Stream
+                // frame (e.g. relayed from a 1472B-MTU UDP peer) cannot be
+                // carried. Stream is lossy by design (§5.2 watermark drop), but
+                // this loss is *systematic*, so we check and log rather than fail
+                // silently (#6). Producers should keep Stream frames within
+                // MAX_DATAGRAM_SIZE (§9.6) when a WT peer is on the band.
+                if conn.max_datagram_size().is_some_and(|max| frame.len() > max) {
+                    tracing::debug!(len = frame.len(), "stream frame exceeds WT datagram size; dropping");
+                    continue;
+                }
                 if let Err(e) = conn.send_datagram(&frame[..]) {
                     tracing::debug!(error = %e, "wt datagram send failed");
                 }
@@ -170,8 +185,20 @@ async fn egress_writer(
                 // async open can't use the Entry API, hence the explicit lookup.
                 let cid = info.channel_id;
                 if !channels.contains_key(&cid) {
+                    // Bound concurrent Channel streams (#7): FIFO-evict the
+                    // oldest (dropping a SendStream resets it). Stale entries
+                    // left by write failures are skipped here lazily.
+                    while channels.len() >= MAX_EGRESS_CHANNELS {
+                        match order.pop_front() {
+                            Some(old) => {
+                                channels.remove(&old);
+                            }
+                            None => break,
+                        }
+                    }
                     if let Some(s) = open_egress_stream(&conn, &registry, band, key).await {
                         channels.insert(cid, s);
+                        order.push_back(cid);
                     }
                 }
                 if let Some(s) = channels.get_mut(&cid) {
@@ -206,8 +233,8 @@ async fn open_egress_stream(
 ) -> Option<SendStream> {
     let opening = conn.open_bi().await.ok()?;
     let (send, recv) = opening.await.ok()?;
-    let r = registry.clone();
-    tokio::spawn(async move { read_framed_stream(recv, r, band, key).await });
+    let (r, c) = (registry.clone(), conn.clone());
+    tokio::spawn(async move { read_framed_stream(recv, r, band, key, c).await });
     Some(send)
 }
 
@@ -233,8 +260,12 @@ async fn ingress_datagrams(
 ) {
     while let Ok(dg) = conn.receive_datagram().await {
         if let Some(info) = frame::route_info(&dg) {
-            registry.touch(&band, &key);
-            registry.forward(&info.band_id, &key, Arc::from(&dg[..]));
+            // Pin the session to its query-declared band (#2): a datagram naming
+            // a different band_id is dropped, not relayed cross-band.
+            if info.band_id == band {
+                registry.touch(&band, &key);
+                registry.forward(&band, &key, Arc::from(&dg[..]));
+            }
         }
     }
 }
@@ -246,34 +277,44 @@ async fn ingress_streams(
     key: PeerKey,
 ) {
     while let Ok((_send, recv)) = conn.accept_bi().await {
-        let r = registry.clone();
-        tokio::spawn(async move { read_framed_stream(recv, r, band, key).await });
+        let (r, c) = (registry.clone(), conn.clone());
+        tokio::spawn(async move { read_framed_stream(recv, r, band, key, c).await });
     }
 }
 
+/// Read one length-prefixed frame off a reliable stream. `None` on FIN/reset.
+async fn read_one_frame(recv: &mut RecvStream) -> Option<Vec<u8>> {
+    let mut len_buf = [0u8; WT_STREAM_LEN_PREFIX];
+    recv.read_exact(&mut len_buf).await.ok()?;
+    let len = u16::from_be_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; len];
+    recv.read_exact(&mut buf).await.ok()?;
+    Some(buf)
+}
+
 /// Read length-prefixed frames off one reliable stream and relay each (G5).
+/// Also races `conn.closed()` so the task exits promptly on session teardown
+/// instead of lingering with an `Arc<Registry>` (#11).
 async fn read_framed_stream(
     mut recv: RecvStream,
     registry: Arc<Registry>,
     band: BandId,
     key: PeerKey,
+    conn: Arc<Connection>,
 ) {
     loop {
-        let mut len_buf = [0u8; WT_STREAM_LEN_PREFIX];
-        if recv.read_exact(&mut len_buf).await.is_err() {
-            break; // clean FIN or reset
-        }
-        let len = u16::from_be_bytes(len_buf) as usize;
-        if len == 0 {
-            continue;
-        }
-        let mut buf = vec![0u8; len];
-        if recv.read_exact(&mut buf).await.is_err() {
-            break;
-        }
-        if let Some(info) = frame::route_info(&buf) {
-            registry.touch(&band, &key);
-            registry.forward(&info.band_id, &key, Arc::from(buf.as_slice()));
+        let frame = tokio::select! {
+            _ = conn.closed() => break,
+            f = read_one_frame(&mut recv) => match f {
+                Some(f) => f,
+                None => break,
+            },
+        };
+        if let Some(info) = frame::route_info(&frame) {
+            if info.band_id == band {
+                registry.touch(&band, &key);
+                registry.forward(&band, &key, Arc::from(frame.as_slice()));
+            }
         }
     }
 }

@@ -50,7 +50,10 @@ pub async fn serve(
                 let (n, src) = match sock.recv_from(&mut buf).await {
                     Ok(x) => x,
                     Err(e) => {
+                        // Back off briefly so a persistent socket error can't
+                        // spin the recv loop at 100% CPU.
                         tracing::warn!(error = %e, "recv_from failed");
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                         continue;
                     }
                 };
@@ -77,7 +80,11 @@ pub async fn serve(
         _ = shutdown => tracing::info!("udp transport shutting down"),
     }
 
-    drop(tx);
+    // Abort the writer rather than waiting for the channel to close: registered
+    // peers hold `Sink::Udp` clones of `tx`, so `writer.await` would otherwise
+    // block until prune evicts every UDP peer (up to peer_ttl) — turning a clean
+    // SIGTERM into a hang that systemd escalates to SIGKILL.
+    writer.abort();
     let _ = writer.await;
     Ok(())
 }
