@@ -34,6 +34,16 @@ def test_keys():
         assert crypto.derive_encryption_key(v["psk"], cipher_id).hex() == key_hex, cipher_id
 
 
+def test_session_keys():
+    # Per-session data keys (SPEC §3.1/§3.3) must match the pinned vectors and
+    # differ from the base key.
+    v = load()
+    for case in v["session_keys"]["vectors"]:
+        got = crypto.derive_encryption_key(v["psk"], case["cipher"], session=case["session"])
+        assert got.hex() == case["key_hex"], (case["cipher"], case["session"])
+        assert got != crypto.derive_encryption_key(v["psk"], case["cipher"]), "session key must differ from base"
+
+
 def test_aead_vectors():
     v = load()
     for case in v["aead"]:

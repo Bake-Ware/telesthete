@@ -108,5 +108,30 @@
         "01abababababababababababababababab000100020304"
       ]
     }
-  ]
+  ],
+  "session_keys": {
+    "_comment": "Per-session data keys: HKDF info = 'encryption-'+cipher+'-session-'+epoch(8 BE). SPEC \u00a73.1/\u00a73.3.",
+    "vectors": [
+      {
+        "cipher": "chacha20-poly1305",
+        "session": 1,
+        "key_hex": "9e0f0ed432ecf3f18eae75326875a922c3b3a2ad0e77ef5a907012fa16341d82"
+      },
+      {
+        "cipher": "chacha20-poly1305",
+        "session": 1737158400123,
+        "key_hex": "1bc98368db951994615c384b806d94de1135340e076a4a47b4cc1d57399ba045"
+      },
+      {
+        "cipher": "aes256-gcm",
+        "session": 1,
+        "key_hex": "4a50a06daaeede63f231ef2bb7ded09dc59f0d7cc34abe3ada4cb5f46dfa14e0"
+      },
+      {
+        "cipher": "aes256-gcm",
+        "session": 1737158400123,
+        "key_hex": "984ffb52aed25236e191cd6393169fa304ccac092ed617ac65f04e1359e912c5"
+      }
+    ]
+  }
 }

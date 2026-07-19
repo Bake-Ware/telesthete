@@ -45,13 +45,24 @@ def derive_band_id(psk: str) -> bytes:
     return hashlib.sha256(psk.encode("utf-8")).digest()[:16]
 
 
-def derive_encryption_key(psk: str, cipher_id: str = BASELINE_CIPHER) -> bytes:
-    """32-byte per-cipher AEAD key via HKDF-SHA256. SPEC §3.1.
+def derive_encryption_key(psk: str, cipher_id: str = BASELINE_CIPHER,
+                          session: int = None) -> bytes:
+    """32-byte AEAD key via HKDF-SHA256. SPEC §3.1.
 
     info = "encryption-" + cipher_id, so each suite gets a distinct key.
+
+    When ``session`` is given, the sender's monotonic session epoch is mixed in
+    as a fixed 8-byte big-endian suffix (``"-session-" || epoch``), yielding a
+    per-session **data key**. Packets encrypted under an old session's key then
+    fail authentication after that sender restarts to a new epoch, which closes
+    the cross-session replay window (SPEC §3.3). HELLO/HELLO_ACK use the base key
+    (``session=None``) so a receiver can decrypt the handshake and learn the
+    peer's epoch before deriving its data key.
     """
     salt = b"telesthete-v1"
     info = b"encryption-" + cipher_id.encode("utf-8")
+    if session is not None:
+        info += b"-session-" + int(session).to_bytes(8, "big")
     # HKDF-Extract
     prk = hmac.new(salt, psk.encode("utf-8"), hashlib.sha256).digest()
     # HKDF-Expand, single 32-byte block

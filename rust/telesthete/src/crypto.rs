@@ -70,6 +70,24 @@ pub fn derive_key(psk: &[u8]) -> Key {
     derive_key_for(psk, BASELINE_CIPHER)
 }
 
+/// Per-session **data key** (SPEC §3.1/§3.3): the sender's monotonic session
+/// epoch is mixed into HKDF as a fixed 8-byte big-endian suffix
+/// (`"encryption-" + cipher_id + "-session-" + epoch`). Packets under an old
+/// epoch's key fail authentication after the sender restarts, closing the
+/// cross-session replay window. HELLO/HELLO_ACK keep the base [`derive_key_for`]
+/// so a receiver can bootstrap the peer's epoch.
+pub fn derive_session_key(psk: &[u8], cipher_id: &str, session: u64) -> Key {
+    let hk = Hkdf::<Sha256>::new(Some(b"telesthete-v1"), psk);
+    let mut info = b"encryption-".to_vec();
+    info.extend_from_slice(cipher_id.as_bytes());
+    info.extend_from_slice(b"-session-");
+    info.extend_from_slice(&session.to_be_bytes());
+    let mut okm = [0u8; KEY_LEN];
+    hk.expand(&info, &mut okm)
+        .expect("HKDF expand of 32 bytes from SHA-256 cannot fail");
+    okm
+}
+
 /// Build the 12-byte nonce: 4 zero bytes, then sequence as 8 BE bytes. SPEC §3.2.
 fn nonce_bytes(seq: u64) -> [u8; NONCE_LEN] {
     let mut n = [0u8; NONCE_LEN];
@@ -267,11 +285,23 @@ mod tests {
             "band_id diverged"
         );
 
-        // Per-cipher key derivation (both suites).
+        // Per-cipher base key derivation (both suites).
         for (cipher_id, key_hex) in v["keys"].as_object().unwrap() {
             Suite::from_id(cipher_id).expect("known cipher in vectors");
             let key = derive_key_for(psk, cipher_id);
             assert_eq!(to_hex(&key), key_hex.as_str().unwrap(), "key diverged: {cipher_id}");
+        }
+
+        // Per-session data keys (SPEC §3.1/§3.3): must be byte-identical to Python.
+        for case in v["session_keys"]["vectors"].as_array().unwrap() {
+            let cipher_id = case["cipher"].as_str().unwrap();
+            let session = case["session"].as_u64().unwrap();
+            let key = derive_session_key(psk, cipher_id, session);
+            assert_eq!(
+                to_hex(&key),
+                case["key_hex"].as_str().unwrap(),
+                "session key diverged: {cipher_id} session={session}"
+            );
         }
 
         for case in v["aead"].as_array().unwrap() {
