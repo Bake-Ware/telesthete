@@ -142,6 +142,19 @@ def test_replayed_set_is_dropped_by_watermark():
     assert len(changes) == 1, "replayed SET must be dropped (SPEC §3.3)"
 
 
+def test_out_of_range_lamport_rejected_keeps_digest_working():
+    # A hostile SET with a >2^64 (or negative) Lamport clock must be rejected,
+    # not stored — else digest()'s lamport.to_bytes(8) raises forever (§7.4).
+    a, _, _, _ = _pair()
+    a.set("k", "ok")
+    assert a.merge_entry({"key": "bad", "value": "x",
+                          "ts": [1 << 64, "attacker"]}) is False
+    assert a.merge_entry({"key": "neg", "value": "x",
+                          "ts": [-1, "attacker"]}) is False
+    assert "bad" not in a._entries and "neg" not in a._entries
+    a.digest()  # must not raise
+
+
 def test_lamport_advances_past_merged_clock():
     a, b, ta, tb = _pair()
     for _ in range(5):

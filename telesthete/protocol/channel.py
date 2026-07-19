@@ -38,6 +38,7 @@ _RESERVED_FLAGS = 0xF0
 DEFAULT_WINDOW = 32      # §6.4 sliding window (frames)
 DEFAULT_RTO = 0.5        # §6.4 retransmission timeout (seconds)
 MAX_FRAME_DATA = MAX_CHANNEL_DATA  # §6.4: 1024 bytes per frame
+MAX_RETRIES = 10         # give up on a frame after this many RTOs (dead peer)
 
 # Queue sentinel: FIN ordered behind already-queued data so close() cannot
 # reorder ahead of a window-blocked send() (§6.3 FIN consumes the next seq).
@@ -72,6 +73,7 @@ class _Unacked:
     seq: int
     data: bytes
     sent_at: float = field(default_factory=time.monotonic)
+    retries: int = 0
 
 
 class Channel:
@@ -206,15 +208,16 @@ class Channel:
             self._state = "CLOSED"
 
     def send(self, data: bytes):
-        """Queue raw bytes, split into <=1024-byte frames (§6.4).
+        """Send one logical message reliably. Alias for `send_message`.
 
-        Frames beyond the send window are QUEUED and drained as ACKs arrive —
-        never dropped (a full window must exert backpressure, not lose data)."""
-        if self._closing or self._state not in ("SYN_SENT", "ESTABLISHED"):
-            raise RuntimeError(f"Channel not open (state={self._state})")
-        for off in range(0, len(data), MAX_FRAME_DATA):
-            self._send_queue.append(data[off:off + MAX_FRAME_DATA])
-        self._pump()
+        Channel carries §6.6-enveloped messages ONLY — there is no raw
+        non-enveloped frame path. A bare byte payload on channel_type 0x02
+        would be misparsed as a §6.1 control frame by a conformant receiver
+        (forging ACK/window) and dropped by the Rust peer, which delivers
+        only reassembled messages; enveloping every send keeps the two
+        references interoperable. Fire-and-forget bytes belong on a Stream
+        (§5), not a Channel."""
+        self.send_message(data)
 
     def send_message(self, message: bytes):
         """Send one logical message via the §6.6 fragmentation envelope.
@@ -375,8 +378,12 @@ class Channel:
             return
         if seq > self._rcv_next:
             # §6.4: out-of-order — buffer by inner seq; duplicate buffered
-            # frames are dropped. Dup-ACK restates what we still expect.
-            if seq not in self._recv_buffer:
+            # frames are dropped. Dup-ACK restates what we still expect. The
+            # buffer is bounded by the window we advertise (§6.4): a seq beyond
+            # rcv_next + window_size is outside what we promised to hold, so we
+            # drop it (and dup-ACK) rather than let a hostile peer grow memory
+            # by sending sparse far-future sequences.
+            if seq < self._rcv_next + self.window_size and seq not in self._recv_buffer:
                 self._recv_buffer[seq] = (flags, data)
             self._send_ack()
             return
@@ -394,7 +401,11 @@ class Channel:
             self._send_ack()
 
     def _handle_ack(self, ack_num: int):
-        # §6.1 cumulative: acknowledges every frame with seq < ack_num.
+        # §6.1 cumulative: acknowledges every frame with seq < ack_num. Bound
+        # ack_num by what we have actually sent (_snd_next): a frame whose
+        # payload happened to decode to a huge ack_num must not clear frames we
+        # never sent, which would suppress their retransmission (silent loss).
+        ack_num = min(ack_num, self._snd_next)
         acked = [s for s in self._send_buffer if s < ack_num]
         for s in acked:
             del self._send_buffer[s]
@@ -434,29 +445,31 @@ class Channel:
         return False
 
     def _deliver(self, data: bytes):
-        # Raw byte path: every in-order frame payload.
-        self._recv_queue.append(data)
-        self._recv_ready.set()
-        if self._on_receive:
-            try:
-                self._on_receive(data)
-            except Exception as e:
-                logger.error(f"Channel {self.channel_id}: receive callback error: {e}")
-        # §6.6 message path: frames are envelope chunks; a completed
-        # reassembly emits one logical message. Non-envelope (raw send())
-        # frames fail the stateless parse and are ignored here.
+        # Every Channel data frame is a §6.6 envelope chunk; a completed
+        # reassembly emits one logical message on BOTH the recv() and
+        # recv_message() paths (they are the same message stream, kept as two
+        # names for API compatibility). on_receive and on_message both fire.
         message = self._reassembler.feed(data)
-        if message is not None:
-            self._msg_queue.append(message)
-            self._msg_ready.set()
-            if self._on_message:
+        if message is None:
+            return
+        for queue, ready in ((self._recv_queue, self._recv_ready),
+                             (self._msg_queue, self._msg_ready)):
+            queue.append(message)
+            ready.set()
+        for cb in (self._on_receive, self._on_message):
+            if cb:
                 try:
-                    self._on_message(message)
+                    cb(message)
                 except Exception as e:
-                    logger.error(f"Channel {self.channel_id}: message callback error: {e}")
+                    logger.error(f"Channel {self.channel_id}: receive callback error: {e}")
 
     def _teardown(self):
+        # Stop guaranteeing delivery: a CLOSED/reset channel must not keep
+        # retransmitting its unacked frames forever (that leaks the task and
+        # floods the peer). Clearing both buffers lets _retransmit_loop exit.
         self._state = "CLOSED"
+        self._send_buffer.clear()
+        self._send_queue.clear()
         self._closed.set()
 
     # --------------------------------------------------------- retransmission
@@ -472,7 +485,12 @@ class Channel:
 
     async def _retransmit_loop(self):
         """§6.4: resend unacked frames after RTO, each re-encrypted under a
-        fresh outer sequence via _transmit (never the original ciphertext)."""
+        fresh outer sequence via _transmit (never the original ciphertext).
+
+        Bounded: a frame retransmitted MAX_RETRIES times with no ACK means the
+        peer is gone (it never sent RST). We give up and tear the channel down
+        rather than resend forever — otherwise a vanished peer leaves this task
+        flooding the network and consuming outer sequences indefinitely."""
         while True:
             try:
                 await asyncio.sleep(self.rto / 4)
@@ -482,6 +500,13 @@ class Channel:
                 for seq in sorted(self._send_buffer):
                     frame = self._send_buffer.get(seq)
                     if frame is not None and (now - frame.sent_at) >= self.rto:
+                        if frame.retries >= MAX_RETRIES:
+                            logger.warning(f"Channel {self.channel_id}: peer "
+                                           f"unresponsive after {MAX_RETRIES} "
+                                           f"retransmits; tearing down")
+                            self._teardown()
+                            return
+                        frame.retries += 1
                         frame.sent_at = now
                         self._transmit(frame.flags, frame.seq, frame.data)
             except asyncio.CancelledError:

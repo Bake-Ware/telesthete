@@ -286,7 +286,21 @@ class ControlChannel:
             # the normal replay check (a replayed HELLO is still rejected).
             if msg_type in (ControlMessageType.HELLO, ControlMessageType.HELLO_ACK):
                 epoch = int(payload.get("session", 0))
-                if epoch > self._peer_session.get(peer_addr, -1):
+                prev_epoch = self._peer_session.get(peer_addr, -1)
+                if epoch < prev_epoch:
+                    # A HELLO from an OLDER epoch is a replay captured before the
+                    # peer restarted (HELLO is base-key encrypted, so it stays
+                    # decryptable forever). It must NOT reach the generic replay
+                    # check below: because HELLO sequences are independent random
+                    # starts, the stale seq is ~50% likely to exceed the live
+                    # watermark, which would ratchet the watermark far past the
+                    # live session and silently drop every real control packet
+                    # (permanent control-plane DoS). Drop it outright. (Matches
+                    # rust/telesthete/src/control.rs.)
+                    logger.debug(f"Dropping stale-epoch control from {peer_addr} "
+                                 f"(epoch {epoch} < {prev_epoch})")
+                    return
+                if epoch > prev_epoch:
                     self._peer_session[peer_addr] = epoch
                     self._recv_watermark[peer_addr] = seq
                     if self._on_new_session:

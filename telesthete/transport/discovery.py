@@ -7,7 +7,8 @@ Discovers peers on the local network without needing to know their addresses.
 import asyncio
 import socket
 import logging
-from typing import Callable, Optional, Set, Tuple
+from collections import OrderedDict
+from typing import Callable, Optional, Tuple
 
 from ..protocol.framing import PROTOCOL_VERSION
 
@@ -70,9 +71,12 @@ class Discovery:
         # Socket for sending/receiving broadcasts
         self.socket: Optional[socket.socket] = None
 
-        # Discovered peers (to avoid duplicate callbacks)
-        # Set of (hostname, ip, port)
-        self._discovered: Set[Tuple[str, str, int]] = set()
+        # Discovered peers (to avoid duplicate callbacks), as an insertion-
+        # ordered LRU keyed by (hostname, ip, port). Bounded so unauthenticated
+        # LAN beacons — an attacker can spoof unlimited (hostname, port) pairs —
+        # cannot grow it without limit; the oldest entry is evicted at the cap.
+        self._discovered: "OrderedDict[Tuple[str, str, int], None]" = OrderedDict()
+        self._max_discovered = 4096
 
         # Running state
         self._running = False
@@ -214,9 +218,11 @@ class Discovery:
             if peer_tuple in self._discovered:
                 return
 
-            # New peer discovered
+            # New peer discovered — record, evicting the oldest past the cap.
             logger.info(f"Discovered peer: {hostname} at {peer_ip}:{port}")
-            self._discovered.add(peer_tuple)
+            self._discovered[peer_tuple] = None
+            while len(self._discovered) > self._max_discovered:
+                self._discovered.popitem(last=False)
 
             # Call callback
             self.on_peer_found(hostname, peer_ip, port)

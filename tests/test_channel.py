@@ -6,6 +6,7 @@ fragmentation, and the nonce-safety property that killed the old channel.py
 import asyncio
 import os
 import sys
+import time
 
 import pytest
 
@@ -19,6 +20,16 @@ from telesthete.protocol.channel import (
 from telesthete.protocol.crypto import BandCrypto
 from telesthete.protocol.framing import pack_packet, unpack_packet, ChannelType
 from telesthete.protocol.sequence import SequenceSource
+from telesthete.protocol.fragment import Fragmenter
+
+
+def env(message: bytes) -> bytes:
+    """A single-chunk §6.6 envelope for `message`. Channel data is always
+    enveloped (no raw frame path), so a hand-injected frame must carry one."""
+    chunks = Fragmenter().split(message)
+    assert len(chunks) == 1
+    return chunks[0]
+
 
 VECTORS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vectors.json")
 
@@ -173,9 +184,9 @@ async def test_out_of_order_arrival_is_reordered(pair):
     got = []
     pair.b.on_receive(got.append)
     pair.a._snd_next = 4  # inner 1..3 "consumed"; emit newest-first
-    pair.a._transmit(FLAG_ACK, 3, b"three")
-    pair.a._transmit(FLAG_ACK, 2, b"two")
-    pair.a._transmit(FLAG_ACK, 1, b"one")
+    pair.a._transmit(FLAG_ACK, 3, env(b"three"))
+    pair.a._transmit(FLAG_ACK, 2, env(b"two"))
+    pair.a._transmit(FLAG_ACK, 1, env(b"one"))
 
     acks = []
     for _, pkt in list(pair.ta.sent):
@@ -235,7 +246,11 @@ async def test_rto_retransmission_fresh_outer_sequence(pair):
     outer2, (flags2, _, _, seq2, data2) = decode(pair.crypto, pair.ta.sent[0][1])
     assert outer2 != outer1, "retransmission must NOT reuse the outer sequence (nonce)"
     assert outer2 > outer1
-    assert (flags2, seq2, data2) == (flags1, seq1, data1) == (FLAG_ACK, 1, b"lost")
+    # Same (flags, inner seq, enveloped data); only the outer nonce changes.
+    assert (flags2, seq2, data2) == (flags1, seq1, data1)
+    assert (flags2, seq2) == (FLAG_ACK, 1)
+    from telesthete.protocol.fragment import Reassembler
+    assert Reassembler().feed(data2) == b"lost"  # the retransmit carries the message
 
     got = []
     pair.b.on_receive(got.append)
@@ -333,6 +348,47 @@ async def test_fin_queues_behind_pending_data(pair):
     await asyncio.wait_for(close_task, timeout=1.0)
     assert got == [b"first", b"second"]
     assert pair.a._state == "CLOSED" and pair.b._state == "CLOSED"
+
+
+async def test_rst_stops_retransmission_and_frees_buffer(pair):
+    # A reset (or any teardown) must stop resending unacked frames — otherwise
+    # the retransmit task floods the peer forever and never exits.
+    await pair.establish()
+    pair.a.rto = 0.02
+    pair.a.send(b"inflight")
+    assert pair.a._send_buffer
+    pair.ta.sent.clear()  # frame "lost"
+
+    # Peer resets us.
+    from telesthete.protocol.channel import FLAG_RST
+    b_outer = pair.b._seq_source.next()
+    aad = bytes([ChannelType.CHANNEL, CHANNEL_ID >> 8, CHANNEL_ID & 0xFF])
+    ct = pair.crypto.encrypt(b_outer, pack_frame(FLAG_RST, 0, 32, 0, b""), aad)
+    pair.a.handle_packet(B_ADDR, pack_packet(pair.crypto.band_id,
+                         ChannelType.CHANNEL, CHANNEL_ID, b_outer, ct))
+
+    assert pair.a._state == "CLOSED"
+    assert not pair.a._send_buffer, "reset must clear the send buffer"
+    pair.ta.sent.clear()
+    await asyncio.sleep(0.1)  # several RTOs
+    assert not pair.ta.sent, "a reset channel must not keep retransmitting"
+    assert pair.a._retransmit_task.done()
+
+
+async def test_dead_peer_retransmit_gives_up(pair):
+    # A peer that vanishes (no RST) must not draw infinite retransmits: after
+    # MAX_RETRIES the channel tears itself down.
+    await pair.establish()
+    pair.a.rto = 0.01
+    pair.a.send(b"into-the-void")
+    pair.tb.sent.clear()  # b never acks; a never hears back
+    # A retransmit fires ~once per RTO; teardown after MAX_RETRIES. Poll rather
+    # than sleep a fixed span, so scheduler jitter can't make this flaky.
+    deadline = time.monotonic() + 2.0
+    while pair.a._state != "CLOSED" and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert pair.a._state == "CLOSED", "unresponsive peer must trigger teardown"
+    assert pair.a._retransmit_task.done()
 
 
 # ------------------------------------------------------------- fragmentation

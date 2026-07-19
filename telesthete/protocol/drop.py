@@ -152,6 +152,31 @@ class DropReceiver(_DropBase):
         """callback(data, sha_ok) once every chunk arrived and was verified."""
         self._on_complete = callback
 
+    def _valid_offer(self, offer: dict) -> bool:
+        """§8.1: total_chunks must be the exact ceil(size/chunk_size), chunk_size
+        the fixed 1024, size non-negative. A malformed OFFER (e.g. total_chunks
+        wildly larger than size implies) would drive a request/allocation storm."""
+        try:
+            size = int(offer["size"])
+            chunk_size = int(offer["chunk_size"])
+            total = int(offer["total_chunks"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if size < 0 or chunk_size != CHUNK_SIZE:
+            return False
+        # A zero-byte file is one empty chunk (matches DropSender), so the
+        # count is never zero.
+        expected = max(1, -(-size // chunk_size))
+        return total == expected
+
+    def _chunk_len(self, index: int) -> int:
+        """Expected byte length of chunk `index` for the current offer."""
+        size = self.offer["size"]
+        total = self.offer["total_chunks"]
+        if index < total - 1:
+            return CHUNK_SIZE
+        return size - (total - 1) * CHUNK_SIZE  # final (possibly short) chunk
+
     def missing_ranges(self) -> List[Tuple[int, int]]:
         """Contiguous [start, end) runs of chunks we lack, split to §8.1 size."""
         total = self.offer["total_chunks"] if self.offer else 0
@@ -194,6 +219,9 @@ class DropReceiver(_DropBase):
             type_ = frame[0]
             if type_ == DropFrameType.OFFER:
                 offer = json.loads(frame[1:].decode("utf-8"))
+                if not self._valid_offer(offer):
+                    logger.warning(f"Drop {self.drop_id}: rejecting malformed OFFER")
+                    return
                 if self.offer is not None and (
                         offer.get("sha256") != self.offer.get("sha256")
                         or offer.get("size") != self.offer.get("size")):
@@ -202,17 +230,27 @@ class DropReceiver(_DropBase):
                     self.have.clear()
                     self.verified = None
                 self.offer = offer
+                # Drop any pre-seeded (resumed) chunk that this OFFER doesn't
+                # cover: an out-of-range index would KeyError in _finish, and a
+                # wrong-length chunk would corrupt the assembled file (§8.2
+                # resume applies only to chunks this offer actually defines).
+                total = offer["total_chunks"]
+                self.have = {i: c for i, c in self.have.items()
+                             if 0 <= i < total and len(c) == self._chunk_len(i)}
                 self.sender_addr = peer_addr
                 self._last_progress = time.monotonic()
-                self.request_missing()
+                if all(i in self.have for i in range(total)):
+                    self._finish()  # resume already had everything
+                else:
+                    self.request_missing()
             elif type_ == DropFrameType.CHUNK and self.offer is not None:
                 index = int.from_bytes(frame[1:5], "big")
                 if index >= self.offer["total_chunks"]:
                     return
-                if index not in self.have:
+                if index not in self.have and len(frame[5:]) == self._chunk_len(index):
                     self.have[index] = frame[5:]
                     self._last_progress = time.monotonic()
-                if len(self.have) == self.offer["total_chunks"]:
+                if all(i in self.have for i in range(self.offer["total_chunks"])):
                     self._finish()
                 elif self._outstanding is not None and all(
                         i in self.have for i in range(*self._outstanding)):

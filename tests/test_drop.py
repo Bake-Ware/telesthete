@@ -129,6 +129,42 @@ def test_hostile_request_is_clamped():
     assert len(ts.sent) <= sender.total_chunks
 
 
+def test_out_of_range_preseed_does_not_crash_finish():
+    # Pre-seeded chunks that this OFFER doesn't cover (out-of-range index or
+    # wrong length) must be pruned, not carried into _finish (KeyError/corrupt).
+    data = os.urandom(CHUNK_SIZE * 2)
+    good = {0: data[:CHUNK_SIZE]}
+    poison = {0: data[:CHUNK_SIZE], 99: b"nonsense", 1: b"wrong-length"}
+    sender, receiver, ts, tr = _pair(data, have=poison)
+    sender.offer(("receiver", 1))
+    _pump(sender, receiver, ts, tr)
+    assert receiver.verified is True
+    assert 99 not in receiver.have  # out-of-range pruned
+
+
+def test_malformed_offer_rejected():
+    data = os.urandom(CHUNK_SIZE * 3)
+    sender, receiver, ts, tr = _pair(data)
+    # Forge an OFFER whose total_chunks lies about the size.
+    receiver._send_raw = lambda *a, **k: None  # silence
+    receiver.handle_packet(("sender", 1),
+                           _offer_packet(sender, total_chunks=10_000_000))
+    assert receiver.offer is None, "malformed OFFER must be rejected"
+
+
+def _offer_packet(sender, total_chunks):
+    import json as _json
+    from telesthete.protocol.framing import pack_packet, ChannelType
+    from telesthete.protocol.drop import DropFrameType
+    body = bytes([DropFrameType.OFFER]) + _json.dumps({
+        "name": "x", "size": len(sender.data), "chunk_size": 1024,
+        "total_chunks": total_chunks, "sha256": sender.sha256}).encode()
+    seq = sender._seq_source.next()
+    aad = bytes([ChannelType.DROP, sender.drop_id >> 8, sender.drop_id & 0xFF])
+    ct = sender._send_crypto(("receiver", 1)).encrypt(seq, body, aad)
+    return pack_packet(sender.band_id, ChannelType.DROP, sender.drop_id, seq, ct)
+
+
 def test_empty_file():
     sender, receiver, ts, tr = _pair(b"")
     sender.offer(("receiver", 1))

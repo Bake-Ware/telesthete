@@ -234,6 +234,45 @@ def test_unknown_control_type_is_ignored():
     assert fired == [], "unknown control type must not be dispatched"
 
 
+def test_stale_epoch_hello_cannot_ratchet_control_watermark():
+    # A replayed pre-restart HELLO (older epoch) whose random outer sequence
+    # happens to exceed the live watermark must NOT advance the watermark — that
+    # would drop every genuine session-2 control packet (permanent control DoS).
+    crypto = BandCrypto("psk-ctrl-dos")
+    recv_mt = MockTransport()
+    receiver = ControlChannel(crypto.band_id, crypto=crypto, transport=recv_mt)
+    keepalives = []
+    receiver.register_handler(ControlMessageType.KEEPALIVE,
+                              lambda a, p: keepalives.append(p))
+
+    # Session 1 HELLO at a HIGH outer sequence.
+    s1 = MockTransport()
+    old = ControlChannel(crypto.band_id, crypto=crypto, transport=s1,
+                         seq_source=SequenceSource(start=9_000_000))
+    old.add_destination(("s", 1))
+    old.send_hello("h", ("s", 1), session=1)
+    stale_hello = s1.sent[-1][1]
+    receiver.handle_packet(("peer", 1), stale_hello)
+
+    # Session 2 HELLO at a LOWER outer sequence (peer restarted, fresh source).
+    s2 = MockTransport()
+    new = ControlChannel(crypto.band_id, crypto=crypto, transport=s2,
+                         seq_source=SequenceSource(start=100))
+    new.add_destination(("s", 1))
+    new.send_hello("h", ("s", 1), session=2)
+    receiver.handle_packet(("peer", 1), s2.sent[-1][1])
+
+    # Replay the stale session-1 HELLO (high seq). It must be dropped by the
+    # epoch check, NOT ratchet the watermark up to 9,000,000+.
+    receiver.handle_packet(("peer", 1), stale_hello)
+
+    # Live session-2 keepalives (seq ~100+) must still be accepted.
+    for _ in range(3):
+        new.send_message(ControlMessageType.KEEPALIVE, {}, dest=("s", 1))
+        receiver.handle_packet(("peer", 1), s2.sent[-1][1])
+    assert len(keepalives) == 3, "stale-epoch HELLO must not wedge the control plane"
+
+
 def test_stale_epoch_hello_cannot_downgrade_peer():
     # §4.3 monotonicity at the Band layer: a replayed pre-restart HELLO (older
     # epoch) must not roll back peer.session_epoch/cipher — that would swap the

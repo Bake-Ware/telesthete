@@ -163,6 +163,14 @@ class Board:
         """Apply one SET payload. Returns True if it changed local state."""
         key = payload["key"]
         lamport, actor = int(payload["ts"][0]), str(payload["ts"][1])
+        # The Lamport clock is a uint64 on the wire and in the digest (§7.4
+        # encodes it as 8 BE bytes). A negative or >2^64-1 value would raise in
+        # to_bytes(8) and permanently break digest() — an anti-entropy DoS. A
+        # conformant clock never leaves [0, 2^64); reject anything that does.
+        if not 0 <= lamport < (1 << 64):
+            logger.warning(f"Board {self.board_id}: rejecting out-of-range "
+                           f"lamport {lamport} for key {key!r}")
+            return False
         incoming = BoardEntry(value=payload.get("value"), lamport=lamport,
                               actor=actor, deleted=bool(payload.get("deleted", False)))
         self._lamport = max(self._lamport, lamport)  # clock advance (§7.3)

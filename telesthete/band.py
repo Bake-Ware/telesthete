@@ -218,7 +218,11 @@ class Band:
         selected = select_cipher(init_ciphers, self.ciphers)
 
         peer = self._ensure_peer(peer_addr, hostname)
-        epoch = int(payload.get("session", peer.session_epoch))
+        # Absent session defaults to 0 (matching the Rust serde default), NOT the
+        # peer's -1 sentinel: a peer that omits the field must still get a usable
+        # epoch, else recv_crypto stays None and every data packet is dropped
+        # forever. A conformant peer always sends session (§4.3).
+        epoch = int(payload.get("session", 0))
         if epoch < peer.session_epoch:
             # §4.3 monotonicity: an older-epoch HELLO is a replay from before a
             # restart. Adopting it would downgrade the peer's session key and
@@ -240,13 +244,21 @@ class Band:
         """Handle HELLO_ACK: adopt the cipher the responder committed (§3.5)."""
         hostname = payload.get("hostname", str(peer_addr))
         peer = self._ensure_peer(peer_addr, hostname)
-        epoch = int(payload.get("session", peer.session_epoch))
+        epoch = int(payload.get("session", 0))  # see _on_hello: 0 default, not -1
         if epoch < peer.session_epoch:
             # §4.3 monotonicity — see _on_hello.
             logger.debug(f"Ignoring stale-epoch HELLO_ACK from {peer_addr} (epoch {epoch})")
             return
         peer.capabilities = payload.get("capabilities", [])
-        peer.cipher = payload.get("cipher", BASELINE_CIPHER)
+        committed = payload.get("cipher", BASELINE_CIPHER)
+        if committed not in self.ciphers:
+            # §3.5: the responder must commit a suite we offered. An unknown or
+            # unsupported string would derive a key we can't reproduce and wedge
+            # the data path — fall back to the mandatory baseline instead.
+            logger.warning(f"Peer {peer_addr} committed unsupported cipher "
+                           f"{committed!r}; using baseline")
+            committed = BASELINE_CIPHER
+        peer.cipher = committed
         peer.session_epoch = epoch
         peer.update_last_seen()
 
@@ -528,11 +540,18 @@ class Band:
         self.control.send_goodbye()
         await asyncio.sleep(0.1)  # Give time for goodbye to send
 
+        # Cancel per-Channel retransmit tasks: they hold the transport and would
+        # keep resending (and stay alive) after the socket closes otherwise.
+        channel_tasks = [c._retransmit_task for c in self.channels.values()
+                         if c._retransmit_task is not None]
+        for t in channel_tasks:
+            t.cancel()
+
         # Stop tasks
         for task in self._tasks:
             task.cancel()
 
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        await asyncio.gather(*self._tasks, *channel_tasks, return_exceptions=True)
 
         # Stop transport
         await self.transport.stop()
