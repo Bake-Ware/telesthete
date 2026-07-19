@@ -24,6 +24,7 @@ bitflags.workspace = true
 tokio-stream = "0.1"
 nix = { version = "0.30", features = ["socket", "uio", "fs"] }
 libc = "0.2"
+getrandom = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

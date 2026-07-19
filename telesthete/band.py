@@ -7,9 +7,11 @@ A Band is a PSK-scoped encrypted communication context between peers.
 import asyncio
 import logging
 import socket
+import time
 from typing import Optional, Dict, Callable, List
 
 from .protocol.crypto import BandCrypto, select_cipher, BASELINE_CIPHER
+from .protocol.sequence import SequenceSource
 from .protocol.stream import Stream
 from .protocol.control import ControlChannel, ControlMessageType
 from .protocol.framing import ChannelType
@@ -63,12 +65,25 @@ class Band:
         self.crypto = self._crypto_for_cipher(BASELINE_CIPHER)
         self.band_id = self.crypto.band_id
 
+        # One sequence source for this sender, shared across Control/Stream/
+        # Channel so no two packets we emit reuse an AEAD (key, nonce) — the
+        # nonce is the sequence, and the key is band-wide (SPEC §3.3).
+        self.seq_source = SequenceSource()
+
+        # This band instance's session epoch (SPEC §4.3). Advertised in HELLO so
+        # a peer that has seen an earlier session rebases its replay watermark
+        # after we restart, instead of dropping our fresh (lower-sequence) HELLO.
+        self.session_epoch = int(time.time() * 1000)
+
         # Transport
         self.transport = UDPTransport(bind_address, bind_port)
 
-        # Control channel (per-peer negotiated cipher resolver)
+        # Control channel (per-peer negotiated cipher resolver). Restart of a
+        # peer (new session epoch) rebases that peer's Stream watermarks too.
         self.control = ControlChannel(self.band_id, transport=self.transport,
-                                      crypto_for=self.crypto_for_peer)
+                                      crypto_for=self.crypto_for_peer,
+                                      seq_source=self.seq_source,
+                                      on_new_session=self._on_new_session)
 
         # Peers
         self.peers: Dict[tuple, Peer] = {}
@@ -161,12 +176,14 @@ class Band:
         peer = self._ensure_peer(peer_addr, hostname)
         peer.capabilities = payload.get("capabilities", [])
         peer.cipher = selected
+        peer.session_epoch = int(payload.get("session", peer.session_epoch))
         peer.update_last_seen()
 
-        # Commit the negotiated suite back to the initiator.
+        # Commit the negotiated suite back to the initiator, with our epoch.
         self.control.send_hello_ack(self.hostname, peer_addr,
                                     capabilities=self.capabilities,
-                                    ciphers=self.ciphers, cipher=selected)
+                                    ciphers=self.ciphers, cipher=selected,
+                                    session=self.session_epoch)
 
     def _on_hello_ack(self, peer_addr: tuple, payload: dict):
         """Handle HELLO_ACK: adopt the cipher the responder committed (§3.5)."""
@@ -174,7 +191,15 @@ class Band:
         peer = self._ensure_peer(peer_addr, hostname)
         peer.capabilities = payload.get("capabilities", [])
         peer.cipher = payload.get("cipher", BASELINE_CIPHER)
+        peer.session_epoch = int(payload.get("session", peer.session_epoch))
         peer.update_last_seen()
+
+    def _on_new_session(self, peer_addr: tuple):
+        """A peer (re)started its session: rebase its Stream watermarks so its
+        fresh (possibly lower) sequences are accepted (SPEC §3.3/§4.3). The
+        Control watermark is rebased by the ControlChannel itself."""
+        for stream in self.streams.values():
+            stream.reset_peer(peer_addr)
 
     def _on_keepalive(self, peer_addr: tuple, payload: dict):
         """Handle KEEPALIVE from peer"""
@@ -219,9 +244,12 @@ class Band:
         if stream_id in self.streams:
             return self.streams[stream_id]
 
-        # Create new stream (per-peer negotiated cipher resolver)
+        # Create new stream (per-peer negotiated cipher resolver + the band's
+        # shared sequence source so nonces never collide with Control/other
+        # streams, SPEC §3.3).
         stream = Stream(self.band_id, stream_id, transport=self.transport,
-                        priority=priority, crypto_for=self.crypto_for_peer)
+                        priority=priority, crypto_for=self.crypto_for_peer,
+                        seq_source=self.seq_source)
 
         # Add all current peers as destinations
         for peer_addr in self.peers.keys():
@@ -242,9 +270,11 @@ class Band:
         """
         peer_addr = (host, port)
 
-        # Send HELLO advertising our capabilities + ordered ciphers (§3.5)
+        # Send HELLO advertising our capabilities + ordered ciphers (§3.5) and
+        # our session epoch (§4.3).
         self.control.send_hello(self.hostname, peer_addr,
-                                capabilities=self.capabilities, ciphers=self.ciphers)
+                                capabilities=self.capabilities, ciphers=self.ciphers,
+                                session=self.session_epoch)
         logger.info(f"Connecting to peer at {peer_addr}")
 
     def get_peers(self) -> List[Peer]:

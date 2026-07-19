@@ -123,13 +123,17 @@ async fn handle_stream_inbound(
     }
     let key = (in_pkt.from, in_pkt.header.channel_id);
     {
+        // Accept the first packet seen from a (peer, stream) at whatever random
+        // sequence the sender started from (SPEC §3.3); thereafter require
+        // strictly increasing sequences. A prior `or_insert(0)` wrongly dropped
+        // any first packet at sequence 0 — including a conformant peer's.
         let mut wm = watermarks.lock().await;
-        let entry = wm.entry(key).or_insert(0);
-        if in_pkt.header.sequence <= *entry {
-            // Stale — drop.
-            return None;
+        match wm.get(&key) {
+            Some(&prev) if in_pkt.header.sequence <= prev => return None, // stale
+            _ => {
+                wm.insert(key, in_pkt.header.sequence);
+            }
         }
-        *entry = in_pkt.header.sequence;
     }
     let priority = in_pkt.payload[0];
     let data = in_pkt.payload[1..].to_vec();

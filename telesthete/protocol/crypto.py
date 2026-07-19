@@ -21,7 +21,10 @@ associated data — never prepended to the plaintext.
 
 import hashlib
 import hmac
+import logging
 from typing import Tuple
+
+_log = logging.getLogger(__name__)
 
 try:
     from nacl import bindings as _na
@@ -59,9 +62,17 @@ def derive_encryption_key(psk: str, cipher_id: str = BASELINE_CIPHER) -> bytes:
 def select_cipher(initiator_prefs, responder_supported) -> str:
     """Pick the negotiated AEAD suite per SPEC §3.5: the first entry in the
     *initiator's* ordered preference list that the *responder* also supports.
-    Falls back to the mandatory baseline (which both MUST support), so this
-    never fails."""
+
+    Per §3.5 rule 2 / §12.5, both lists MUST include the mandatory baseline
+    (``chacha20-poly1305``). A list that omits it is non-conformant; we normalize
+    by treating the baseline as always supported (it is mandatory) so selection
+    never fails, and log the violation for the operator.
+    """
+    if BASELINE_CIPHER not in responder_supported:
+        _log.warning("cipher list omits the mandatory baseline (SPEC §12.5); "
+                     "treating baseline as supported")
     supported = set(responder_supported)
+    supported.add(BASELINE_CIPHER)  # baseline is mandatory (§3.5 rule 2)
     for cid in initiator_prefs:
         if cid in supported:
             return cid

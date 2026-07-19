@@ -143,14 +143,35 @@ AAD = [channel_type (1B)] [channel_id high byte] [channel_id low byte]
 
 ### 3.3 Security Notes
 
-- Sequence numbers MUST be monotonically increasing per sender per Band.
-  Reuse of a sequence number with the same key is catastrophic for any
-  AEAD (both ChaCha20-Poly1305 and AES-256-GCM).
-- The 64-bit sequence space (2^64 packets) is effectively inexhaustible.
-- Receivers **MUST** reject packets whose sequence number is at or below
-  the per-(peer, channel_type, channel_id) high-water mark, and advance
-  the mark on each accepted packet. This is replay protection; it is the
-  same freshness mechanism Streams use (§5.2). *(SHOULD → MUST in v1.2.)*
+- **One sequence source per sender, shared across all channels/streams.** The
+  nonce is derived from the sequence alone (§3.2) and the key is band-wide
+  (§3.1, PSK-only — no per-sender component), so reuse of a sequence number
+  under one key is catastrophic for any AEAD (keystream recovery + tag
+  forgery). A sender therefore MUST draw every packet's sequence — Control,
+  Stream, and Channel alike — from a **single** monotonic counter, never a
+  per-channel one. (A per-channel counter starting at 0 would make Control
+  seq 0 and the first Stream frame collide immediately.)
+- **Counters MUST be CSPRNG-initialized (v1.2).** Because the key is shared by
+  every band member, two senders that both started at 0 (or 1) would reuse
+  `(key, nonce)` on their first packets. Each sender MUST seed its counter from
+  a cryptographically secure RNG (a 63-bit start is RECOMMENDED, leaving ~2^63
+  of headroom before wrap). This makes a cross-sender or cross-restart
+  collision birthday-bounded and negligible rather than guaranteed. Sequences
+  remain monotonically increasing per sender from that random start.
+- The 64-bit sequence space is effectively inexhaustible; a sender MUST NOT let
+  its counter wrap (re-key / re-handshake first).
+- Receivers **MUST** reject packets whose sequence is at or below the
+  per-(peer, channel_type, channel_id) high-water mark, and advance the mark on
+  each accepted packet (replay protection; same freshness mechanism as §5.2).
+  Because senders start at a random value, a receiver **MUST accept the first
+  packet it sees from a peer at whatever sequence it carries** (establishing the
+  mark), then require strictly increasing sequences. *(SHOULD → MUST in v1.2.)*
+- **Restart handling.** A restarted sender picks a new random start that may
+  fall below a receiver's existing high-water mark. To avoid a permanent
+  lockout, HELLO/HELLO_ACK carry a monotonic `session` epoch (§4.3); a receiver
+  that sees a **newer** epoch from a peer MUST rebase (clear) that peer's
+  high-water marks, accepting the fresh session. An older/equal epoch does not
+  rebase, so a replayed HELLO cannot roll the mark backward.
 - Cipher negotiation (§3.5) is downgrade-resistant: HELLO/HELLO_ACK are
   encrypted under the mandatory baseline key, which an attacker without
   the PSK cannot forge or tamper. Telesthete has no anonymous key
@@ -243,7 +264,8 @@ older peer silently drops them rather than erroring.
 ```json
 {"type": 1, "payload": {"hostname": "machine-name",
                          "capabilities": ["af-unix", "webtransport"],
-                         "ciphers": ["aes256-gcm", "chacha20-poly1305"]}}
+                         "ciphers": ["aes256-gcm", "chacha20-poly1305"],
+                         "session": 1737158400123}}
 ```
 
 `capabilities` and `ciphers` are **mandatory** as of v1.2 — capability
@@ -252,13 +274,22 @@ and MUST contain the baseline `chacha20-poly1305` (§3.5). HELLO itself is
 always encrypted with the baseline suite. A peer that omits these fields
 is non-conformant.
 
+`session` is a monotonic per-sender epoch (v1.2), typically the sender's
+start time in milliseconds, that increases on every restart. A receiver uses
+it to rebase replay high-water marks after a peer restarts (§3.3): a HELLO or
+HELLO_ACK bearing a **newer** epoch than last seen from that peer rebases its
+marks (accepting the peer's fresh CSPRNG-seeded sequence), while an older or
+equal epoch does not — so a replayed HELLO cannot roll a mark backward. A peer
+that omits `session` is treated as epoch 0.
+
 ### 4.4 HELLO_ACK (0x02)
 
 ```json
 {"type": 2, "payload": {"hostname": "responder-name",
                          "capabilities": ["..."],
                          "ciphers": ["..."],
-                         "cipher": "aes256-gcm"}}
+                         "cipher": "aes256-gcm",
+                         "session": 1737158400456}}
 ```
 
 `capabilities` and `ciphers` semantics match §4.3 (mandatory). The

@@ -11,6 +11,7 @@ from typing import Callable, Optional, Dict
 from collections import defaultdict
 
 from .framing import pack_stream_message, unpack_packet, ChannelType
+from .sequence import SequenceSource
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,8 @@ class Stream:
         crypto=None,
         transport=None,
         priority: int = 128,
-        crypto_for=None
+        crypto_for=None,
+        seq_source=None
     ):
         """
         Initialize a Stream
@@ -54,12 +56,14 @@ class Stream:
         self.transport = transport
         self.priority = priority
 
-        # Sequence number for outbound packets
-        self._send_sequence = 0
+        # Shared per-sender sequence source (SPEC §3.3). One per band, shared with
+        # Control/Channel so nonces never collide; a private one if omitted.
+        self._seq_source = seq_source if seq_source is not None else SequenceSource()
 
-        # High-water mark for inbound packets (per peer)
-        # Maps peer_addr -> highest_sequence_seen
-        self._recv_watermark: Dict[tuple, int] = defaultdict(lambda: -1)
+        # High-water mark for inbound packets (per peer). A missing entry means
+        # "not yet seen" -> the first packet is accepted at whatever (random)
+        # sequence the sender started from; thereafter strictly increasing.
+        self._recv_watermark: Dict[tuple, int] = {}
 
         # Receive callback
         self._on_receive: Optional[Callable] = None
@@ -97,9 +101,8 @@ class Stream:
             data: Payload to send
         """
 
-        # Increment sequence
-        sequence = self._send_sequence
-        self._send_sequence += 1
+        # Draw one sequence from the shared per-sender source (SPEC §3.3).
+        sequence = self._seq_source.next()
 
         # Build associated data for AEAD
         aad = bytes([
@@ -119,6 +122,11 @@ class Stream:
             ciphertext = crypto.encrypt(sequence, payload, aad)
             packet = pack_stream_message(self.band_id, self.stream_id, sequence, ciphertext)
             self.transport.send(dest, packet)
+
+    def reset_peer(self, peer_addr: tuple):
+        """Forget a peer's watermark so its next packet is accepted afresh.
+        Called when the peer (re)starts a session (SPEC §3.3)."""
+        self._recv_watermark.pop(peer_addr, None)
 
     def on_receive(self, callback: Callable[[bytes, tuple, int], None]):
         """
@@ -153,9 +161,11 @@ class Stream:
                 logger.warning(f"Wrong stream ID: {packet.channel_id}")
                 return
 
-            # Check high-water mark (drop stale/replayed packets, SPEC §3.3)
-            watermark = self._recv_watermark[peer_addr]
-            if packet.sequence <= watermark:
+            # Check high-water mark (drop stale/replayed packets, SPEC §3.3).
+            # First packet from a peer is accepted at its random start; then
+            # strictly increasing.
+            watermark = self._recv_watermark.get(peer_addr)
+            if watermark is not None and packet.sequence <= watermark:
                 logger.debug(f"Dropping stale packet: seq={packet.sequence}, watermark={watermark}")
                 return
 

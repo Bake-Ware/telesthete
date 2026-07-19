@@ -13,6 +13,7 @@ from enum import IntEnum
 
 from .framing import pack_control_message, unpack_packet, ChannelType
 from .crypto import BASELINE_CIPHER
+from .sequence import SequenceSource
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,8 @@ class ControlChannel:
     Always reliable (we'll add retransmission later if needed)
     """
 
-    def __init__(self, band_id: bytes, crypto=None, transport=None, crypto_for=None):
+    def __init__(self, band_id: bytes, crypto=None, transport=None, crypto_for=None,
+                 seq_source=None, on_new_session=None):
         """
         Initialize control channel
 
@@ -45,6 +47,12 @@ class ControlChannel:
             transport: UDPTransport instance
             crypto_for: optional resolver(peer_addr, cipher_id=None) -> BandCrypto
                 for per-peer negotiated ciphers (SPEC §3.5)
+            seq_source: the sender's shared :class:`SequenceSource` (SPEC §3.3).
+                One per band, shared with the Streams/Channels so nonces never
+                collide. A private one is created if omitted (standalone use).
+            on_new_session: optional callback(peer_addr) fired when a peer
+                (re)starts a session, so the Band can rebase that peer's Stream
+                watermarks too.
         """
         self.band_id = band_id
         self.transport = transport
@@ -54,8 +62,9 @@ class ControlChannel:
             self._crypto_for = lambda addr, cipher_id=None: crypto
         self.crypto = crypto
 
-        # Sequence number
-        self._send_sequence = 0
+        # Shared per-sender sequence source (SPEC §3.3).
+        self._seq_source = seq_source if seq_source is not None else SequenceSource()
+        self._on_new_session = on_new_session
 
         # Peer destinations
         self._destinations = []
@@ -68,8 +77,13 @@ class ControlChannel:
         self._keepalive_interval = 5.0  # seconds
 
         # Replay protection: highest accepted sequence per peer (SPEC §3.3).
-        # Control is monotonic per sender, so a watermark is exact.
-        self._recv_watermark: Dict[tuple, int] = defaultdict(lambda: -1)
+        # A missing entry means "not yet seen" -> the first packet is accepted at
+        # whatever (random) sequence the sender started from; thereafter strictly
+        # increasing. `_peer_session` records the peer's session epoch so a
+        # restarted peer (lower random start, newer epoch) rebases rather than
+        # being locked out.
+        self._recv_watermark: Dict[tuple, int] = {}
+        self._peer_session: Dict[tuple, int] = {}
 
     def add_destination(self, peer_addr: tuple):
         """Add peer destination"""
@@ -105,9 +119,9 @@ class ControlChannel:
             dest: Specific destination, or None to broadcast to all peers
         """
 
-        # Increment sequence (shared across destinations)
-        sequence = self._send_sequence
-        self._send_sequence += 1
+        # Draw one sequence from the shared per-sender source (SPEC §3.3),
+        # reused across every destination of this message.
+        sequence = self._seq_source.next()
 
         message = {
             "type": int(msg_type),
@@ -129,23 +143,27 @@ class ControlChannel:
             self.transport.send(d, packet)
 
     def send_hello(self, hostname: str, dest: tuple,
-                   capabilities=None, ciphers=None):
+                   capabilities=None, ciphers=None, session: int = 0):
         """Send HELLO with mandatory capabilities + ordered ciphers (SPEC §4.3).
-        Always on the baseline suite."""
+        Always on the baseline suite. `session` is this sender's session epoch
+        (SPEC §4.3), which lets a receiver rebase its replay watermark on a
+        restart instead of locking the peer out."""
         self.send_message(ControlMessageType.HELLO, {
             "hostname": hostname,
             "capabilities": capabilities or [],
             "ciphers": ciphers or [BASELINE_CIPHER],
+            "session": int(session),
         }, dest, baseline=True)
 
     def send_hello_ack(self, hostname: str, dest: tuple,
-                       capabilities=None, ciphers=None, cipher=None):
+                       capabilities=None, ciphers=None, cipher=None, session: int = 0):
         """Send HELLO_ACK committing the negotiated `cipher` (SPEC §4.4)."""
         self.send_message(ControlMessageType.HELLO_ACK, {
             "hostname": hostname,
             "capabilities": capabilities or [],
             "ciphers": ciphers or [BASELINE_CIPHER],
             "cipher": cipher or BASELINE_CIPHER,
+            "session": int(session),
         }, dest, baseline=True)
 
     def send_keepalive(self):
@@ -207,42 +225,74 @@ class ControlChannel:
                 logger.warning(f"Wrong channel type: {packet.channel_type}")
                 return
 
-            # Replay protection (SPEC §3.3): reject seq <= high-water mark.
-            if packet.sequence <= self._recv_watermark[peer_addr]:
-                logger.debug(
-                    f"Dropping replayed/stale control packet: seq={packet.sequence}, "
-                    f"watermark={self._recv_watermark[peer_addr]}")
-                return
-
-            # Build AAD
             aad = bytes([ChannelType.CONTROL, 0, 0])
 
-            # Decrypt with negotiated suite, baseline fallback (SPEC §3.5).
-            # Raises on auth failure -> watermark not advanced, so a forged
-            # high-seq packet cannot wedge the mark.
-            message_bytes = self._decrypt_control(peer_addr, packet.sequence, packet.ciphertext, aad)
+            # Authenticate FIRST (SPEC §3.5 negotiated suite, baseline fallback).
+            # We decrypt before applying the replay watermark so a HELLO/HELLO_ACK
+            # from a restarted peer — whose fresh random sequence may fall below
+            # our stale watermark — can still be recognized and rebase the mark.
+            # A forged packet fails AEAD here and never touches any state.
+            try:
+                message_bytes = self._decrypt_control(
+                    peer_addr, packet.sequence, packet.ciphertext, aad)
+            except Exception:
+                logger.debug("Dropping unauthenticated control packet")
+                return
 
-            # Authenticated: advance the watermark.
-            self._recv_watermark[peer_addr] = packet.sequence
-
-            # Decode JSON
             message = json.loads(message_bytes.decode('utf-8'))
+            try:
+                msg_type = ControlMessageType(message["type"])
+            except ValueError:
+                # SPEC §4.2: unknown control types MUST be ignored (handled fully
+                # in the Control-completeness phase; ignore quietly for now).
+                logger.debug(f"Ignoring unknown control type {message.get('type')}")
+                return
+            payload = message.get("payload", {})
+            seq = packet.sequence
+            wm = self._recv_watermark.get(peer_addr)
 
-            msg_type = ControlMessageType(message["type"])
-            payload = message["payload"]
+            # Session (re)start handling (SPEC §3.3/§4.3): a HELLO/HELLO_ACK with
+            # a newer session epoch rebases this peer's watermark, so a restart
+            # is not a permanent lockout. An older/equal epoch falls through to
+            # the normal replay check (a replayed HELLO is still rejected).
+            if msg_type in (ControlMessageType.HELLO, ControlMessageType.HELLO_ACK):
+                epoch = int(payload.get("session", 0))
+                if epoch > self._peer_session.get(peer_addr, -1):
+                    self._peer_session[peer_addr] = epoch
+                    self._recv_watermark[peer_addr] = seq
+                    if self._on_new_session:
+                        try:
+                            self._on_new_session(peer_addr)
+                        except Exception as e:
+                            logger.error(f"on_new_session error: {e}")
+                    self._dispatch(msg_type, peer_addr, payload)
+                    return
 
-            logger.debug(f"Control message from {peer_addr}: type={msg_type.name}")
-
-            # Call handlers
-            handlers = self._handlers.get(msg_type, [])
-            for handler in handlers:
-                try:
-                    handler(peer_addr, payload)
-                except Exception as e:
-                    logger.error(f"Control handler error: {e}")
+            # Replay protection (SPEC §3.3): accept the first packet seen from a
+            # peer at any sequence, then require strictly increasing sequences.
+            if wm is not None and seq <= wm:
+                logger.debug(
+                    f"Dropping replayed/stale control packet: seq={seq}, watermark={wm}")
+                return
+            self._recv_watermark[peer_addr] = seq
+            self._dispatch(msg_type, peer_addr, payload)
 
         except Exception as e:
             logger.error(f"Error handling control packet: {e}")
+
+    def _dispatch(self, msg_type, peer_addr, payload):
+        """Invoke registered handlers for an authenticated control message."""
+        logger.debug(f"Control message from {peer_addr}: type={msg_type.name}")
+        for handler in self._handlers.get(msg_type, []):
+            try:
+                handler(peer_addr, payload)
+            except Exception as e:
+                logger.error(f"Control handler error: {e}")
+
+    def reset_peer(self, peer_addr: tuple):
+        """Forget a peer's replay/session state (e.g. on disconnect)."""
+        self._recv_watermark.pop(peer_addr, None)
+        self._peer_session.pop(peer_addr, None)
 
 
 def test_control():

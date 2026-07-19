@@ -41,6 +41,10 @@ class Peer:
         self.capabilities: list = []
         self.cipher: Optional[str] = None
 
+        # Session epoch last seen from this peer (SPEC §4.3). A larger value
+        # signals a restart and rebases our replay watermark for the peer.
+        self.session_epoch: int = -1
+
         # Focus state
         self.has_focus = False
 

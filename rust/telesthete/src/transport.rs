@@ -49,15 +49,32 @@ pub enum TransportError {
     Closed,
 }
 
-/// Per-peer monotonic sequence counter. SPEC §3.3: must never repeat per key.
-#[derive(Debug, Default)]
+/// One monotonic sequence counter per sender (shared across this sender's
+/// channels/streams). The AEAD nonce is the sequence and the key is band-wide
+/// (SPEC §3.1), so the sequence MUST NOT repeat under one key across senders or
+/// restarts. It is therefore CSPRNG-initialized (SPEC §3.3) with ~2^63 headroom
+/// before wrap, making a cross-sender collision negligible rather than
+/// guaranteed (two senders both starting at 0/1 would collide immediately).
+#[derive(Debug)]
 pub struct SequenceCounter(std::sync::atomic::AtomicU64);
 
 impl SequenceCounter {
+    /// CSPRNG-seeded start (SPEC §3.3).
+    pub fn random() -> Self {
+        let mut b = [0u8; 8];
+        getrandom::getrandom(&mut b).expect("CSPRNG unavailable");
+        Self(std::sync::atomic::AtomicU64::new(u64::from_be_bytes(b) >> 1))
+    }
+
+    /// Return the current value, then advance by one.
     pub fn next(&self) -> u64 {
-        self.0
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .wrapping_add(1)
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Default for SequenceCounter {
+    fn default() -> Self {
+        Self::random()
     }
 }
 
