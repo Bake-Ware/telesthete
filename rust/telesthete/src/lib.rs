@@ -21,6 +21,8 @@ pub mod stream;
 pub mod transport;
 pub mod unix_transport;
 pub mod wire;
+pub mod board;
+pub mod drop_channel;
 
 pub use band::{Band, BandError};
 pub use channel::{ChannelEndpoint, ChannelError, ChannelHub, ChannelMessage, ChannelSender};
@@ -39,4 +41,12 @@ pub use unix_transport::{
 pub use wire::{
     DmabufDescriptor, DmabufError, DmabufPlane, StreamFlags, StreamHeader, StreamHeaderError,
     DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR, MAX_PLANES, STREAM_HEADER_LEN,
+};
+pub use board::{
+    BoardChange, BoardCore, BoardEndpoint, BoardEntry, BoardError, BoardHub, SetPayload,
+    DIGEST_INTERVAL,
+};
+pub use drop_channel::{
+    DropError, DropHub, DropReceiver, DropReceiverCore, DropSender, DropSenderCore, OfferPayload,
+    CHUNK_SIZE, MAX_RANGE_CHUNKS, REREQUEST_TIMEOUT,
 };

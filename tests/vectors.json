@@ -210,5 +210,49 @@
       "data_hex": "68656c6c6f",
       "packed_hex": "0400000000000000010020000000000000000568656c6c6f"
     }
+  ],
+  "board_digest": [
+    {
+      "entries": [
+        {
+          "key": "alpha",
+          "lamport": 1,
+          "actor": "alice",
+          "deleted": false
+        },
+        {
+          "key": "beta",
+          "lamport": 2,
+          "actor": "bob",
+          "deleted": false
+        }
+      ],
+      "count": 2,
+      "hash": "d18a4f0a2660047d273372990ca14fed2c93d5911990bdce43f9aafbde0bbd10"
+    },
+    {
+      "entries": [
+        {
+          "key": "zeta",
+          "lamport": 5,
+          "actor": "host-2",
+          "deleted": true
+        },
+        {
+          "key": "alpha",
+          "lamport": 3,
+          "actor": "host-1",
+          "deleted": false
+        },
+        {
+          "key": "mid/key",
+          "lamport": 9223372036854775813,
+          "actor": "host-3",
+          "deleted": false
+        }
+      ],
+      "count": 3,
+      "hash": "2b43690b607f5bf427d3fc5d6ae458bd20cb76772112a10e8b2694aef0c29fa9"
+    }
   ]
 }

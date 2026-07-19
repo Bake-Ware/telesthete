@@ -88,10 +88,17 @@ struct Partial {
 }
 
 /// Collects fragments and emits full payloads. Single-task; not thread-safe.
-#[derive(Default)]
 pub struct Reassembler {
     buffers: HashMap<[u8; 16], Partial>,
     limit: usize,
+}
+
+impl Default for Reassembler {
+    /// Same as [`Reassembler::new`]. (A derived `Default` would zero `limit`,
+    /// making the memory cap evict every in-progress buffer.)
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Reassembler {

@@ -13,12 +13,14 @@ use thiserror::Error;
 use tokio::task::JoinHandle;
 use tracing::debug;
 
+use crate::board::{BoardEndpoint, BoardHub};
 use crate::channel::{ChannelEndpoint, ChannelHub};
 use crate::control::{
     send_control_json, ControlChannel, ControlConfig, ControlError, PeerState, Peers,
     TYPE_KEEPALIVE,
 };
 use crate::crypto::{derive_band_id, derive_key, BandId, Key};
+use crate::drop_channel::{DropHub, DropReceiver, DropSender};
 use crate::stream::{StreamEndpoint, StreamHub};
 use crate::transport::Transport;
 
@@ -77,6 +79,8 @@ pub struct Band {
     transport: Arc<Transport>,
     stream_hub: StreamHub,
     channel_hub: ChannelHub,
+    board_hub: BoardHub,
+    drop_hub: DropHub,
     /// `None` after [`Band::take_control`] hands the receiver to a drain task.
     control: Option<ControlChannel>,
     hostname: String,
@@ -175,6 +179,10 @@ impl Band {
         let peers: Peers = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let stream_hub = StreamHub::new(Arc::clone(&transport), rebase_tx.subscribe()).await;
         let channel_hub = ChannelHub::new(Arc::clone(&transport)).await;
+        // Board's actor string — the §7.3 LWW tiebreak — is this Band's hostname.
+        let board_hub =
+            BoardHub::new(Arc::clone(&transport), hostname.clone(), rebase_tx.clone()).await;
+        let drop_hub = DropHub::new(Arc::clone(&transport), rebase_tx.clone()).await;
         let control = ControlChannel::new(
             Arc::clone(&transport),
             ControlConfig {
@@ -204,6 +212,8 @@ impl Band {
             transport,
             stream_hub,
             channel_hub,
+            board_hub,
+            drop_hub,
             control: Some(control),
             hostname,
             key: base_key,
@@ -313,6 +323,39 @@ impl Band {
     /// Open a Channel endpoint to a peer with the given `channel_id`.
     pub async fn channel(&self, peer: SocketAddr, channel_id: u16) -> ChannelEndpoint {
         self.channel_hub.open(peer, channel_id).await
+    }
+
+    /// Open the replicated Board with the given `board_id` (SPEC §7). The
+    /// Band's hostname is the board's actor string (§7.3 tiebreak); add
+    /// destinations per peer for SET/DIGEST broadcast.
+    pub async fn board(&self, board_id: u16) -> BoardEndpoint {
+        self.board_hub.open(board_id).await
+    }
+
+    /// Offer one file on `drop_id` (SPEC §8); serve receivers' range requests.
+    pub async fn drop_send(
+        &self,
+        drop_id: u16,
+        name: impl Into<String>,
+        data: Vec<u8>,
+    ) -> DropSender {
+        self.drop_hub.open_sender(drop_id, name, data).await
+    }
+
+    /// Receive the file offered on `drop_id` (SPEC §8).
+    pub async fn drop_recv(&self, drop_id: u16) -> DropReceiver {
+        self.drop_hub
+            .open_receiver(drop_id, HashMap::new())
+            .await
+    }
+
+    /// Receive on `drop_id`, resuming from persisted chunks (§8.2).
+    pub async fn drop_recv_resume(
+        &self,
+        drop_id: u16,
+        have: HashMap<u32, Vec<u8>>,
+    ) -> DropReceiver {
+        self.drop_hub.open_receiver(drop_id, have).await
     }
 
     /// Borrow the Control channel for HELLO_ACK / KEEPALIVE / GOODBYE / etc.
@@ -693,5 +736,79 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got, msg);
+    }
+
+    #[tokio::test]
+    async fn band_board_set_replicates() {
+        // §7 over loopback UDP: HELLO handshake first, then a Board SET flows
+        // from alice to bob under the session data keys.
+        let alice = Band::bind(b"board-band-psk", "127.0.0.1:0".parse().unwrap(), "alice")
+            .await
+            .unwrap();
+        let mut bob = Band::bind(b"board-band-psk", "127.0.0.1:0".parse().unwrap(), "bob")
+            .await
+            .unwrap();
+        let (_alice_addr, bob_addr) = hello_pair(&alice, &mut bob).await;
+
+        let alice_board = alice.board(3).await;
+        let mut bob_board = bob.board(3).await;
+        alice_board.add_destination(bob_addr).await;
+        alice_board
+            .set("cursor", serde_json::json!({"x": 4, "y": 2}))
+            .await
+            .unwrap();
+
+        let change = tokio::time::timeout(Duration::from_secs(2), bob_board.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(change.key, "cursor");
+        assert_eq!(
+            bob_board.get("cursor").await,
+            Some(serde_json::json!({"x": 4, "y": 2}))
+        );
+    }
+
+    #[tokio::test]
+    async fn band_drop_small_file_transfer() {
+        // §8 over loopback UDP: HELLO handshake, then a small Drop end-to-end
+        // with the sha verdict confirmed on both ends.
+        let alice = Band::bind(b"drop-band-psk", "127.0.0.1:0".parse().unwrap(), "alice")
+            .await
+            .unwrap();
+        let mut bob = Band::bind(b"drop-band-psk", "127.0.0.1:0".parse().unwrap(), "bob")
+            .await
+            .unwrap();
+        let (_alice_addr, bob_addr) = hello_pair(&alice, &mut bob).await;
+        // Wait until alice has processed bob's auto HELLO_ACK so she can
+        // decrypt bob's session-keyed REQUEST frames (SPEC §3.3).
+        for _ in 0..50 {
+            if alice.peers().await.contains_key(&bob_addr) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(alice.peers().await.contains_key(&bob_addr));
+
+        let data: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+        let mut sender = alice.drop_send(5, "blob.bin", data.clone()).await;
+        let mut receiver = bob.drop_recv(5).await;
+        sender.offer(bob_addr).await.unwrap();
+
+        let (got, ok) = tokio::time::timeout(Duration::from_secs(3), receiver.recv_file())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ok);
+        assert_eq!(got, data);
+        assert_eq!(receiver.verified().await, Some(true));
+
+        let (from, verdict) = tokio::time::timeout(Duration::from_secs(2), sender.recv_verdict())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(from, bob_addr);
+        assert!(verdict);
+        assert!(sender.completed().await[&bob_addr]);
     }
 }
