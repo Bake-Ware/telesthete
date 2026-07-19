@@ -44,6 +44,32 @@ phased roadmap.
 format, seq=0 drop, divergent Channel wire) — a Python peer and a Rust peer
 cannot talk today. There is also no live Python↔Rust socket interop test.
 
+## Progress (updated as phases land on `lib/full-implementation`)
+
+Every defect in the table above is now fixed except the deliberately
+re-scoped items below. Phases 1–8 are complete in BOTH languages: shared
+CSPRNG SequenceSource + session-epoch re-key/rebase (1), framing/wire
+conformance + vectors (2), Rust negotiated-cipher data path + keepalive/
+dead-peer/auto-ACK Band driving (3), KEYFRAME_REQ/RATE_HINT + unknown-type
+MUST-ignore (4), StreamHeader/dmabuf in Python + dmabuf bounds hardening +
+timestamp removal → live Python↔Rust interop (5), full reliable Channel
+with the §6.1 inner-seq amendment (6), §9.2-conformant discovery ×2 +
+Python AF_UNIX SEQPACKET (7), Board §7 + Drop §8 specified and implemented
+(8). Epoch-downgrade replay guard added both languages (found in phase 3).
+
+Re-scoped, with rationale recorded in SPEC/commits:
+- **§5.3/§9.5 send priority:** both references send synchronously (no
+  queue), so there is nothing to reorder; priority is carried per §5.1.
+- **WSS/WebTransport clients:** §9.3 remains Future; §12.2 scopes these to
+  browser/Kotlin/ESP32 clients, not the reference libraries. The hub
+  serves both; the references speak UDP + AF_UNIX.
+- **Rust AF_UNIX keeps SOCK_DGRAM for peer-to-peer** (spec-permitted;
+  `telesthete-c` + consumer examples depend on the connectionless model)
+  and **adds `UnixSeqClient`**, a SOCK_SEQPACKET client — the hub's
+  listener is SEQPACKET-only, so this closes the audit's "cannot reach
+  the hub's socket" defect. Python demonstrates a SEQPACKET
+  server+client transport.
+
 ## Phase roadmap (each phase: both langs + spec + vectors + TDD, then report)
 
 1. **Crypto/sequence/watermark core** — shared CSPRNG sequence source; accept-first

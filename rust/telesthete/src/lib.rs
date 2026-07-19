@@ -33,8 +33,8 @@ pub use framing::{
 pub use stream::{StreamEndpoint, StreamError, StreamHub, StreamMessage};
 pub use transport::{Inbound, Outbound, Transport, TransportError};
 pub use unix_transport::{
-    UnixInbound, UnixOutbound, UnixTransport, UnixTransportError, MAX_FDS_PER_PACKET,
-    SOCKET_DIR_ENV, SOCKET_DIR_FALLBACK,
+    UnixInbound, UnixOutbound, UnixSeqClient, UnixTransport, UnixTransportError,
+    MAX_FDS_PER_PACKET, SOCKET_DIR_ENV, SOCKET_DIR_FALLBACK,
 };
 pub use wire::{
     DmabufDescriptor, DmabufError, DmabufPlane, StreamFlags, StreamHeader, StreamHeaderError,

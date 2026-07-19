@@ -5,15 +5,17 @@
 //! that we need raw `recvmsg` / `sendmsg` with `SCM_RIGHTS` ancillary
 //! messages so that dmabuf fds can ride alongside Stream packets.
 //!
-//! ## Socket type
+//! ## Socket types
 //!
-//! §9.4 recommends `SOCK_SEQPACKET` and permits `SOCK_DGRAM`. Tokio's
-//! stable async UDS API only covers `SOCK_DGRAM` first-class, so this
-//! module uses `SOCK_DGRAM` and relies on the kernel's per-message-
-//! boundary behaviour for datagram sockets. The Python reference
-//! (`telesthete/transport/unix.py`) demonstrates the recommended
-//! SEQPACKET variant; between them the two references cover both
-//! spec-legal socket types.
+//! §9.4 recommends `SOCK_SEQPACKET` and permits `SOCK_DGRAM`. This module
+//! provides both:
+//!
+//! - [`UnixTransport`]: `SOCK_DGRAM`, connectionless peer-to-peer (used by
+//!   `telesthete-c` and the consumer examples). Kernel datagram semantics
+//!   preserve message boundaries.
+//! - [`UnixSeqClient`]: a `SOCK_SEQPACKET` **client** — required to reach
+//!   the telesthitium hub's AF_UNIX listener, which is SEQPACKET-only (a
+//!   DGRAM socket cannot connect to a SEQPACKET listener).
 //!
 //! ## Ownership of fds
 //!
@@ -302,6 +304,192 @@ impl Drop for UnixTransport {
     }
 }
 
+/// `SOCK_SEQPACKET` client for the telesthitium hub's AF_UNIX listener
+/// (§9.4 recommended socket type). Connection-oriented: one connect, then
+/// send/recv with no per-packet address. SCM_RIGHTS fds ride exactly as on
+/// the DGRAM transport.
+pub struct UnixSeqClient {
+    conn: Arc<AsyncFd<OwnedFd>>,
+    server_path: PathBuf,
+    key: crate::crypto::Key,
+    band_id: [u8; 16],
+    seq: Arc<SequenceCounter>,
+    routes: Arc<Mutex<HashMap<ChannelType, mpsc::UnboundedSender<UnixInbound>>>>,
+}
+
+impl UnixSeqClient {
+    /// Connect to a SEQPACKET listener at `path` (e.g. the hub's
+    /// `$XDG_RUNTIME_DIR/telesthete/<band_id_hex>.sock`).
+    pub async fn connect(
+        path: impl AsRef<Path>,
+        key: crate::crypto::Key,
+        band_id: [u8; 16],
+    ) -> Result<Self, UnixTransportError> {
+        use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType};
+        let path = path.as_ref().to_path_buf();
+        let fd = socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+            None,
+        )?;
+        let addr = UnixAddr::new(path.as_path())?;
+        match connect(fd.as_raw_fd(), &addr) {
+            Ok(()) | Err(nix::errno::Errno::EINPROGRESS) => {}
+            Err(e) => return Err(UnixTransportError::Nix(e)),
+        }
+        let conn = Arc::new(AsyncFd::new(fd)?);
+        // Wait for the (local, near-instant) connect to complete.
+        conn.writable().await?.retain_ready();
+        debug!(?path, "telesthete unix seqpacket client connected");
+        Ok(Self {
+            conn,
+            server_path: path,
+            key,
+            band_id,
+            seq: Arc::new(SequenceCounter::default()),
+            routes: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    pub fn server_path(&self) -> &Path {
+        &self.server_path
+    }
+
+    pub async fn route(&self, ty: ChannelType) -> mpsc::UnboundedReceiver<UnixInbound> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.routes.lock().await.insert(ty, tx);
+        rx
+    }
+
+    /// Encrypt + send one packet on the connection, with optional
+    /// `SCM_RIGHTS` fds. (`UnixOutbound.to` is ignored: SEQPACKET is
+    /// connected.)
+    pub async fn send(&self, out: UnixOutbound<'_>) -> Result<(), UnixTransportError> {
+        if out.fds.len() > MAX_FDS_PER_PACKET {
+            return Err(UnixTransportError::TooManyFds(out.fds.len()));
+        }
+        let seq = self.seq.next();
+        let pkt = encode_packet(
+            &self.key,
+            &self.band_id,
+            out.channel_type,
+            out.channel_id,
+            seq,
+            &out.plaintext,
+        )?;
+        let raw_fds: Vec<RawFd> = out.fds.iter().map(|f| f.as_raw_fd()).collect();
+        loop {
+            let mut guard = self.conn.writable().await?;
+            let result = guard.try_io(|inner| {
+                let fd = inner.get_ref().as_raw_fd();
+                let iov = [io::IoSlice::new(&pkt)];
+                let scm = ControlMessage::ScmRights(&raw_fds);
+                let cmsgs: &[ControlMessage] = if raw_fds.is_empty() {
+                    &[]
+                } else {
+                    std::slice::from_ref(&scm)
+                };
+                match sendmsg::<UnixAddr>(fd, &iov, cmsgs, MsgFlags::empty(), None) {
+                    Ok(_) => Ok(()),
+                    Err(nix::errno::Errno::EAGAIN) => {
+                        Err(io::Error::from(io::ErrorKind::WouldBlock))
+                    }
+                    Err(e) => Err(io::Error::from(e)),
+                }
+            });
+            match result {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(e)) => return Err(UnixTransportError::Io(e)),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    /// Spawn the recv loop; exits on orderly close (empty SEQPACKET read).
+    pub fn spawn_recv_loop(&self) -> tokio::task::JoinHandle<()> {
+        let conn = Arc::clone(&self.conn);
+        let routes = Arc::clone(&self.routes);
+        let key = self.key;
+        let band_id = self.band_id;
+        let from = self.server_path.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 131_072];
+            loop {
+                let triple = loop {
+                    let mut guard = match conn.readable().await {
+                        Ok(g) => g,
+                        Err(e) => {
+                            warn!("unix seqpacket readable() error: {e}");
+                            return;
+                        }
+                    };
+                    let r = guard.try_io(|inner| {
+                        let fd = inner.get_ref().as_raw_fd();
+                        let mut iov = [io::IoSliceMut::new(&mut buf)];
+                        let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS_PER_PACKET]);
+                        match recvmsg::<UnixAddr>(
+                            fd,
+                            &mut iov,
+                            Some(&mut cmsg_buf),
+                            MsgFlags::empty(),
+                        ) {
+                            Ok(m) => {
+                                let fds = match m.cmsgs() {
+                                    Ok(it) => collect_fds(it),
+                                    Err(e) => {
+                                        warn!("cmsgs parse failed: {e}");
+                                        Vec::new()
+                                    }
+                                };
+                                Ok((m.bytes, fds))
+                            }
+                            Err(nix::errno::Errno::EAGAIN) => {
+                                Err(io::Error::from(io::ErrorKind::WouldBlock))
+                            }
+                            Err(e) => Err(io::Error::from(e)),
+                        }
+                    });
+                    match r {
+                        Ok(Ok(pair)) => break pair,
+                        Ok(Err(e)) => {
+                            warn!("seqpacket recvmsg failed: {e}");
+                            return;
+                        }
+                        Err(_would_block) => continue,
+                    }
+                };
+                let (n, fds) = triple;
+                if n == 0 {
+                    debug!("unix seqpacket server closed the connection");
+                    return; // orderly close
+                }
+                let (header, payload) = match decode_packet(&key, &buf[..n]) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        debug!("seqpacket decode_packet failed: {e}");
+                        continue; // fds dropped -> closed
+                    }
+                };
+                if header.band_id != band_id {
+                    debug!("dropping seqpacket packet: foreign band_id");
+                    continue;
+                }
+                let inbound = UnixInbound {
+                    from: from.clone(),
+                    header,
+                    payload,
+                    fds,
+                };
+                let routes = routes.lock().await;
+                if let Some(tx) = routes.get(&header.channel_type) {
+                    let _ = tx.send(inbound);
+                }
+            }
+        })
+    }
+}
+
 fn parse_addr(addr: Option<UnixAddr>) -> PathBuf {
     addr.and_then(|a| a.path().map(|p| p.to_path_buf()))
         .unwrap_or_default()
@@ -449,6 +637,67 @@ mod tests {
 
         let r = tokio::time::timeout(Duration::from_millis(200), bob_in.recv()).await;
         assert!(r.is_err(), "expected timeout (foreign-band drop)");
+    }
+
+    #[tokio::test]
+    async fn seqpacket_client_reaches_seqpacket_listener() {
+        // The hub's AF_UNIX socket is SOCK_SEQPACKET (telesthitium/src/unix.rs);
+        // a DGRAM socket cannot connect to it. This drives UnixSeqClient
+        // against a hub-style listener: packet up, packet down, echo intact.
+        use nix::sys::socket::{
+            accept, bind, listen, socket, AddressFamily, Backlog, SockFlag, SockType,
+        };
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hub.sock");
+        let (key, band_id) = psk_key_band(b"seqpacket-hub");
+
+        let listener = socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .unwrap();
+        bind(listener.as_raw_fd(), &UnixAddr::new(path.as_path()).unwrap()).unwrap();
+        listen(&listener, Backlog::new(4).unwrap()).unwrap();
+
+        // Blind-relay echo server, one accept (hub relays ciphertext without
+        // decrypting; echoing unmodified bytes models that).
+        let server = tokio::task::spawn_blocking(move || {
+            let conn = accept(listener.as_raw_fd()).unwrap();
+            let mut buf = vec![0u8; 65536];
+            let n = nix::unistd::read(
+                unsafe { std::os::fd::BorrowedFd::borrow_raw(conn) },
+                &mut buf,
+            )
+            .unwrap();
+            let iov = [io::IoSlice::new(&buf[..n])];
+            sendmsg::<UnixAddr>(conn, &iov, &[], MsgFlags::empty(), None).unwrap();
+            let _ = nix::unistd::close(conn);
+        });
+
+        let client = UnixSeqClient::connect(&path, key, band_id).await.unwrap();
+        let mut inbound = client.route(ChannelType::Stream).await;
+        client.spawn_recv_loop();
+        client
+            .send(UnixOutbound {
+                to: path.clone(),
+                channel_type: ChannelType::Stream,
+                channel_id: 3,
+                plaintext: b"to-the-hub".to_vec(),
+                priority: 0,
+                fds: &[],
+            })
+            .await
+            .unwrap();
+
+        let got = tokio::time::timeout(Duration::from_secs(2), inbound.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.payload, b"to-the-hub");
+        assert_eq!(got.header.channel_id, 3);
+        server.await.unwrap();
     }
 
     #[tokio::test]
