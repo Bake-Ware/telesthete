@@ -1,10 +1,11 @@
 //! Cross-language interop peer, driven by `tests/test_interop.py`.
 //!
 //! Binds a Band on an ephemeral loopback port, prints `READY <addr>` to stderr,
-//! then acts as a responder: it prints `HELLO` when it receives a peer's HELLO
-//! (base-key handshake) and `KEEPALIVE` when it receives a session-keyed
-//! keepalive afterward (proving the session data-key path interoperates), then
-//! exits 0. Exits 1 on a 5 s idle timeout.
+//! then acts as a responder: prints `HELLO` on the peer's HELLO (base-key
+//! handshake), opens a Stream back to that peer, and prints `STREAM <data>` when
+//! it receives a session-keyed stream frame (proving the session data-key path
+//! AND the §5.1 stream wire format interoperate), then exits 0. Exits 1 on a
+//! 5 s idle timeout.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -19,26 +20,32 @@ async fn main() {
         .expect("bind");
     eprintln!("READY {}", band.local_addr().unwrap());
 
-    let mut saw_hello = false;
-    loop {
+    // 1) Handshake: wait for the peer's HELLO (base key) and learn its address.
+    let peer = loop {
         match tokio::time::timeout(Duration::from_secs(5), band.control().recv()).await {
-            Ok(Some(ev)) => match ev {
-                ControlEvent::Hello { .. } | ControlEvent::HelloAck { .. } => {
-                    println!("HELLO");
-                    saw_hello = true;
-                }
-                ControlEvent::Keepalive { .. } if saw_hello => {
-                    // A session-keyed keepalive decrypted under the Python peer's
-                    // data key (learned from its HELLO epoch): interop confirmed.
-                    println!("KEEPALIVE");
-                    std::process::exit(0);
-                }
-                _ => {}
-            },
+            Ok(Some(ControlEvent::Hello { from, .. }))
+            | Ok(Some(ControlEvent::HelloAck { from, .. })) => {
+                println!("HELLO");
+                break from;
+            }
+            Ok(Some(_)) => continue,
             _ => {
-                eprintln!("timeout");
+                eprintln!("timeout waiting for HELLO");
                 std::process::exit(1);
             }
+        }
+    };
+
+    // 2) Data: receive a session-keyed stream frame from that peer.
+    let mut s = band.stream(peer, 9).await;
+    match tokio::time::timeout(Duration::from_secs(5), s.recv()).await {
+        Ok(Some(msg)) => {
+            println!("STREAM {}", String::from_utf8_lossy(&msg.data));
+            std::process::exit(0);
+        }
+        _ => {
+            eprintln!("no stream data");
+            std::process::exit(1);
         }
     }
 }

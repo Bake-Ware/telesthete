@@ -20,7 +20,6 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from telesthete.band import Band
-from telesthete.protocol.control import ControlMessageType
 
 RUST_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "rust"))
 
@@ -55,17 +54,21 @@ async def test_python_to_rust_handshake_and_session_key():
         band = Band(psk="interop-psk", bind_port=0)
         await band.start()
         try:
-            # HELLO (base key) then a session-keyed KEEPALIVE to the rust peer.
+            # HELLO (base key), then a session-keyed Stream frame to the rust peer.
             band.connect_peer(host, port)
             await asyncio.sleep(0.4)
-            band.control.send_message(ControlMessageType.KEEPALIVE, {}, dest=(host, port))
+            st = band.stream(stream_id=9)
+            st.add_destination((host, port))  # rust peer sends no HELLO_ACK; add manually
+            for _ in range(5):  # first may race the peer opening its receiver
+                st.send(b"hi-from-python")
+                await asyncio.sleep(0.1)
 
             rc = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: _wait(proc, 6))
             out = proc.stdout.read()
             assert rc == 0, f"rust peer exit={rc}, stdout={out!r}"
             assert "HELLO" in out, out
-            assert "KEEPALIVE" in out, out
+            assert "STREAM hi-from-python" in out, out
         finally:
             await band.stop()
     finally:

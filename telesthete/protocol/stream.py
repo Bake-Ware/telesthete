@@ -121,9 +121,10 @@ class Stream:
             self.stream_id & 0xFF
         ])
 
-        # Prepend priority and timestamp to payload
-        timestamp = int(time.time() * 1000) & 0xFFFFFFFF  # 32-bit milliseconds
-        payload = bytes([self.priority]) + timestamp.to_bytes(4, 'big') + data
+        # SPEC §5.1 stream payload = priority (1 byte) || data. (A prior
+        # implementation inserted a 4-byte timestamp here, which broke interop
+        # with the Rust reference; removed to conform.)
+        payload = bytes([self.priority]) + data
 
         # Encrypt per destination under our session data key for that peer's
         # negotiated suite (SPEC §3.1/§3.5). Sequence is shared across dests.
@@ -200,10 +201,12 @@ class Stream:
             # Authenticated and fresh: advance the watermark.
             self._recv_watermark[peer_addr] = packet.sequence
 
-            # Extract priority and timestamp
-            priority = payload[0]
-            timestamp = int.from_bytes(payload[1:5], 'big')
-            data = payload[5:]
+            # SPEC §5.1: payload = priority (1 byte) || data. The wire carries no
+            # timestamp; the receive callback gets a local receive time for
+            # compatibility with its (data, peer, timestamp) shape.
+            priority = payload[0]  # noqa: F841 — reserved for §5.3 priority handling
+            data = payload[1:]
+            timestamp = int(time.time() * 1000)
 
             # Call receive handler
             if self._on_receive:
