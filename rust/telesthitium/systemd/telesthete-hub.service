@@ -1,5 +1,5 @@
 [Unit]
-Description=Telesthete Hub — discovery + relay
+Description=Telesthete Hub — reference relay (SPEC §10)
 After=network-online.target
 Wants=network-online.target
 
@@ -7,11 +7,19 @@ Wants=network-online.target
 Type=simple
 User=telesthete
 Group=telesthete
+# Configuration (HUB_BIND, HUB_WS_BIND, HUB_WT_BIND, HUB_UNIX_DIR, HUB_TLS_*, …)
+# lives here; see the README. The built-ins below are defaults it overrides.
+EnvironmentFile=-/etc/telesthete-hub.env
+Environment=RUST_LOG=info
+Environment=HUB_BIND=0.0.0.0:7474
 ExecStart=/usr/local/bin/telesthete-hub
 Restart=on-failure
 RestartSec=3s
-Environment=RUST_LOG=info
-Environment=HUB_BIND=0.0.0.0:7474
+
+# For the AF_UNIX transport (§9.4): set HUB_UNIX_DIR=/run/telesthete. This dir is
+# host-visible (unlike PrivateTmp's /tmp), so local peers can reach it.
+RuntimeDirectory=telesthete
+RuntimeDirectoryMode=0700
 
 # Sandboxing
 NoNewPrivileges=true
@@ -22,7 +30,8 @@ PrivateDevices=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
-RestrictAddressFamilies=AF_INET AF_INET6
+# AF_UNIX is required for the §9.4 transport; AF_INET/6 for UDP/WS/WebTransport.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
