@@ -110,12 +110,14 @@ class BandCrypto:
         cipher_id: AEAD suite (default: the mandatory baseline).
     """
 
-    def __init__(self, psk: str, cipher_id: str = BASELINE_CIPHER):
+    def __init__(self, psk: str, cipher_id: str = BASELINE_CIPHER, session: int = None):
         if cipher_id not in SUPPORTED_CIPHERS:
             raise ValueError(f"unsupported cipher_id: {cipher_id!r}")
         self.cipher_id = cipher_id
+        self.session = session
         self.band_id = derive_band_id(psk)
-        self.key = derive_encryption_key(psk, cipher_id)
+        # session=None -> base key (HELLO/HELLO_ACK); session=epoch -> data key.
+        self.key = derive_encryption_key(psk, cipher_id, session=session)
         self._aesgcm = None
         if cipher_id == "aes256-gcm":
             # Optional suite — pulled in lazily so the baseline has no extra dep.

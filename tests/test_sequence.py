@@ -131,3 +131,65 @@ def test_select_cipher_normalizes_missing_baseline():
     # Responder omits the mandatory baseline; selection still resolves.
     assert select_cipher([BASELINE_CIPHER], ["aes256-gcm"]) == BASELINE_CIPHER
     assert select_cipher(["aes256-gcm"], ["aes256-gcm"]) == "aes256-gcm"
+
+
+def test_next_is_thread_safe():
+    # A duplicated sequence is a duplicated nonce; concurrent next() must not
+    # collide (would fail without the lock).
+    import threading
+    src = SequenceSource(start=0)
+    out = []
+    barrier = threading.Barrier(8)
+
+    def worker():
+        barrier.wait()
+        local = [src.next() for _ in range(2000)]
+        out.extend(local)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(out) == 16000
+    assert len(set(out)) == 16000, "concurrent next() must never duplicate a sequence"
+
+
+def test_old_session_packet_fails_under_new_session_key():
+    # The cross-session replay closure: a packet encrypted under an old session
+    # epoch's key must NOT authenticate under the peer's new-session key or the
+    # base key after a restart.
+    import pytest
+    from telesthete.protocol.crypto import BandCrypto, build_aad
+    psk = "replay-window-psk"
+    aad = build_aad(1, 0)
+    old = BandCrypto(psk, session=1000)          # session 1
+    ct = old.encrypt(42, b"old-session secret", aad)
+    assert old.decrypt(42, ct, aad) == b"old-session secret"  # sanity
+
+    new = BandCrypto(psk, session=2000)          # peer restarted -> session 2
+    base = BandCrypto(psk, session=None)         # base (HELLO) key
+    with pytest.raises(Exception):
+        new.decrypt(42, ct, aad)
+    with pytest.raises(Exception):
+        base.decrypt(42, ct, aad)
+
+
+def test_band_wires_one_shared_source_and_session_keys():
+    # Catch broken wiring: Control and every Stream MUST share the Band's one
+    # sequence source (else nonces could collide), and Streams MUST use the
+    # session-keyed resolvers (else the replay fix is bypassed).
+    from telesthete.band import Band
+    b = Band(psk="wiring-psk", bind_port=0)
+    s1 = b.stream(1)
+    s2 = b.stream(2)
+    assert b.control._seq_source is b.seq_source
+    assert s1._seq_source is b.seq_source is s2._seq_source
+    # Streams resolve through the Band's per-session send/recv crypto.
+    assert s1._send_crypto == b.send_crypto
+    assert s1._recv_crypto == b.recv_crypto
+    # A stream's send key is the base band's OWN epoch data key, distinct from
+    # the base (HELLO) key.
+    send_c = b.send_crypto(("1.2.3.4", 5))
+    assert send_c.session == b.session_epoch
+    assert send_c.key != b.base_crypto().key

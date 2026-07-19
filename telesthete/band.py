@@ -60,9 +60,11 @@ class Band:
         if BASELINE_CIPHER not in self.ciphers:
             self.ciphers.append(BASELINE_CIPHER)  # baseline is mandatory
 
-        # Per-cipher BandCrypto cache (band_id is cipher-independent).
-        self._cryptos: Dict[str, BandCrypto] = {}
-        self.crypto = self._crypto_for_cipher(BASELINE_CIPHER)
+        # BandCrypto cache keyed by (cipher_id, session_epoch). session=None is
+        # the base key used for HELLO/HELLO_ACK; a session epoch gives the
+        # per-session data key (SPEC §3.1/§3.3).
+        self._cryptos: Dict[tuple, BandCrypto] = {}
+        self.crypto = self._crypto(BASELINE_CIPHER, None)  # base
         self.band_id = self.crypto.band_id
 
         # One sequence source for this sender, shared across Control/Stream/
@@ -81,7 +83,9 @@ class Band:
         # Control channel (per-peer negotiated cipher resolver). Restart of a
         # peer (new session epoch) rebases that peer's Stream watermarks too.
         self.control = ControlChannel(self.band_id, transport=self.transport,
-                                      crypto_for=self.crypto_for_peer,
+                                      base_crypto=self.base_crypto,
+                                      send_crypto=self.send_crypto,
+                                      recv_crypto=self.recv_crypto,
                                       seq_source=self.seq_source,
                                       on_new_session=self._on_new_session)
 
@@ -99,20 +103,35 @@ class Band:
         # Register transport handlers
         self._setup_handlers()
 
-    def _crypto_for_cipher(self, cipher_id: str) -> BandCrypto:
-        c = self._cryptos.get(cipher_id)
+    def _crypto(self, cipher_id: str, session: Optional[int]) -> BandCrypto:
+        key = (cipher_id, session)
+        c = self._cryptos.get(key)
         if c is None:
-            c = BandCrypto(self.psk, cipher_id)
-            self._cryptos[cipher_id] = c
+            c = BandCrypto(self.psk, cipher_id, session=session)
+            self._cryptos[key] = c
         return c
 
-    def crypto_for_peer(self, peer_addr: tuple, cipher_id: Optional[str] = None) -> BandCrypto:
-        """Resolve the BandCrypto for a peer's negotiated suite (SPEC §3.5).
-        `cipher_id` overrides (used for the baseline HELLO bootstrap)."""
-        if cipher_id is None:
-            peer = self.peers.get(peer_addr)
-            cipher_id = peer.cipher if (peer and peer.cipher) else BASELINE_CIPHER
-        return self._crypto_for_cipher(cipher_id)
+    def _peer_cipher(self, peer_addr: tuple) -> str:
+        peer = self.peers.get(peer_addr)
+        return peer.cipher if (peer and peer.cipher) else BASELINE_CIPHER
+
+    def base_crypto(self) -> BandCrypto:
+        """Base key (baseline suite, no session) for HELLO/HELLO_ACK (SPEC §3.5)."""
+        return self._crypto(BASELINE_CIPHER, None)
+
+    def send_crypto(self, peer_addr: tuple) -> BandCrypto:
+        """Data key for sending to a peer: our OWN session epoch + the peer's
+        negotiated suite (SPEC §3.1/§3.3)."""
+        return self._crypto(self._peer_cipher(peer_addr), self.session_epoch)
+
+    def recv_crypto(self, peer_addr: tuple) -> Optional[BandCrypto]:
+        """Data key for decrypting from a peer: the PEER's session epoch (learned
+        from its HELLO) + its negotiated suite. `None` until we've seen the
+        peer's HELLO — a data packet that arrives first is simply dropped."""
+        peer = self.peers.get(peer_addr)
+        if peer is None or peer.session_epoch < 0:
+            return None
+        return self._crypto(self._peer_cipher(peer_addr), peer.session_epoch)
 
     def _setup_handlers(self):
         """Setup packet handlers for transport"""
@@ -244,11 +263,12 @@ class Band:
         if stream_id in self.streams:
             return self.streams[stream_id]
 
-        # Create new stream (per-peer negotiated cipher resolver + the band's
-        # shared sequence source so nonces never collide with Control/other
-        # streams, SPEC §3.3).
+        # Create new stream: per-session data keys (send=own epoch, recv=peer
+        # epoch) + the band's shared sequence source so nonces never collide
+        # with Control/other streams (SPEC §3.1/§3.3).
         stream = Stream(self.band_id, stream_id, transport=self.transport,
-                        priority=priority, crypto_for=self.crypto_for_peer,
+                        priority=priority,
+                        send_crypto=self.send_crypto, recv_crypto=self.recv_crypto,
                         seq_source=self.seq_source)
 
         # Add all current peers as destinations

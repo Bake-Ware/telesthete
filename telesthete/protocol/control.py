@@ -37,7 +37,8 @@ class ControlChannel:
     """
 
     def __init__(self, band_id: bytes, crypto=None, transport=None, crypto_for=None,
-                 seq_source=None, on_new_session=None):
+                 seq_source=None, on_new_session=None,
+                 base_crypto=None, send_crypto=None, recv_crypto=None):
         """
         Initialize control channel
 
@@ -56,10 +57,20 @@ class ControlChannel:
         """
         self.band_id = band_id
         self.transport = transport
-        if crypto_for is not None:
-            self._crypto_for = crypto_for
+        # Per-session data keys (SPEC §3.1/§3.3): HELLO/HELLO_ACK use the base
+        # key so a receiver can bootstrap the peer's epoch; other messages use
+        # the session data key (send=our epoch, recv=peer epoch). Legacy
+        # fallback to a single `crypto` / `crypto_for` for standalone/test use.
+        if base_crypto is not None:
+            self._base_crypto = base_crypto
+            self._send_crypto = send_crypto
+            self._recv_crypto = recv_crypto
         else:
-            self._crypto_for = lambda addr, cipher_id=None: crypto
+            resolve = crypto_for if crypto_for is not None else (
+                lambda addr, cipher_id=None: crypto)
+            self._base_crypto = lambda: resolve(None)
+            self._send_crypto = lambda addr: resolve(addr)
+            self._recv_crypto = lambda addr: resolve(addr)
         self.crypto = crypto
 
         # Shared per-sender sequence source (SPEC §3.3).
@@ -131,13 +142,12 @@ class ControlChannel:
         message_bytes = json.dumps(message).encode('utf-8')
         aad = bytes([ChannelType.CONTROL, 0, 0])
 
-        # HELLO/HELLO_ACK bootstrap on the baseline suite (SPEC §3.5); all
-        # other messages use each peer's negotiated suite. Encrypt per
-        # destination because peers may have negotiated different ciphers.
-        cipher_id = BASELINE_CIPHER if baseline else None
+        # HELLO/HELLO_ACK bootstrap on the base key (§3.5); every other message
+        # uses the per-session data key for that peer's negotiated suite (§3.1).
+        # Encrypt per destination because peers may differ in suite/epoch.
         destinations = [dest] if dest else list(self._destinations)
         for d in destinations:
-            crypto = self._crypto_for(d, cipher_id)
+            crypto = self._base_crypto() if baseline else self._send_crypto(d)
             ciphertext = crypto.encrypt(sequence, message_bytes, aad)
             packet = pack_control_message(self.band_id, sequence, ciphertext)
             self.transport.send(d, packet)
@@ -196,16 +206,17 @@ class ControlChannel:
         self.send_message(ControlMessageType.GOODBYE, {})
 
     def _decrypt_control(self, peer_addr: tuple, sequence: int, ciphertext: bytes, aad: bytes) -> bytes:
-        """Decrypt with the peer's negotiated suite, falling back to baseline
-        (HELLO/HELLO_ACK always use baseline). Raises if both fail."""
-        negotiated = self._crypto_for(peer_addr)
-        try:
-            return negotiated.decrypt(sequence, ciphertext, aad)
-        except Exception:
-            baseline = self._crypto_for(peer_addr, BASELINE_CIPHER)
-            if baseline is negotiated:
-                raise
-            return baseline.decrypt(sequence, ciphertext, aad)
+        """Authenticate a control packet: try the peer's per-session data key
+        (keepalives and other data), then the base key (HELLO/HELLO_ACK
+        bootstrap). An old-session packet fails the current data key AND the
+        base key, so it is rejected. Raises if neither authenticates."""
+        rc = self._recv_crypto(peer_addr)
+        if rc is not None:
+            try:
+                return rc.decrypt(sequence, ciphertext, aad)
+            except Exception:
+                pass
+        return self._base_crypto().decrypt(sequence, ciphertext, aad)
 
     def handle_packet(self, peer_addr: tuple, packet_bytes: bytes):
         """

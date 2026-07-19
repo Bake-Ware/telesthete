@@ -32,7 +32,9 @@ class Stream:
         transport=None,
         priority: int = 128,
         crypto_for=None,
-        seq_source=None
+        seq_source=None,
+        send_crypto=None,
+        recv_crypto=None
     ):
         """
         Initialize a Stream
@@ -48,10 +50,18 @@ class Stream:
         """
         self.band_id = band_id
         self.stream_id = stream_id
-        if crypto_for is not None:
-            self._crypto_for = crypto_for
+        # Per-session data keys: send uses OUR epoch, recv uses the PEER's
+        # (SPEC §3.1/§3.3). Falls back to the legacy single-crypto resolver, or a
+        # fixed BandCrypto, for standalone/test use.
+        if send_crypto is not None and recv_crypto is not None:
+            self._send_crypto = send_crypto
+            self._recv_crypto = recv_crypto
+        elif crypto_for is not None:
+            self._send_crypto = lambda addr: crypto_for(addr)
+            self._recv_crypto = lambda addr: crypto_for(addr)
         else:
-            self._crypto_for = lambda addr, cipher_id=None: crypto
+            self._send_crypto = lambda addr: crypto
+            self._recv_crypto = lambda addr: crypto
         self.crypto = crypto
         self.transport = transport
         self.priority = priority
@@ -115,10 +125,10 @@ class Stream:
         timestamp = int(time.time() * 1000) & 0xFFFFFFFF  # 32-bit milliseconds
         payload = bytes([self.priority]) + timestamp.to_bytes(4, 'big') + data
 
-        # Encrypt per destination under that peer's negotiated suite (SPEC §3.5)
-        # and send. Sequence is shared across destinations.
+        # Encrypt per destination under our session data key for that peer's
+        # negotiated suite (SPEC §3.1/§3.5). Sequence is shared across dests.
         for dest in self._destinations:
-            crypto = self._crypto_for(dest)
+            crypto = self._send_crypto(dest)
             ciphertext = crypto.encrypt(sequence, payload, aad)
             packet = pack_stream_message(self.band_id, self.stream_id, sequence, ciphertext)
             self.transport.send(dest, packet)
@@ -176,10 +186,16 @@ class Stream:
                 self.stream_id & 0xFF
             ])
 
-            # Decrypt under the sender's negotiated suite (raises on auth
-            # failure before we advance the watermark, so a forged high-seq
-            # packet cannot wedge the mark)
-            payload = self._crypto_for(peer_addr).decrypt(packet.sequence, packet.ciphertext, aad)
+            # Decrypt under the sender's session data key (its epoch, learned
+            # from its HELLO). `None` -> we have not seen the peer's HELLO yet
+            # (or it restarted and we've not re-handshaked), so drop. Raises on
+            # auth failure before we advance the watermark, so a forged or
+            # old-session packet cannot wedge the mark.
+            rc = self._recv_crypto(peer_addr)
+            if rc is None:
+                logger.debug(f"No session key for {peer_addr} yet; dropping stream packet")
+                return
+            payload = rc.decrypt(packet.sequence, packet.ciphertext, aad)
 
             # Authenticated and fresh: advance the watermark.
             self._recv_watermark[peer_addr] = packet.sequence

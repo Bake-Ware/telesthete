@@ -13,6 +13,7 @@ the random initialization.
 """
 
 import os
+import threading
 
 _MASK = (1 << 64) - 1
 
@@ -32,12 +33,19 @@ class SequenceSource:
             # is unreachable at any realistic packet rate.
             start = int.from_bytes(os.urandom(8), "big") >> 1
         self._seq = start & _MASK
+        # A duplicated sequence is a duplicated nonce under the band-wide key, so
+        # the increment MUST be atomic. asyncio is single-threaded, but consumers
+        # legitimately call send() from worker threads (e.g. a HID/capture
+        # callback) concurrently with the event loop — an uncontended lock (~100 ns)
+        # closes that race.
+        self._lock = threading.Lock()
 
     def next(self) -> int:
-        """Return the current sequence value, then advance by one."""
-        s = self._seq
-        self._seq = (self._seq + 1) & _MASK
-        return s
+        """Return the current sequence value, then advance by one (atomic)."""
+        with self._lock:
+            s = self._seq
+            self._seq = (self._seq + 1) & _MASK
+            return s
 
     def peek(self) -> int:
         """The value that the next :meth:`next` call will return."""
