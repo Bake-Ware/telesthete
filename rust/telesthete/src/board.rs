@@ -591,6 +591,14 @@ pub struct BoardHub {
     /// Per-peer session-restart signal (SPEC §3.3): each opened endpoint
     /// subscribes so it can clear that peer's replay watermark.
     rebase_tx: tokio::sync::broadcast::Sender<SocketAddr>,
+    /// Demux task; aborted on drop so it releases its `Arc<Transport>`.
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for BoardHub {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl BoardHub {
@@ -603,7 +611,7 @@ impl BoardHub {
         let senders: Arc<Mutex<HashMap<u16, mpsc::UnboundedSender<Inbound>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let senders_ref = Arc::clone(&senders);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             while let Some(pkt) = inbound.recv().await {
                 let senders = senders_ref.lock().await;
                 if let Some(tx) = senders.get(&pkt.header.channel_id) {
@@ -618,6 +626,7 @@ impl BoardHub {
             actor: actor.into(),
             senders,
             rebase_tx,
+            task,
         }
     }
 

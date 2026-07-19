@@ -103,7 +103,13 @@ impl Discovery {
         let recv_sock = Arc::clone(&socket);
         let own_hostname = hostname;
         let recv = tokio::spawn(async move {
+            // Bounded dedup set: unauthenticated LAN beacons can spoof unlimited
+            // (hostname, ip, port) triples, so cap the set and evict the oldest
+            // (insertion-ordered) past the cap rather than growing forever.
+            const MAX_SEEN: usize = 4096;
             let mut seen: HashSet<DiscoveredPeer> = HashSet::new();
+            let mut order: std::collections::VecDeque<DiscoveredPeer> =
+                std::collections::VecDeque::new();
             let mut buf = [0u8; 1024];
             loop {
                 let Ok((n, from)) = recv_sock.recv_from(&mut buf).await else {
@@ -120,8 +126,16 @@ impl Discovery {
                     ip: from.ip(),
                     port,
                 };
-                if seen.insert(peer.clone()) && tx.send(peer).is_err() {
-                    return;
+                if seen.insert(peer.clone()) {
+                    order.push_back(peer.clone());
+                    while order.len() > MAX_SEEN {
+                        if let Some(old) = order.pop_front() {
+                            seen.remove(&old);
+                        }
+                    }
+                    if tx.send(peer).is_err() {
+                        return;
+                    }
                 }
             }
         });

@@ -25,7 +25,7 @@ pub mod board;
 pub mod drop_channel;
 
 pub use band::{Band, BandError};
-pub use channel::{ChannelEndpoint, ChannelError, ChannelHub, ChannelMessage, ChannelSender};
+pub use channel::{ChannelEndpoint, ChannelError, ChannelHub, ChannelMessage};
 pub use control::{capability, ControlChannel, ControlError, ControlEvent, LOCAL_PSK};
 pub use discovery::{pack_announce, parse_announce, DiscoveredPeer, Discovery, DISCOVERY_PORT};
 pub use crypto::{build_aad, derive_band_id, derive_key, BandId, CryptoError, Key, BAND_ID_LEN};

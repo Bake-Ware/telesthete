@@ -175,12 +175,26 @@ struct ControlEnvelope {
     payload: serde_json::Value,
 }
 
+/// When the control task's per-peer replay maps exceed this, prune entries for
+/// addresses no longer in the live `peers` registry (which the Band's keepalive
+/// loop evicts). Bounds growth from spoofed-source HELLOs.
+const PEER_MAP_SOFT_CAP: usize = 1024;
+
 pub struct ControlChannel {
     transport: Arc<Transport>,
     inbound: mpsc::UnboundedReceiver<ControlEvent>,
     /// This sender's session epoch (§4.3), advertised in HELLO/HELLO_ACK so a
     /// peer rebases its replay watermark when we restart.
     session: u64,
+    /// The receive task; aborted on drop so it releases its `Arc<Transport>`
+    /// and the socket is actually closed when the Band goes away.
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ControlChannel {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl ControlChannel {
@@ -198,13 +212,21 @@ impl ControlChannel {
         if !cfg.ciphers.iter().any(|c| c == crate::crypto::BASELINE_CIPHER) {
             cfg.ciphers.push(crate::crypto::BASELINE_CIPHER.to_string());
         }
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             // Replay protection (SPEC §3.3): highest accepted sequence per peer;
             // `sessions` tracks each peer's epoch for restart rebase. Transport
             // already authenticated the packet, so this runs on trusted plaintext.
             let mut watermark: HashMap<SocketAddr, u64> = HashMap::new();
             let mut sessions: HashMap<SocketAddr, u64> = HashMap::new();
             while let Some(pkt) = raw.recv().await {
+                // Bound these maps: past a soft cap, drop entries for addresses
+                // the Band's keepalive loop has already evicted from `peers`.
+                // Without this a spoofed-source HELLO flood grows them forever.
+                if watermark.len() > PEER_MAP_SOFT_CAP {
+                    let live = peers.lock().await;
+                    watermark.retain(|a, _| live.contains_key(a));
+                    sessions.retain(|a, _| live.contains_key(a));
+                }
                 let seq = pkt.header.sequence;
                 let env = match serde_json::from_slice::<ControlEnvelope>(&pkt.payload) {
                     Ok(e) => e,
@@ -424,6 +446,7 @@ impl ControlChannel {
             transport,
             inbound: rx,
             session,
+            task,
         }
     }
 

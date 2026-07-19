@@ -178,7 +178,7 @@ impl Band {
 
         let peers: Peers = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let stream_hub = StreamHub::new(Arc::clone(&transport), rebase_tx.subscribe()).await;
-        let channel_hub = ChannelHub::new(Arc::clone(&transport)).await;
+        let channel_hub = ChannelHub::new(Arc::clone(&transport), rebase_tx.subscribe()).await;
         // Board's actor string — the §7.3 LWW tiebreak — is this Band's hostname.
         let board_hub =
             BoardHub::new(Arc::clone(&transport), hostname.clone(), rebase_tx.clone()).await;
@@ -408,6 +408,36 @@ mod tests {
             }
             other => panic!("expected Hello, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn dropped_band_releases_its_socket() {
+        // Dropping a Band must abort ALL its spawned tasks (recv loop, control,
+        // stream/channel/board/drop hubs) so their Arc<Transport> refs release
+        // and the UDP port is actually freed — otherwise the socket leaks.
+        let addr = {
+            let band = Band::bind(b"release-psk", "127.0.0.1:0".parse().unwrap(), "a")
+                .await
+                .unwrap();
+            let a = band.local_addr().unwrap();
+            // Open one of every hub so their tasks exist and hold the transport.
+            let _ = band.stream(a, 1).await;
+            let _ = band.channel(a, 2).await;
+            let _ = band.board(3).await;
+            a
+        }; // band dropped here
+
+        // The port must be reusable: bind a fresh UDP socket on it. A leaked
+        // transport task would keep the SO_REUSEADDR-less socket bound.
+        let mut ok = false;
+        for _ in 0..20 {
+            if tokio::net::UdpSocket::bind(addr).await.is_ok() {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(ok, "dropped Band must release its socket at {addr}");
     }
 
     #[tokio::test]

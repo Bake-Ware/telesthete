@@ -71,6 +71,16 @@ pub struct StreamHub {
     transport: Arc<Transport>,
     /// Per-stream-id senders.
     senders: Arc<Mutex<HashMap<u16, mpsc::UnboundedSender<StreamMessage>>>>,
+    /// The demux task. Aborted on drop so it releases its `Arc<Transport>` (the
+    /// task holds the socket alive otherwise, since its route sender lives in
+    /// the same Transport it never exits on its own).
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for StreamHub {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl StreamHub {
@@ -86,7 +96,7 @@ impl StreamHub {
 
         let senders_ref = Arc::clone(&senders);
         let wm = Arc::clone(&watermarks);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut rx = inbound;
             loop {
                 tokio::select! {
@@ -117,7 +127,7 @@ impl StreamHub {
             }
         });
 
-        Self { transport, senders }
+        Self { transport, senders, task }
     }
 
     pub async fn open(&self, peer: SocketAddr, stream_id: u16) -> StreamEndpoint {

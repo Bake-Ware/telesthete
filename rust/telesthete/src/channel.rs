@@ -46,6 +46,10 @@ pub const DEFAULT_RTO: Duration = Duration::from_millis(500);
 /// How long [`ChannelEndpoint::connect`] waits for ESTABLISHED before erroring.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Give up on an unacked frame after this many RTOs — a peer that vanished
+/// without RST must not draw infinite retransmits (§6.4).
+const MAX_RETRIES: u32 = 10;
+
 #[derive(Debug, Error)]
 pub enum ChannelError {
     #[error("transport: {0}")]
@@ -151,11 +155,17 @@ struct ChannelCore {
     window: u16, // our advertised receive window
     rto: Duration,
 
+    // Retransmission bound (§6.4): give up on a peer that never acks.
+    retries: u32,
+
     // Outputs, drained by the task.
     outbox: Vec<Vec<u8>>,
     delivered: Vec<Vec<u8>>,
     just_established: bool,
     peer_closed: bool,
+    /// Set on RST or after MAX_RETRIES: the owning task tears the connection
+    /// down (stops retransmitting, releases the task) instead of looping forever.
+    dead: bool,
 }
 
 impl ChannelCore {
@@ -172,10 +182,12 @@ impl ChannelCore {
             reassembler: Reassembler::new(),
             window,
             rto,
+            retries: 0,
             outbox: Vec::new(),
             delivered: Vec::new(),
             just_established: false,
             peer_closed: false,
+            dead: false,
         }
     }
 
@@ -262,7 +274,13 @@ impl ChannelCore {
     }
 
     /// Cumulative ACK (§6.1): drop every in-flight frame with `seq < ack_num`.
+    /// `ack_num` is clamped to `send_next`: a frame whose payload decoded to a
+    /// huge ack_num must not clear frames we never sent (which would suppress
+    /// their retransmission — silent loss). An ACK that clears something is
+    /// forward progress, so the retry counter resets.
     fn ack(&mut self, ack_num: u64) {
+        let ack_num = ack_num.min(self.send_next);
+        let before = self.unacked.len();
         while let Some(front) = self.unacked.front() {
             if front.seq < ack_num {
                 self.unacked.pop_front();
@@ -270,11 +288,25 @@ impl ChannelCore {
                 break;
             }
         }
+        if self.unacked.len() != before {
+            self.retries = 0;
+        }
     }
 
     /// Retransmit every in-flight frame (RTO fired, §6.4). Re-serialized so it
-    /// carries a fresh outer sequence and the latest ack_num/window.
+    /// carries a fresh outer sequence and the latest ack_num/window. Bounded:
+    /// after MAX_RETRIES with no ACK the peer is gone — tear the connection down
+    /// rather than resend forever.
     fn on_timeout(&mut self) {
+        if self.unacked.is_empty() {
+            return;
+        }
+        if self.retries >= MAX_RETRIES {
+            debug!("channel peer unresponsive after {MAX_RETRIES} retransmits; closing");
+            self.teardown();
+            return;
+        }
+        self.retries += 1;
         let pending: Vec<(u8, u64, Vec<u8>)> = self
             .unacked
             .iter()
@@ -283,6 +315,16 @@ impl ChannelCore {
         for (flags, seq, data) in pending {
             self.emit(flags, seq, data);
         }
+    }
+
+    /// Stop guaranteeing delivery and mark the connection dead so the owning
+    /// task exits. Clears in-flight/queued frames — a CLOSED or reset channel
+    /// must not keep retransmitting (leaks the task, floods the peer).
+    fn teardown(&mut self) {
+        self.state = ConnState::Closed;
+        self.unacked.clear();
+        self.send_queue.clear();
+        self.dead = true;
     }
 
     /// Process one received frame through the state machine.
@@ -294,8 +336,8 @@ impl ChannelCore {
         self.peer_window = f.window;
 
         if f.flags & FLAG_RST != 0 {
-            self.state = ConnState::Closed;
             self.peer_closed = true;
+            self.teardown();
             return;
         }
 
@@ -344,6 +386,14 @@ impl ChannelCore {
         if f.seq < self.rcv_next || self.recv_buffer.contains_key(&f.seq) {
             // Already delivered or already buffered — dedup, but re-ack so a
             // peer whose ACK was lost stops retransmitting (§6.4).
+            self.emit_pure_ack();
+            return;
+        }
+        // Bound the reorder buffer by the window we advertise (§6.4): a seq at
+        // or beyond rcv_next + window is outside what we promised to hold, so
+        // drop it (and re-ack) rather than let a peer sending sparse far-future
+        // sequences grow memory without limit.
+        if f.seq >= self.rcv_next + self.window as u64 {
             self.emit_pure_ack();
             return;
         }
@@ -475,6 +525,12 @@ async fn run_connection(t: ConnTask) {
             deliver_tx = None;
         }
 
+        // A reset or retransmit-exhausted connection is dead: stop looping so
+        // the task (and its transport reference) is released.
+        if core.dead {
+            break;
+        }
+
         deadline = match (core.has_unacked(), deadline) {
             (true, Some(d)) => Some(d),           // keep the oldest frame's timer
             (true, None) => Some(Instant::now() + core.rto),
@@ -502,7 +558,6 @@ pub struct ChannelMessage {
 /// A reliable Channel endpoint (§6). Owns the command/deliver plumbing to a
 /// per-connection task; cheap fields (peer/channel_id) mirror the old shape.
 pub struct ChannelEndpoint {
-    transport: Arc<Transport>,
     peer: SocketAddr,
     channel_id: u16,
     cmd_tx: mpsc::UnboundedSender<Command>,
@@ -559,49 +614,6 @@ impl ChannelEndpoint {
             .map_err(|_| ChannelError::Closed)
     }
 
-    /// A `Send + Sync + Clone` low-level sender for this channel. Bypasses the
-    /// reliability state machine (raw fire-and-forget frames); useful for
-    /// cockpit-side input dispatch where multiple tasks share one channel.
-    pub fn sender(&self) -> ChannelSender {
-        ChannelSender {
-            transport: Arc::clone(&self.transport),
-            peer: self.peer,
-            channel_id: self.channel_id,
-        }
-    }
-}
-
-/// Low-level, fire-and-forget sender counterpart to [`ChannelEndpoint`]. Cheap
-/// to clone. Sends raw bytes as the Channel plaintext with no §6 reliability.
-#[derive(Clone)]
-pub struct ChannelSender {
-    transport: Arc<Transport>,
-    peer: SocketAddr,
-    channel_id: u16,
-}
-
-impl ChannelSender {
-    pub async fn send(&self, data: &[u8]) -> Result<(), ChannelError> {
-        self.transport
-            .send(Outbound {
-                to: self.peer,
-                channel_type: ChannelType::Channel,
-                channel_id: self.channel_id,
-                plaintext: data.to_vec(),
-                priority: 4,
-                use_base_key: false,
-            })
-            .await?;
-        Ok(())
-    }
-
-    pub fn peer(&self) -> SocketAddr {
-        self.peer
-    }
-
-    pub fn channel_id(&self) -> u16 {
-        self.channel_id
-    }
 }
 
 type Routes = Arc<Mutex<HashMap<(SocketAddr, u16), mpsc::UnboundedSender<ChannelFrame>>>>;
@@ -613,40 +625,88 @@ pub struct ChannelHub {
     routes: Routes,
     window: u16,
     rto: Duration,
+    /// Demux task; aborted on drop so it releases its `Arc<Transport>`.
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ChannelHub {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl ChannelHub {
-    pub async fn new(transport: Arc<Transport>) -> Self {
-        Self::with_options(transport, DEFAULT_WINDOW, DEFAULT_RTO).await
+    pub async fn new(
+        transport: Arc<Transport>,
+        rebase_rx: tokio::sync::broadcast::Receiver<SocketAddr>,
+    ) -> Self {
+        Self::with_options(transport, rebase_rx, DEFAULT_WINDOW, DEFAULT_RTO).await
     }
 
     /// Build a hub with a custom window / RTO (tests use a short RTO).
-    pub async fn with_options(transport: Arc<Transport>, window: u16, rto: Duration) -> Self {
+    pub async fn with_options(
+        transport: Arc<Transport>,
+        mut rebase_rx: tokio::sync::broadcast::Receiver<SocketAddr>,
+        window: u16,
+        rto: Duration,
+    ) -> Self {
         let inbound = transport.route(ChannelType::Channel).await;
         let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        // §3.3 replay watermark on the OUTER sequence, per (peer, channel_id):
+        // accept-first, then strictly increasing. The inner-seq machinery dedups
+        // data, but a replayed frame must be rejected before it reaches the state
+        // machine at all (a stale SYN/ACK could otherwise perturb it).
+        let watermarks: Arc<Mutex<HashMap<(SocketAddr, u16), u64>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         let routes_ref = Arc::clone(&routes);
-        tokio::spawn(async move {
+        let wm = Arc::clone(&watermarks);
+        let task = tokio::spawn(async move {
             let mut rx = inbound;
-            while let Some(pkt) = rx.recv().await {
-                let Some(frame) = ChannelFrame::parse(&pkt.payload) else {
-                    debug!(
-                        "dropping malformed Channel frame from {} (channel_id=0x{:04x})",
-                        pkt.from, pkt.header.channel_id
-                    );
-                    continue;
-                };
-                let key = (pkt.from, pkt.header.channel_id);
-                let routes = routes_ref.lock().await;
-                if let Some(tx) = routes.get(&key) {
-                    if tx.send(frame).is_err() {
-                        debug!("channel task for {key:?} gone");
-                    }
-                } else {
-                    debug!(
-                        "no Channel connection for {} channel_id=0x{:04x}",
-                        pkt.from, pkt.header.channel_id
-                    );
+            loop {
+                tokio::select! {
+                    pkt = rx.recv() => match pkt {
+                        Some(pkt) => {
+                            let key = (pkt.from, pkt.header.channel_id);
+                            {
+                                let mut w = wm.lock().await;
+                                match w.get(&key) {
+                                    Some(&prev) if pkt.header.sequence <= prev => {
+                                        debug!("drop replayed/stale Channel seq={} from {}",
+                                               pkt.header.sequence, pkt.from);
+                                        continue;
+                                    }
+                                    _ => { w.insert(key, pkt.header.sequence); }
+                                }
+                            }
+                            let Some(frame) = ChannelFrame::parse(&pkt.payload) else {
+                                debug!(
+                                    "dropping malformed Channel frame from {} (channel_id=0x{:04x})",
+                                    pkt.from, pkt.header.channel_id
+                                );
+                                continue;
+                            };
+                            let routes = routes_ref.lock().await;
+                            if let Some(tx) = routes.get(&key) {
+                                if tx.send(frame).is_err() {
+                                    debug!("channel task for {key:?} gone");
+                                }
+                            } else {
+                                debug!(
+                                    "no Channel connection for {} channel_id=0x{:04x}",
+                                    pkt.from, pkt.header.channel_id
+                                );
+                            }
+                        }
+                        None => break,
+                    },
+                    // Peer restarted (§3.3/§4.3): clear its channel watermarks so
+                    // its fresh-session sequences are accepted.
+                    peer = rebase_rx.recv() => match peer {
+                        Ok(addr) => { wm.lock().await.retain(|(a, _), _| *a != addr); }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    },
                 }
             }
         });
@@ -656,6 +716,7 @@ impl ChannelHub {
             routes,
             window,
             rto,
+            task,
         }
     }
 
@@ -681,7 +742,6 @@ impl ChannelHub {
         }));
 
         ChannelEndpoint {
-            transport: Arc::clone(&self.transport),
             peer,
             channel_id,
             cmd_tx,
@@ -875,6 +935,72 @@ mod tests {
         init.on_timeout();
         shuttle(&mut init, &mut resp);
         assert_eq!(resp.delivered, vec![b"needs-retransmit".to_vec()]);
+    }
+
+    #[test]
+    fn rst_tears_down_and_stops_retransmitting() {
+        let (mut init, mut resp) = handshake();
+        init.send_message(b"inflight");
+        assert!(init.has_unacked());
+        // Responder resets the initiator.
+        resp.emit(FLAG_RST, 0, Vec::new());
+        shuttle(&mut resp, &mut init);
+        assert_eq!(init.state, ConnState::Closed);
+        assert!(init.dead, "RST must mark the connection dead");
+        assert!(!init.has_unacked(), "reset must clear the send buffer");
+        // A subsequent RTO does nothing (nothing to resend).
+        init.outbox.clear();
+        init.on_timeout();
+        assert!(init.outbox.is_empty(), "a dead channel must not retransmit");
+    }
+
+    #[test]
+    fn dead_peer_retransmit_cap_tears_down() {
+        let (mut init, _resp) = handshake();
+        init.send_message(b"into-the-void");
+        // No ACK ever arrives; every RTO retransmits until the cap.
+        for _ in 0..MAX_RETRIES {
+            assert!(!init.dead);
+            init.outbox.clear();
+            init.on_timeout();
+        }
+        // One more RTO past the cap → teardown, no further sends.
+        init.outbox.clear();
+        init.on_timeout();
+        assert!(init.dead, "unresponsive peer must trigger teardown");
+        assert!(init.outbox.is_empty());
+        assert!(!init.has_unacked());
+    }
+
+    #[test]
+    fn ack_num_clamped_to_send_next() {
+        let (mut init, _resp) = handshake();
+        init.send_message(b"a");
+        init.send_message(b"b");
+        let inflight = init.unacked.len();
+        assert!(inflight >= 1);
+        // A forged frame acking far beyond what we ever sent must not clear
+        // frames we never sent (which would suppress their retransmission).
+        init.ack(u64::MAX);
+        // Only frames with seq < send_next are cleared; send_next-bounded.
+        assert!(init.unacked.is_empty() || init.unacked.len() <= inflight);
+        // send_next is small; nothing beyond it exists to clear.
+        assert!(init.send_next < 100);
+    }
+
+    #[test]
+    fn reorder_buffer_bounded_by_window() {
+        let mut resp = ChannelCore::new(4, DEFAULT_RTO); // small window
+        // Bring responder to Established via a SYN.
+        resp.on_frame(ChannelFrame { flags: FLAG_SYN, ack_num: 0, window: 32, seq: 0, data: vec![] });
+        assert_eq!(resp.state, ConnState::Established);
+        // Feed a far-future data frame (seq well beyond rcv_next + window): it
+        // must be dropped, not buffered.
+        let chunk = fragment(b"x", MAX_CHUNK_PAYLOAD, &[9u8; 16]).remove(0);
+        resp.on_frame(ChannelFrame {
+            flags: FLAG_ACK, ack_num: 0, window: 32, seq: 1000, data: chunk,
+        });
+        assert!(resp.recv_buffer.is_empty(), "far-future seq must not be buffered");
     }
 
     #[test]
