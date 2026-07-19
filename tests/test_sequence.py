@@ -195,6 +195,45 @@ def test_band_wires_one_shared_source_and_session_keys():
     assert send_c.key != b.base_crypto().key
 
 
+def test_keyframe_req_and_rate_hint_round_trip():
+    # §4.9/§4.10 control messages encode + decode both ways.
+    crypto = BandCrypto("kf-psk")
+    mt = MockTransport()
+    sender = ControlChannel(crypto.band_id, crypto=crypto, transport=mt,
+                            seq_source=SequenceSource(start=0))
+    sender.add_destination(("d", 1))
+    receiver = ControlChannel(crypto.band_id, crypto=crypto, transport=MockTransport())
+    got = []
+    receiver.register_handler(ControlMessageType.KEYFRAME_REQ, lambda a, p: got.append(("kf", p)))
+    receiver.register_handler(ControlMessageType.RATE_HINT, lambda a, p: got.append(("rh", p)))
+
+    sender.send_keyframe_req(9, dest=("d", 1))
+    receiver.handle_packet(("peer", 1), mt.sent[-1][1])
+    sender.send_rate_hint(9, 2_000_000, 0.05, dest=("d", 1))
+    receiver.handle_packet(("peer", 1), mt.sent[-1][1])
+
+    assert got[0] == ("kf", {"stream_id": 9})
+    assert got[1][0] == "rh"
+    assert got[1][1]["stream_id"] == 9 and got[1][1]["target_bps"] == 2_000_000
+    assert abs(got[1][1]["loss"] - 0.05) < 1e-6
+
+
+def test_unknown_control_type_is_ignored():
+    # §4.2: an unknown control type must be dropped, not crash or dispatch.
+    crypto = BandCrypto("unknown-psk")
+    mt = MockTransport()
+    sender = ControlChannel(crypto.band_id, crypto=crypto, transport=mt,
+                            seq_source=SequenceSource(start=0))
+    sender.add_destination(("d", 1))
+    receiver = ControlChannel(crypto.band_id, crypto=crypto, transport=MockTransport())
+    fired = []
+    for t in ControlMessageType:
+        receiver.register_handler(t, lambda a, p: fired.append(p))
+    sender.send_message(0x42, {"x": 1}, dest=("d", 1))  # undefined type
+    receiver.handle_packet(("peer", 1), mt.sent[-1][1])  # must not raise
+    assert fired == [], "unknown control type must not be dispatched"
+
+
 def test_channel_is_not_wired_into_band():
     # Regression guard (Phase 6 deferral): the reliable Channel still has an
     # unfixed per-object counter, so it MUST NOT be on the live path or it would

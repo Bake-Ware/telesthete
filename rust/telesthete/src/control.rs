@@ -21,6 +21,8 @@ pub const TYPE_KEEPALIVE: u8 = 0x03;
 pub const TYPE_FOCUS_CHANGE: u8 = 0x04;
 pub const TYPE_METACONTROL: u8 = 0x05;
 pub const TYPE_GOODBYE: u8 = 0x06;
+pub const TYPE_KEYFRAME_REQ: u8 = 0x07;
+pub const TYPE_RATE_HINT: u8 = 0x08;
 
 /// Capability strings advertised in HELLO / HELLO_ACK per Telesthete §12.5.
 /// As of v1.2 capability announce is mandatory; unknown capabilities are
@@ -84,6 +86,21 @@ pub struct Keepalive {}
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Goodbye {}
 
+/// Stream consumer -> producer keyframe request (§4.9).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct KeyframeReq {
+    pub stream_id: u16,
+}
+
+/// Stream consumer -> producer congestion feedback (§4.10).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RateHint {
+    pub stream_id: u16,
+    pub target_bps: u32,
+    #[serde(default)]
+    pub loss: f32,
+}
+
 #[derive(Debug, Clone)]
 pub enum ControlEvent {
     Hello {
@@ -104,6 +121,16 @@ pub enum ControlEvent {
     },
     Goodbye {
         from: SocketAddr,
+    },
+    KeyframeReq {
+        from: SocketAddr,
+        stream_id: u16,
+    },
+    RateHint {
+        from: SocketAddr,
+        stream_id: u16,
+        target_bps: u32,
+        loss: f32,
     },
     Other {
         from: SocketAddr,
@@ -225,6 +252,30 @@ impl ControlChannel {
                         let event = match env.type_ {
                             TYPE_KEEPALIVE => ControlEvent::Keepalive { from: pkt.from },
                             TYPE_GOODBYE => ControlEvent::Goodbye { from: pkt.from },
+                            TYPE_KEYFRAME_REQ => {
+                                match serde_json::from_value::<KeyframeReq>(env.payload) {
+                                    Ok(k) => ControlEvent::KeyframeReq {
+                                        from: pkt.from,
+                                        stream_id: k.stream_id,
+                                    },
+                                    Err(e) => {
+                                        debug!("bad KEYFRAME_REQ: {e}");
+                                        continue;
+                                    }
+                                }
+                            }
+                            TYPE_RATE_HINT => match serde_json::from_value::<RateHint>(env.payload) {
+                                Ok(r) => ControlEvent::RateHint {
+                                    from: pkt.from,
+                                    stream_id: r.stream_id,
+                                    target_bps: r.target_bps,
+                                    loss: r.loss,
+                                },
+                                Err(e) => {
+                                    debug!("bad RATE_HINT: {e}");
+                                    continue;
+                                }
+                            },
                             _ => ControlEvent::Other {
                                 from: pkt.from,
                                 type_: env.type_,
@@ -321,6 +372,37 @@ impl ControlChannel {
         self.send_typed(peer, TYPE_GOODBYE, &Goodbye {}).await
     }
 
+    /// Stream consumer -> producer: request a fresh keyframe (§4.9).
+    pub async fn send_keyframe_req(
+        &self,
+        peer: SocketAddr,
+        stream_id: u16,
+    ) -> Result<(), ControlError> {
+        self.send_typed(peer, TYPE_KEYFRAME_REQ, &KeyframeReq { stream_id })
+            .await
+    }
+
+    /// Stream consumer -> producer: bitrate/loss feedback for a lossy Stream
+    /// (§4.10). Advisory.
+    pub async fn send_rate_hint(
+        &self,
+        peer: SocketAddr,
+        stream_id: u16,
+        target_bps: u32,
+        loss: f32,
+    ) -> Result<(), ControlError> {
+        self.send_typed(
+            peer,
+            TYPE_RATE_HINT,
+            &RateHint {
+                stream_id,
+                target_bps,
+                loss,
+            },
+        )
+        .await
+    }
+
     async fn send_typed<T: Serialize>(
         &self,
         peer: SocketAddr,
@@ -385,6 +467,21 @@ mod tests {
         assert_eq!(parsed.session, 1_737_000_000_000);
         let minimal: Hello = serde_json::from_str(r#"{"hostname":"b"}"#).unwrap();
         assert_eq!(minimal.session, 0);
+    }
+
+    #[test]
+    fn keyframe_req_and_rate_hint_serde() {
+        // §4.9/§4.10 round-trip; loss defaults to 0.
+        let k: KeyframeReq =
+            serde_json::from_str(&serde_json::to_string(&KeyframeReq { stream_id: 9 }).unwrap())
+                .unwrap();
+        assert_eq!(k.stream_id, 9);
+        let r: RateHint =
+            serde_json::from_str(r#"{"stream_id":9,"target_bps":2000000,"loss":0.05}"#).unwrap();
+        assert_eq!((r.stream_id, r.target_bps), (9, 2_000_000));
+        assert!((r.loss - 0.05).abs() < 1e-6);
+        let r2: RateHint = serde_json::from_str(r#"{"stream_id":1,"target_bps":1}"#).unwrap();
+        assert_eq!(r2.loss, 0.0);
     }
 
     #[test]

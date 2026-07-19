@@ -26,6 +26,8 @@ class ControlMessageType(IntEnum):
     FOCUS_CHANGE = 0x04    # Focus state change
     METACONTROL = 0x05     # Settings/config sync (monitor layout, etc)
     GOODBYE = 0x06         # Peer disconnect
+    KEYFRAME_REQ = 0x07    # Stream consumer -> producer: request a fresh keyframe (§4.9)
+    RATE_HINT = 0x08       # Stream consumer -> producer: bitrate/loss feedback (§4.10)
 
 
 class ControlChannel:
@@ -204,6 +206,22 @@ class ControlChannel:
     def send_goodbye(self):
         """Send goodbye before disconnect"""
         self.send_message(ControlMessageType.GOODBYE, {})
+
+    def send_keyframe_req(self, stream_id: int, dest: Optional[tuple] = None):
+        """Stream consumer -> producer: request a fresh keyframe (SPEC §4.9).
+        Carried on Control (reliable) so it is not subject to Stream drop."""
+        self.send_message(ControlMessageType.KEYFRAME_REQ,
+                          {"stream_id": int(stream_id)}, dest)
+
+    def send_rate_hint(self, stream_id: int, target_bps: int, loss: float,
+                       dest: Optional[tuple] = None):
+        """Stream consumer -> producer: application-level congestion feedback for
+        a lossy Stream (SPEC §4.10). Advisory."""
+        self.send_message(ControlMessageType.RATE_HINT, {
+            "stream_id": int(stream_id),
+            "target_bps": int(target_bps),
+            "loss": float(loss),
+        }, dest)
 
     def _decrypt_control(self, peer_addr: tuple, sequence: int, ciphertext: bytes, aad: bytes) -> bytes:
         """Authenticate a control packet: try the peer's per-session data key
