@@ -539,6 +539,9 @@ mod tests {
         assert_eq!(select_cipher(&[aes.clone(), cha.clone()], &[cha.clone(), aes.clone()]), aes);
         assert_eq!(select_cipher(&[cha.clone(), aes.clone()], &[cha.clone(), aes.clone()]), cha);
         // no overlap -> baseline
-        assert_eq!(select_cipher(&[aes.clone()], &[cha.clone()]), cha);
+        assert_eq!(
+            select_cipher(std::slice::from_ref(&aes), std::slice::from_ref(&cha)),
+            cha
+        );
     }
 }

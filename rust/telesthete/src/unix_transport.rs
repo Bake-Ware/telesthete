@@ -301,10 +301,10 @@ impl Drop for UnixTransport {
 
 fn parse_addr(addr: Option<UnixAddr>) -> PathBuf {
     addr.and_then(|a| a.path().map(|p| p.to_path_buf()))
-        .unwrap_or_else(PathBuf::new)
+        .unwrap_or_default()
 }
 
-fn collect_fds<'a, I>(cmsgs: I) -> Vec<OwnedFd>
+fn collect_fds<I>(cmsgs: I) -> Vec<OwnedFd>
 where
     I: IntoIterator<Item = ControlMessageOwned>,
 {

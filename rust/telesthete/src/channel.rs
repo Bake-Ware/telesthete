@@ -53,6 +53,7 @@ impl ChannelEndpoint {
                 channel_id: self.channel_id,
                 plaintext: data.to_vec(),
                 priority: 4,
+                use_base_key: false,
             })
             .await?;
         Ok(())
@@ -92,6 +93,7 @@ impl ChannelSender {
                 channel_id: self.channel_id,
                 plaintext: data.to_vec(),
                 priority: 4,
+                use_base_key: false,
             })
             .await?;
         Ok(())
