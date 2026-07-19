@@ -193,3 +193,17 @@ def test_band_wires_one_shared_source_and_session_keys():
     send_c = b.send_crypto(("1.2.3.4", 5))
     assert send_c.session == b.session_epoch
     assert send_c.key != b.base_crypto().key
+
+
+def test_channel_is_not_wired_into_band():
+    # Regression guard (Phase 6 deferral): the reliable Channel still has an
+    # unfixed per-object counter, so it MUST NOT be on the live path or it would
+    # silently reintroduce nonce reuse. If a future change wires it up, this
+    # fails until Channel draws from the shared SequenceSource.
+    from telesthete.band import Band
+    from telesthete.protocol.framing import ChannelType
+    b = Band(psk="channel-guard-psk", bind_port=0)
+    registered = set(b.transport._handlers.keys())
+    assert ChannelType.CHANNEL not in registered, "Channel must not be wired (nonce-unsafe until Phase 6)"
+    assert ChannelType.CONTROL in registered
+    assert ChannelType.STREAM in registered

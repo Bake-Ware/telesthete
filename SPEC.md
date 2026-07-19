@@ -82,10 +82,13 @@ Big-endian: "!16s B H Q"
 All derived from a single Pre-Shared Key (PSK) string.
 
 ```
-band_id = SHA256(PSK)[:16]                          # 16 bytes, cleartext routing
-key     = HKDF-SHA256(salt="telesthete-v1",          # 32 bytes, per-cipher key
-                       ikm=PSK,
-                       info="encryption-" + cipher_id)
+band_id  = SHA256(PSK)[:16]                          # 16 bytes, cleartext routing
+base_key = HKDF-SHA256(salt="telesthete-v1",          # 32 bytes, per-cipher key
+                        ikm=PSK,
+                        info="encryption-" + cipher_id)
+data_key = HKDF-SHA256(salt="telesthete-v1",          # 32 bytes, per-session data key
+                        ikm=PSK,
+                        info="encryption-" + cipher_id + "-session-" + epoch_be8)
 ```
 
 `cipher_id` is the negotiated AEAD suite name (§3.2, e.g.
@@ -94,6 +97,17 @@ cipher means the ChaCha key and the AES key are distinct 32-byte values,
 so a packet under one suite can never be confused with another on the
 same band. `band_id` does **not** depend on the cipher — it is constant
 per PSK, so the hub routes regardless of which suite a pair negotiates.
+
+**Session-bound data key (v1.2).** Because the key is band-wide (every member
+derives the same value from the PSK), a HELLO/HELLO_ACK is encrypted under the
+`base_key`, but **every other packet is encrypted under a `data_key` that mixes
+in the sender's session epoch (§4.3)** as a fixed 8-byte big-endian suffix
+(`epoch_be8`). This closes the cross-session replay window: after a sender
+restarts to a new epoch, packets captured from its previous session decrypt
+under neither the new `data_key` nor the `base_key`, so a receiver — which
+learns the sender's epoch from its HELLO and derives that sender's `data_key`
+accordingly — rejects them. A data packet that arrives before the sender's
+HELLO (epoch unknown) is dropped.
 
 Both peers with the same PSK and the same negotiated cipher derive
 identical `key`. The relay (Telesthetium) sees `band_id` for routing but
@@ -274,13 +288,20 @@ and MUST contain the baseline `chacha20-poly1305` (§3.5). HELLO itself is
 always encrypted with the baseline suite. A peer that omits these fields
 is non-conformant.
 
-`session` is a monotonic per-sender epoch (v1.2), typically the sender's
-start time in milliseconds, that increases on every restart. A receiver uses
-it to rebase replay high-water marks after a peer restarts (§3.3): a HELLO or
-HELLO_ACK bearing a **newer** epoch than last seen from that peer rebases its
-marks (accepting the peer's fresh CSPRNG-seeded sequence), while an older or
-equal epoch does not — so a replayed HELLO cannot roll a mark backward. A peer
-that omits `session` is treated as epoch 0.
+`session` is a monotonic per-sender epoch (v1.2) that **MUST strictly increase
+on every restart**. It keys the sender's `data_key` (§3.1) and lets a receiver
+rebase replay high-water marks after that peer restarts (§3.3): a HELLO or
+HELLO_ACK bearing a **newer** epoch than last seen from the peer re-derives its
+`data_key` and rebases its marks (accepting the peer's fresh CSPRNG-seeded
+sequence), while an older or equal epoch does not — so a replayed HELLO cannot
+roll a mark backward or re-key to a stale session. A peer that omits `session`
+is treated as epoch 0.
+
+Milliseconds since the Unix epoch satisfy the requirement on a roughly-synced
+clock. A host whose clock may step backward or start unset (embedded / no-RTC
+devices) MUST persist a monotonic value across restarts, e.g.
+`max(last_saved + 1, now_ms)`; otherwise a peer that saw a higher epoch will
+refuse to rebase and lock the restarted sender out until its session ages off.
 
 ### 4.4 HELLO_ACK (0x02)
 

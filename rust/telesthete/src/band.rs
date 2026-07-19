@@ -50,22 +50,34 @@ pub struct Band {
 }
 
 impl Band {
-    /// Bind a UDP socket and spin up the receive loop.
+    /// Bind a UDP socket and spin up the receive loop, using the current time
+    /// (ms since the Unix epoch) as the session epoch (§4.3). Fine on a
+    /// roughly-synced clock; a host whose clock can step backward or start unset
+    /// MUST use [`Band::bind_with_session`] with a persisted monotonic value.
     pub async fn bind(
         psk: &[u8],
         bind_addr: SocketAddr,
         hostname: impl Into<String>,
     ) -> Result<Self, BandError> {
-        let base_key = derive_key(psk);
-        let band_id = derive_band_id(psk);
-
-        // One session epoch for this Band instance (§4.3), sampled once and used
-        // for our data key, our HELLO payloads, and connect_peer — so a peer
-        // never sees two different epochs from us.
         let session = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        Self::bind_with_session(psk, bind_addr, hostname, session).await
+    }
+
+    /// Bind with an explicit session epoch (§4.3), which MUST increase on every
+    /// restart. Consumers with an unreliable clock should pass a persisted
+    /// `max(last_saved + 1, now_ms)` so a restart is never mistaken for a stale
+    /// session and refused.
+    pub async fn bind_with_session(
+        psk: &[u8],
+        bind_addr: SocketAddr,
+        hostname: impl Into<String>,
+        session: u64,
+    ) -> Result<Self, BandError> {
+        let base_key = derive_key(psk);
+        let band_id = derive_band_id(psk);
 
         let mut transport = Transport::bind(bind_addr, base_key, band_id).await?;
         transport.set_session_key(crate::crypto::derive_session_key(

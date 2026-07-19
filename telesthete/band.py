@@ -35,7 +35,8 @@ class Band:
         bind_address: str = "0.0.0.0",
         bind_port: int = 9999,
         capabilities: Optional[List[str]] = None,
-        ciphers: Optional[List[str]] = None
+        ciphers: Optional[List[str]] = None,
+        session_epoch: Optional[int] = None
     ):
         """
         Initialize a Band
@@ -67,15 +68,25 @@ class Band:
         self.crypto = self._crypto(BASELINE_CIPHER, None)  # base
         self.band_id = self.crypto.band_id
 
-        # One sequence source for this sender, shared across Control/Stream/
-        # Channel so no two packets we emit reuse an AEAD (key, nonce) — the
-        # nonce is the sequence, and the key is band-wide (SPEC §3.3).
+        # One sequence source for this sender, shared across the live channels
+        # (Control + Stream) so no two packets we emit reuse an AEAD (key, nonce)
+        # — the nonce is the sequence (SPEC §3.3). The reliable Channel is
+        # deferred to a later phase and is intentionally NOT wired into the Band.
         self.seq_source = SequenceSource()
 
         # This band instance's session epoch (SPEC §4.3). Advertised in HELLO so
         # a peer that has seen an earlier session rebases its replay watermark
         # after we restart, instead of dropping our fresh (lower-sequence) HELLO.
-        self.session_epoch = int(time.time() * 1000)
+        #
+        # It MUST increase on every restart (§4.3). The default — milliseconds
+        # since the Unix epoch — is monotonic on a roughly-synced clock. A
+        # consumer whose host clock can step backward or start unset (embedded /
+        # no-RTC devices) MUST pass a persisted monotonic value instead, e.g.
+        # ``max(last_saved + 1, now_ms)``, or a peer that saw a higher epoch will
+        # refuse to rebase and lock this instance out until it ages out.
+        self.session_epoch = (
+            int(session_epoch) if session_epoch is not None
+            else int(time.time() * 1000))
 
         # Transport
         self.transport = UDPTransport(bind_address, bind_port)
