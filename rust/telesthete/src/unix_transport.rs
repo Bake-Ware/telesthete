@@ -7,10 +7,13 @@
 //!
 //! ## Socket type
 //!
-//! v1.1 §9.4 prefers `SOCK_SEQPACKET`. Tokio's stable async UDS API only
-//! covers `SOCK_DGRAM` first-class, so this module uses `SOCK_DGRAM` and
-//! relies on the kernel's per-message-boundary behaviour for datagram
-//! sockets. Spec permits this; v1.1 postmortem can move to SEQPACKET.
+//! §9.4 recommends `SOCK_SEQPACKET` and permits `SOCK_DGRAM`. Tokio's
+//! stable async UDS API only covers `SOCK_DGRAM` first-class, so this
+//! module uses `SOCK_DGRAM` and relies on the kernel's per-message-
+//! boundary behaviour for datagram sockets. The Python reference
+//! (`telesthete/transport/unix.py`) demonstrates the recommended
+//! SEQPACKET variant; between them the two references cover both
+//! spec-legal socket types.
 //!
 //! ## Ownership of fds
 //!

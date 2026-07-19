@@ -112,6 +112,13 @@ class Band:
         self.channels: Dict[int, Channel] = {}
         self._channel_handler_registered = False
 
+        # Boards (§7) and Drops (§8), keyed by board_id / drop_id. Handlers
+        # registered lazily on first use, like Channel.
+        self.boards: Dict[int, "Board"] = {}
+        self._board_handler_registered = False
+        self.drops: Dict[int, object] = {}
+        self._drop_handler_registered = False
+
         # Running state
         self._running = False
         self._tasks = []
@@ -200,6 +207,8 @@ class Band:
             self.control.add_destination(peer_addr)
             for stream in self.streams.values():
                 stream.add_destination(peer_addr)
+            for board in self.boards.values():
+                board.add_destination(peer_addr)
         return peer
 
     def _on_hello(self, peer_addr: tuple, payload: dict):
@@ -250,6 +259,10 @@ class Band:
             stream.reset_peer(peer_addr)
         for channel in self.channels.values():
             channel.reset_peer(peer_addr)
+        for board in self.boards.values():
+            board.reset_peer(peer_addr)
+        for drop_ep in self.drops.values():
+            drop_ep.reset_peer(peer_addr)
 
     def _on_keepalive(self, peer_addr: tuple, payload: dict):
         """Handle KEEPALIVE from peer"""
@@ -366,6 +379,96 @@ class Band:
             channel.handle_packet(peer_addr, packet_bytes)
 
         self.transport.register_handler(ChannelType.CHANNEL, handle_channel)
+
+    def board(self, board_id: int) -> "Board":
+        """
+        Open or get a replicated Board (SPEC §7)
+
+        Every known peer is a replication destination; new peers are added as
+        they HELLO. Advertises `board-v1` (§12.5).
+        """
+        from .protocol.board import Board
+        if board_id in self.boards:
+            return self.boards[board_id]
+        board = Board(self.band_id, board_id, self.hostname,
+                      transport=self.transport,
+                      send_crypto=self.send_crypto,
+                      recv_crypto=self.recv_crypto,
+                      seq_source=self.seq_source)
+        for peer_addr in self.peers:
+            board.add_destination(peer_addr)
+        self.boards[board_id] = board
+        if "board-v1" not in self.capabilities:
+            self.capabilities.append("board-v1")
+        self._register_board_handler()
+        return board
+
+    def _register_board_handler(self):
+        if self._board_handler_registered:
+            return
+        self._board_handler_registered = True
+
+        def handle_board(peer_addr, packet_bytes):
+            if peer_addr in self.peers:
+                self.peers[peer_addr].update_last_seen()
+            from .protocol.framing import unpack_packet
+            try:
+                packet = unpack_packet(packet_bytes)
+            except ValueError:
+                return
+            board = self.boards.get(packet.channel_id)
+            if board is not None:
+                board.handle_packet(peer_addr, packet_bytes)
+
+        self.transport.register_handler(ChannelType.BOARD, handle_board)
+
+    def drop_sender(self, drop_id: int, name: str, data: bytes) -> "DropSender":
+        """Offer a file on a Drop (SPEC §8). Advertises `drop-v1` (§12.5)."""
+        from .protocol.drop import DropSender
+        sender = DropSender(self.band_id, drop_id, name, data,
+                            transport=self.transport,
+                            send_crypto=self.send_crypto,
+                            recv_crypto=self.recv_crypto,
+                            seq_source=self.seq_source)
+        self.drops[drop_id] = sender
+        if "drop-v1" not in self.capabilities:
+            self.capabilities.append("drop-v1")
+        self._register_drop_handler()
+        return sender
+
+    def drop_receiver(self, drop_id: int, have=None) -> "DropReceiver":
+        """Receive a file offered on a Drop (SPEC §8); `have` resumes from
+        persisted chunks."""
+        from .protocol.drop import DropReceiver
+        receiver = DropReceiver(self.band_id, drop_id, have=have,
+                                transport=self.transport,
+                                send_crypto=self.send_crypto,
+                                recv_crypto=self.recv_crypto,
+                                seq_source=self.seq_source)
+        self.drops[drop_id] = receiver
+        if "drop-v1" not in self.capabilities:
+            self.capabilities.append("drop-v1")
+        self._register_drop_handler()
+        return receiver
+
+    def _register_drop_handler(self):
+        if self._drop_handler_registered:
+            return
+        self._drop_handler_registered = True
+
+        def handle_drop(peer_addr, packet_bytes):
+            if peer_addr in self.peers:
+                self.peers[peer_addr].update_last_seen()
+            from .protocol.framing import unpack_packet
+            try:
+                packet = unpack_packet(packet_bytes)
+            except ValueError:
+                return
+            endpoint = self.drops.get(packet.channel_id)
+            if endpoint is not None:
+                endpoint.handle_packet(peer_addr, packet_bytes)
+
+        self.transport.register_handler(ChannelType.DROP, handle_drop)
 
     def connect_peer(self, host: str, port: int):
         """
