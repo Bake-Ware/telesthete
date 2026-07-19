@@ -428,6 +428,65 @@ mod tests {
         ));
     }
 
+    /// Byte-identical with the Python reference: tests/vectors.json `dmabuf`
+    /// and `stream_header`.
+    #[test]
+    fn conformance_vectors_match_python() {
+        use crate::wire::stream::{StreamFlags, StreamHeader, STREAM_HEADER_LEN};
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/vectors.json");
+        let raw = std::fs::read_to_string(path).expect("read tests/vectors.json");
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        fn to_hex(b: &[u8]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
+
+        if let Some(cases) = v.get("stream_header").and_then(|c| c.as_array()) {
+            assert!(!cases.is_empty());
+            for case in cases {
+                let h = StreamHeader {
+                    flags: StreamFlags::from_bits(case["flags"].as_u64().unwrap() as u8)
+                        .unwrap(),
+                    frame_id: case["frame_id"].as_u64().unwrap() as u32,
+                };
+                let mut buf = [0u8; STREAM_HEADER_LEN];
+                h.write(&mut buf).unwrap();
+                assert_eq!(to_hex(&buf), case["packed_hex"].as_str().unwrap());
+            }
+        }
+
+        if let Some(cases) = v.get("dmabuf").and_then(|c| c.as_array()) {
+            assert!(!cases.is_empty());
+            for case in cases {
+                let planes: Vec<DmabufPlane> = case["planes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| DmabufPlane {
+                        offset: p["offset"].as_u64().unwrap() as u32,
+                        stride: p["stride"].as_u64().unwrap() as u32,
+                        fd_index: p["fd_index"].as_u64().unwrap() as u8,
+                    })
+                    .collect();
+                let desc = DmabufDescriptor {
+                    width: case["width"].as_u64().unwrap() as u32,
+                    height: case["height"].as_u64().unwrap() as u32,
+                    fourcc: u32::from_le_bytes(
+                        case["fourcc"].as_str().unwrap().as_bytes().try_into().unwrap(),
+                    ),
+                    modifier: u64::from_str_radix(case["modifier"].as_str().unwrap(), 16)
+                        .unwrap(),
+                    fd_count: case["fd_count"].as_u64().unwrap() as u8,
+                    planes,
+                };
+                let mut buf = vec![0u8; DmabufDescriptor::encoded_len(desc.planes.len())];
+                desc.write(&mut buf).unwrap();
+                assert_eq!(to_hex(&buf), case["packed_hex"].as_str().unwrap(), "{case}");
+                assert_eq!(DmabufDescriptor::parse(&buf).unwrap(), desc);
+            }
+        }
+    }
+
     #[test]
     fn rejects_truncated_plane_table() {
         let desc = DmabufDescriptor {
