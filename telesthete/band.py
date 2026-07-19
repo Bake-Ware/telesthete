@@ -29,6 +29,11 @@ class Band:
     This is the main entry point for the Telesthete API.
     """
 
+    # Hard cap on the peer registry (defense against spoofed-HELLO-replay
+    # growth; keepalive eviction handles the steady state). Displaces the
+    # least-recently-seen peer when full.
+    MAX_PEERS = 4096
+
     def __init__(
         self,
         psk: str,
@@ -201,6 +206,15 @@ class Band:
     def _ensure_peer(self, peer_addr: tuple, hostname: str) -> Peer:
         peer = self.peers.get(peer_addr)
         if peer is None:
+            # Bound the registry: a replayed HELLO spoofed from many source
+            # addresses could otherwise grow it without limit before keepalive
+            # eviction catches up. Past the cap, evict the least-recently-seen
+            # peer so a genuine newcomer can still displace a stale phantom.
+            if len(self.peers) >= self.MAX_PEERS:
+                stale = min(self.peers.values(), key=lambda p: p.last_seen)
+                logger.warning(f"Peer registry full ({self.MAX_PEERS}); "
+                               f"evicting least-recently-seen {stale.address}")
+                self._remove_peer(stale.address)
             logger.info(f"Peer joined: {hostname} at {peer_addr}")
             peer = Peer(peer_addr, hostname)
             self.peers[peer_addr] = peer

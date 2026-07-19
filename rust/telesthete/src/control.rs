@@ -349,6 +349,21 @@ impl ControlChannel {
                                 suite,
                             )
                             .await;
+                        {
+                            // Bound the registry against spoofed-HELLO-replay
+                            // growth: past the cap, evict the lowest-epoch entry
+                            // (a stale phantom) so a genuine newcomer still fits.
+                            let mut p = peers.lock().await;
+                            if !p.contains_key(&pkt.from) && p.len() >= PEER_MAP_SOFT_CAP {
+                                if let Some(victim) = p
+                                    .iter()
+                                    .min_by_key(|(_, s)| s.session_epoch)
+                                    .map(|(a, _)| *a)
+                                {
+                                    p.remove(&victim);
+                                }
+                            }
+                        }
                         peers.lock().await.insert(
                             pkt.from,
                             PeerState {

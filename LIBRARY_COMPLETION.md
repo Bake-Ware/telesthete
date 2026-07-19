@@ -97,4 +97,34 @@ Re-scoped, with rationale recorded in SPEC/commits:
 9. **Interop + review** — live Python↔Rust socket harness; regenerate all vectors;
    adversarial review (independent reviewers, like the hub); PR.
 
+## Phase 9 — adversarial review outcome
+
+Ran a 6-lens multi-agent review (crypto/replay, Channel state machines,
+Board/Drop, cross-language wire, Rust concurrency, Python robustness),
+each finding attacked by two refute-by-default skeptics. Every confirmed
+high/medium defect is fixed on this branch (two commits, `review-fix
+(Python)` and `review-fix (Rust)`):
+
+- **Channel §6:** RST/teardown stopped retransmitting forever + leaking
+  the task (both); MAX_RETRIES cap for a vanished peer; reorder buffer
+  and ack_num bounded; Rust gained the §3.3 outer-sequence replay
+  watermark it lacked; Channel is now reliable-only and always
+  §6.6-enveloped (removed Rust's forgeable headerless `ChannelSender`
+  and Python's raw non-enveloped path — they broke Python↔Rust interop
+  and let user bytes forge ACK/window).
+- **Task/socket leak (Rust):** every hub + ControlChannel now aborts its
+  task on drop, so a dropped Band actually releases the UDP socket.
+- **Control/HELLO:** stale-epoch HELLO can no longer ratchet the control
+  watermark and wedge the plane (Python); unknown committed cipher →
+  baseline; absent session → 0 not -1.
+- **Drop §8:** OFFER validated; resumed chunks pruned to in-range/correct
+  length (no `_finish` crash). **Board §7:** out-of-range Lamport rejected
+  (digest DoS). **Reassembler:** evicts oldest, never the in-flight msg.
+- **Bounded growth:** discovery seen-set, control replay maps, and the
+  peer registry are all capped (spoofed-source-HELLO defense).
+
+Full return-routability for the spoofed-source peer-creation vector is a
+protocol change (challenge in the handshake) left for a future revision;
+the caps bound worst-case memory in the meantime.
+
 Not merged until the owner approves. The hub PR (#7) is already merged on `main`.
