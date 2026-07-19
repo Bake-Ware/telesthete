@@ -9,11 +9,40 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::mpsc;
-use tracing::debug;
+use tokio::sync::{mpsc, Mutex};
+use tracing::{debug, warn};
 
+use crate::crypto::{select_cipher, Suite};
 use crate::framing::ChannelType;
 use crate::transport::{Outbound, Transport, TransportError};
+
+/// Live state for one known peer, maintained by the control task (§4.3/§3.5).
+#[derive(Debug, Clone)]
+pub struct PeerState {
+    pub hostname: String,
+    pub capabilities: Vec<String>,
+    /// Negotiated AEAD suite id committed for this peer (§3.5).
+    pub cipher: String,
+    /// The peer's session epoch from its latest HELLO/HELLO_ACK (§4.3).
+    pub session_epoch: u64,
+}
+
+/// Shared peer registry: written by the control task, read by the Band's
+/// keepalive/dead-peer loop and the application.
+pub type Peers = Arc<Mutex<HashMap<SocketAddr, PeerState>>>;
+
+/// Identity + negotiation preferences this endpoint advertises (§3.5/§12.5).
+#[derive(Debug, Clone)]
+pub struct ControlConfig {
+    pub psk: Vec<u8>,
+    /// Our session epoch (§4.3), advertised in HELLO/HELLO_ACK.
+    pub session: u64,
+    pub hostname: String,
+    pub capabilities: Vec<String>,
+    /// Ordered AEAD preference list; the mandatory baseline is appended if
+    /// missing (§12.5).
+    pub ciphers: Vec<String>,
+}
 
 pub const TYPE_HELLO: u8 = 0x01;
 pub const TYPE_HELLO_ACK: u8 = 0x02;
@@ -157,13 +186,18 @@ pub struct ControlChannel {
 impl ControlChannel {
     pub async fn new(
         transport: Arc<Transport>,
-        psk: Vec<u8>,
-        session: u64,
+        config: ControlConfig,
+        peers: Peers,
         rebase_tx: tokio::sync::broadcast::Sender<SocketAddr>,
     ) -> Self {
         let mut raw = transport.route(ChannelType::Control).await;
         let (tx, rx) = mpsc::unbounded_channel();
         let task_transport = Arc::clone(&transport);
+        let session = config.session;
+        let mut cfg = config;
+        if !cfg.ciphers.iter().any(|c| c == crate::crypto::BASELINE_CIPHER) {
+            cfg.ciphers.push(crate::crypto::BASELINE_CIPHER.to_string());
+        }
         tokio::spawn(async move {
             // Replay protection (SPEC §3.3): highest accepted sequence per peer;
             // `sessions` tracks each peer's epoch for restart rebase. Transport
@@ -182,18 +216,32 @@ impl ControlChannel {
                 match env.type_ {
                     TYPE_HELLO | TYPE_HELLO_ACK => {
                         // Parse the typed body FIRST so a bad-body packet never
-                        // mutates replay/session state.
-                        let (event, ep) = if env.type_ == TYPE_HELLO {
+                        // mutates replay/session state. `committed` is the
+                        // negotiated suite: chosen by us for a HELLO (we are
+                        // the responder), dictated by the responder for an ACK.
+                        let is_hello = env.type_ == TYPE_HELLO;
+                        let (event, ep, hostname, caps, committed) = if is_hello {
                             match serde_json::from_value::<Hello>(env.payload) {
-                                Ok(h) => (
-                                    ControlEvent::Hello {
-                                        from: pkt.from,
-                                        hostname: h.hostname,
-                                        capabilities: h.capabilities,
-                                        ciphers: h.ciphers,
-                                    },
-                                    h.session,
-                                ),
+                                Ok(h) => {
+                                    let init = if h.ciphers.is_empty() {
+                                        vec![crate::crypto::BASELINE_CIPHER.to_string()]
+                                    } else {
+                                        h.ciphers.clone()
+                                    };
+                                    let selected = select_cipher(&init, &cfg.ciphers);
+                                    (
+                                        ControlEvent::Hello {
+                                            from: pkt.from,
+                                            hostname: h.hostname.clone(),
+                                            capabilities: h.capabilities.clone(),
+                                            ciphers: h.ciphers,
+                                        },
+                                        h.session,
+                                        h.hostname,
+                                        h.capabilities,
+                                        selected,
+                                    )
+                                }
                                 Err(e) => {
                                     debug!("bad HELLO: {e}");
                                     continue;
@@ -201,36 +249,54 @@ impl ControlChannel {
                             }
                         } else {
                             match serde_json::from_value::<HelloAck>(env.payload) {
-                                Ok(h) => (
-                                    ControlEvent::HelloAck {
-                                        from: pkt.from,
-                                        hostname: h.hostname,
-                                        capabilities: h.capabilities,
-                                        ciphers: h.ciphers,
-                                        cipher: h.cipher,
-                                    },
-                                    h.session,
-                                ),
+                                Ok(h) => {
+                                    let committed = if Suite::from_id(&h.cipher).is_some() {
+                                        h.cipher.clone()
+                                    } else {
+                                        if !h.cipher.is_empty() {
+                                            warn!(
+                                                "peer {} committed unknown cipher {:?}; \
+                                                 falling back to baseline",
+                                                pkt.from, h.cipher
+                                            );
+                                        }
+                                        crate::crypto::BASELINE_CIPHER.to_string()
+                                    };
+                                    (
+                                        ControlEvent::HelloAck {
+                                            from: pkt.from,
+                                            hostname: h.hostname.clone(),
+                                            capabilities: h.capabilities.clone(),
+                                            ciphers: h.ciphers,
+                                            cipher: h.cipher,
+                                        },
+                                        h.session,
+                                        h.hostname,
+                                        h.capabilities,
+                                        committed,
+                                    )
+                                }
                                 Err(e) => {
                                     debug!("bad HELLO_ACK: {e}");
                                     continue;
                                 }
                             }
                         };
+                        // Epoch monotonicity (§4.3): an OLDER-epoch HELLO is a
+                        // replay from before a restart — acting on it would
+                        // downgrade the peer's keys and wedge its live session.
+                        // Drop it entirely (no event, no ACK, no key change).
+                        if matches!(sessions.get(&pkt.from), Some(&prev) if ep < prev) {
+                            debug!("drop stale-epoch control from {} (epoch {ep})", pkt.from);
+                            continue;
+                        }
                         // Session (re)start (SPEC §3.3/§4.3): a strictly-newer
-                        // epoch re-keys the peer (new data key via
-                        // register_peer_key), clears its control watermark, and
-                        // signals the StreamHub to clear its stream watermarks —
-                        // so a restarted peer is accepted and its old-session
-                        // packets fail authentication under the new key.
+                        // epoch re-keys the peer, clears its control watermark,
+                        // and signals the StreamHub to clear its stream
+                        // watermarks — so a restarted peer is accepted and its
+                        // old-session packets fail authentication.
                         if sessions.get(&pkt.from).map_or(true, |&prev| ep > prev) {
                             sessions.insert(pkt.from, ep);
-                            let peer_key = crate::crypto::derive_session_key(
-                                &psk,
-                                crate::crypto::BASELINE_CIPHER,
-                                ep,
-                            );
-                            task_transport.register_peer_key(pkt.from, peer_key).await;
                             watermark.remove(&pkt.from);
                             let _ = rebase_tx.send(pkt.from);
                         }
@@ -239,6 +305,62 @@ impl ControlChannel {
                             continue;
                         }
                         watermark.insert(pkt.from, seq);
+
+                        // Negotiated data keys (§3.1/§3.5): decrypt the peer's
+                        // data under ITS epoch, send ours under OUR epoch, both
+                        // bound to the committed suite. Idempotent on repeats.
+                        let suite = Suite::from_id(&committed)
+                            .unwrap_or(Suite::ChaCha20Poly1305);
+                        task_transport
+                            .register_peer_key(
+                                pkt.from,
+                                crate::crypto::derive_session_key(&cfg.psk, &committed, ep),
+                                suite,
+                            )
+                            .await;
+                        task_transport
+                            .register_send_key(
+                                pkt.from,
+                                crate::crypto::derive_session_key(
+                                    &cfg.psk, &committed, session,
+                                ),
+                                suite,
+                            )
+                            .await;
+                        peers.lock().await.insert(
+                            pkt.from,
+                            PeerState {
+                                hostname,
+                                capabilities: caps,
+                                cipher: committed.clone(),
+                                session_epoch: ep,
+                            },
+                        );
+
+                        // Auto-answer a HELLO with our HELLO_ACK committing the
+                        // selected suite (§3.5) — the Band drives the handshake
+                        // itself, like the Python reference.
+                        if is_hello {
+                            let ack = HelloAck {
+                                hostname: cfg.hostname.clone(),
+                                capabilities: cfg.capabilities.clone(),
+                                ciphers: cfg.ciphers.clone(),
+                                cipher: committed,
+                                session,
+                            };
+                            if let Err(e) = send_control_json(
+                                &task_transport,
+                                pkt.from,
+                                TYPE_HELLO_ACK,
+                                serde_json::to_value(&ack).unwrap_or_default(),
+                                true,
+                            )
+                            .await
+                            {
+                                debug!("auto HELLO_ACK to {} failed: {e}", pkt.from);
+                            }
+                        }
+
                         if tx.send(event).is_err() {
                             return;
                         }
@@ -251,7 +373,15 @@ impl ControlChannel {
                         watermark.insert(pkt.from, seq);
                         let event = match env.type_ {
                             TYPE_KEEPALIVE => ControlEvent::Keepalive { from: pkt.from },
-                            TYPE_GOODBYE => ControlEvent::Goodbye { from: pkt.from },
+                            TYPE_GOODBYE => {
+                                // Peer is leaving: drop its registry entry and
+                                // key/liveness state (§4.8).
+                                peers.lock().await.remove(&pkt.from);
+                                sessions.remove(&pkt.from);
+                                watermark.remove(&pkt.from);
+                                task_transport.forget_peer(pkt.from).await;
+                                ControlEvent::Goodbye { from: pkt.from }
+                            }
                             TYPE_KEYFRAME_REQ => {
                                 match serde_json::from_value::<KeyframeReq>(env.payload) {
                                     Ok(k) => ControlEvent::KeyframeReq {
@@ -409,29 +539,45 @@ impl ControlChannel {
         type_: u8,
         payload: &T,
     ) -> Result<(), ControlError> {
-        let env = ControlEnvelope {
+        send_control_json(
+            &self.transport,
+            peer,
             type_,
-            payload: serde_json::to_value(payload)?,
-        };
-        let bytes = serde_json::to_vec(&env)?;
-        self.transport
-            .send(Outbound {
-                to: peer,
-                channel_type: ChannelType::Control,
-                channel_id: 0,
-                plaintext: bytes,
-                priority: 0,
-                // HELLO/HELLO_ACK use the base key so a receiver can bootstrap
-                // our epoch; other control messages use the session data key.
-                use_base_key: matches!(type_, TYPE_HELLO | TYPE_HELLO_ACK),
-            })
-            .await?;
-        Ok(())
+            serde_json::to_value(payload)?,
+            // HELLO/HELLO_ACK use the base key so a receiver can bootstrap
+            // our epoch; other control messages use the session data key.
+            matches!(type_, TYPE_HELLO | TYPE_HELLO_ACK),
+        )
+        .await
     }
 
     pub async fn recv(&mut self) -> Option<ControlEvent> {
         self.inbound.recv().await
     }
+}
+
+/// Encode + send one control envelope. Shared by [`ControlChannel`], the
+/// Band's keepalive loop, and `Band::connect_peer`.
+pub(crate) async fn send_control_json(
+    transport: &Transport,
+    peer: SocketAddr,
+    type_: u8,
+    payload: serde_json::Value,
+    use_base_key: bool,
+) -> Result<(), ControlError> {
+    let env = ControlEnvelope { type_, payload };
+    let bytes = serde_json::to_vec(&env)?;
+    transport
+        .send(Outbound {
+            to: peer,
+            channel_type: ChannelType::Control,
+            channel_id: 0,
+            plaintext: bytes,
+            priority: 0,
+            use_base_key,
+        })
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]

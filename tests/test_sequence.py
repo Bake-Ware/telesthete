@@ -234,6 +234,36 @@ def test_unknown_control_type_is_ignored():
     assert fired == [], "unknown control type must not be dispatched"
 
 
+def test_stale_epoch_hello_cannot_downgrade_peer():
+    # §4.3 monotonicity at the Band layer: a replayed pre-restart HELLO (older
+    # epoch) must not roll back peer.session_epoch/cipher — that would swap the
+    # peer's data key back to the dead session and wedge its live traffic.
+    from telesthete.band import Band
+    b = Band(psk="epoch-guard-psk", bind_port=0,
+             ciphers=["aes256-gcm", "chacha20-poly1305"])
+    acks = []
+    b.control.send_hello_ack = lambda *a, **kw: acks.append((a, kw))
+
+    b._on_hello(("p", 1), {"hostname": "peer", "session": 100,
+                           "ciphers": ["aes256-gcm", "chacha20-poly1305"]})
+    assert b.peers[("p", 1)].session_epoch == 100
+    assert b.peers[("p", 1)].cipher == "aes256-gcm"
+    assert len(acks) == 1
+
+    # Replayed old-epoch HELLO: ignored entirely (no state change, no ACK).
+    b._on_hello(("p", 1), {"hostname": "peer", "session": 50,
+                           "ciphers": ["chacha20-poly1305"]})
+    assert b.peers[("p", 1)].session_epoch == 100
+    assert b.peers[("p", 1)].cipher == "aes256-gcm"
+    assert len(acks) == 1, "stale-epoch HELLO must not be acked"
+
+    # Same for HELLO_ACK.
+    b._on_hello_ack(("p", 1), {"hostname": "peer", "session": 50,
+                               "cipher": "chacha20-poly1305"})
+    assert b.peers[("p", 1)].session_epoch == 100
+    assert b.peers[("p", 1)].cipher == "aes256-gcm"
+
+
 def test_channel_is_not_wired_into_band():
     # Regression guard (Phase 6 deferral): the reliable Channel still has an
     # unfixed per-object counter, so it MUST NOT be on the live path or it would

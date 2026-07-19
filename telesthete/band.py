@@ -204,9 +204,16 @@ class Band:
         selected = select_cipher(init_ciphers, self.ciphers)
 
         peer = self._ensure_peer(peer_addr, hostname)
+        epoch = int(payload.get("session", peer.session_epoch))
+        if epoch < peer.session_epoch:
+            # §4.3 monotonicity: an older-epoch HELLO is a replay from before a
+            # restart. Adopting it would downgrade the peer's session key and
+            # wedge its live session, so ignore it entirely (no ACK either).
+            logger.debug(f"Ignoring stale-epoch HELLO from {peer_addr} (epoch {epoch})")
+            return
         peer.capabilities = payload.get("capabilities", [])
         peer.cipher = selected
-        peer.session_epoch = int(payload.get("session", peer.session_epoch))
+        peer.session_epoch = epoch
         peer.update_last_seen()
 
         # Commit the negotiated suite back to the initiator, with our epoch.
@@ -219,9 +226,14 @@ class Band:
         """Handle HELLO_ACK: adopt the cipher the responder committed (§3.5)."""
         hostname = payload.get("hostname", str(peer_addr))
         peer = self._ensure_peer(peer_addr, hostname)
+        epoch = int(payload.get("session", peer.session_epoch))
+        if epoch < peer.session_epoch:
+            # §4.3 monotonicity — see _on_hello.
+            logger.debug(f"Ignoring stale-epoch HELLO_ACK from {peer_addr} (epoch {epoch})")
+            return
         peer.capabilities = payload.get("capabilities", [])
         peer.cipher = payload.get("cipher", BASELINE_CIPHER)
-        peer.session_epoch = int(payload.get("session", peer.session_epoch))
+        peer.session_epoch = epoch
         peer.update_last_seen()
 
     def _on_new_session(self, peer_addr: tuple):

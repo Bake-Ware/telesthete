@@ -10,7 +10,9 @@
 
 use thiserror::Error;
 
-use crate::crypto::{build_aad, decrypt, encrypt, BandId, CryptoError, Key, BAND_ID_LEN, TAG_LEN};
+use crate::crypto::{
+    build_aad, decrypt_suite, encrypt_suite, BandId, CryptoError, Key, Suite, BAND_ID_LEN, TAG_LEN,
+};
 
 pub const HEADER_LEN: usize = 27;
 pub const MIN_PACKET_LEN: usize = HEADER_LEN + TAG_LEN; // 43
@@ -92,7 +94,8 @@ impl Header {
     }
 }
 
-/// Encode plaintext payload into a full Telesthete packet (header || ciphertext).
+/// Encode plaintext payload into a full Telesthete packet (header || ciphertext)
+/// under the baseline suite.
 pub fn encode_packet(
     key: &Key,
     band_id: &BandId,
@@ -101,8 +104,31 @@ pub fn encode_packet(
     sequence: u64,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, FramingError> {
+    encode_packet_suite(
+        Suite::ChaCha20Poly1305,
+        key,
+        band_id,
+        channel_type,
+        channel_id,
+        sequence,
+        plaintext,
+    )
+}
+
+/// Encode under an explicit negotiated suite (§3.5). `key` MUST be derived
+/// with the matching `cipher_id`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_packet_suite(
+    suite: Suite,
+    key: &Key,
+    band_id: &BandId,
+    channel_type: ChannelType,
+    channel_id: u16,
+    sequence: u64,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, FramingError> {
     let aad = build_aad(channel_type as u8, channel_id);
-    let ct = encrypt(key, sequence, &aad, plaintext)?;
+    let ct = encrypt_suite(suite, key, sequence, &aad, plaintext)?;
     let mut out = Vec::with_capacity(HEADER_LEN + ct.len());
     out.resize(HEADER_LEN, 0);
     let header = Header {
@@ -116,15 +142,24 @@ pub fn encode_packet(
     Ok(out)
 }
 
-/// Decode + decrypt a Telesthete packet. Returns the parsed header and the
-/// recovered plaintext payload.
+/// Decode + decrypt a Telesthete packet under the baseline suite. Returns the
+/// parsed header and the recovered plaintext payload.
 pub fn decode_packet(key: &Key, packet: &[u8]) -> Result<(Header, Vec<u8>), FramingError> {
+    decode_packet_suite(Suite::ChaCha20Poly1305, key, packet)
+}
+
+/// Decode + decrypt under an explicit negotiated suite (§3.5).
+pub fn decode_packet_suite(
+    suite: Suite,
+    key: &Key,
+    packet: &[u8],
+) -> Result<(Header, Vec<u8>), FramingError> {
     if packet.len() < MIN_PACKET_LEN {
         return Err(FramingError::TooShort(packet.len()));
     }
     let header = Header::parse(packet)?;
     let aad = build_aad(header.channel_type as u8, header.channel_id);
-    let pt = decrypt(key, header.sequence, &aad, &packet[HEADER_LEN..])?;
+    let pt = decrypt_suite(suite, key, header.sequence, &aad, &packet[HEADER_LEN..])?;
     Ok((header, pt))
 }
 

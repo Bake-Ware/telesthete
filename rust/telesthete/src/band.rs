@@ -4,17 +4,57 @@
 //! Mirrors the Python reference's `Band` class shape (`band.stream(id)`,
 //! `band.connect_peer(addr)`, `band.start()`/`stop()`).
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use thiserror::Error;
 use tokio::task::JoinHandle;
+use tracing::debug;
 
 use crate::channel::{ChannelEndpoint, ChannelHub};
-use crate::control::{ControlChannel, ControlError};
+use crate::control::{
+    send_control_json, ControlChannel, ControlConfig, ControlError, PeerState, Peers,
+    TYPE_KEEPALIVE,
+};
 use crate::crypto::{derive_band_id, derive_key, BandId, Key};
 use crate::stream::{StreamEndpoint, StreamHub};
 use crate::transport::Transport;
+
+/// Tunables for one Band instance. `Default` matches SPEC §4.3/§4.5.
+#[derive(Debug, Clone)]
+pub struct BandOptions {
+    /// Session epoch (§4.3); `None` -> current time in ms since the Unix
+    /// epoch. Hosts with unreliable clocks MUST pass a persisted
+    /// `max(last_saved + 1, now_ms)`.
+    pub session: Option<u64>,
+    /// Ordered AEAD preference list (§3.5); baseline appended if missing.
+    pub ciphers: Vec<String>,
+    /// Capability strings advertised in HELLO/HELLO_ACK (§12.5).
+    pub capabilities: Vec<String>,
+    /// KEEPALIVE cadence (§4.5). SPEC default: 5 s.
+    pub keepalive_interval: Duration,
+    /// Idle time after which a peer is considered dead and evicted (§4.5).
+    /// SPEC default: 15 s (3 missed keepalives).
+    pub dead_after: Duration,
+    /// Drive keepalives + dead-peer eviction automatically. On by default;
+    /// tests that want manual control can disable it.
+    pub auto_keepalive: bool,
+}
+
+impl Default for BandOptions {
+    fn default() -> Self {
+        Self {
+            session: None,
+            ciphers: vec![crate::crypto::BASELINE_CIPHER.to_string()],
+            capabilities: Vec::new(),
+            keepalive_interval: Duration::from_secs(5),
+            dead_after: Duration::from_secs(15),
+            auto_keepalive: true,
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum BandError {
@@ -46,7 +86,24 @@ pub struct Band {
     /// advertised in HELLO so a peer rebases its replay watermark when we
     /// restart.
     session: u64,
-    _recv_loop: JoinHandle<()>,
+    /// Ordered cipher preferences + capabilities advertised in our HELLO.
+    ciphers: Vec<String>,
+    capabilities: Vec<String>,
+    /// Live peer registry, maintained by the control task (§3.5/§4.3).
+    peers: Peers,
+    recv_loop: JoinHandle<()>,
+    keepalive_loop: Option<JoinHandle<()>>,
+}
+
+impl Drop for Band {
+    /// Stop the background tasks so the socket is actually released — a
+    /// dropped Band must not keep receiving (or keepaliving) forever.
+    fn drop(&mut self) {
+        self.recv_loop.abort();
+        if let Some(ka) = &self.keepalive_loop {
+            ka.abort();
+        }
+    }
 }
 
 impl Band {
@@ -59,11 +116,7 @@ impl Band {
         bind_addr: SocketAddr,
         hostname: impl Into<String>,
     ) -> Result<Self, BandError> {
-        let session = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        Self::bind_with_session(psk, bind_addr, hostname, session).await
+        Self::bind_with_options(psk, bind_addr, hostname, BandOptions::default()).await
     }
 
     /// Bind with an explicit session epoch (§4.3), which MUST increase on every
@@ -76,8 +129,35 @@ impl Band {
         hostname: impl Into<String>,
         session: u64,
     ) -> Result<Self, BandError> {
+        let opts = BandOptions {
+            session: Some(session),
+            ..BandOptions::default()
+        };
+        Self::bind_with_options(psk, bind_addr, hostname, opts).await
+    }
+
+    /// Bind with full control over session epoch, cipher preferences,
+    /// capabilities, and keepalive timing.
+    pub async fn bind_with_options(
+        psk: &[u8],
+        bind_addr: SocketAddr,
+        hostname: impl Into<String>,
+        opts: BandOptions,
+    ) -> Result<Self, BandError> {
+        let session = opts.session.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        });
+        let hostname = hostname.into();
         let base_key = derive_key(psk);
         let band_id = derive_band_id(psk);
+
+        let mut ciphers = opts.ciphers;
+        if !ciphers.iter().any(|c| c == crate::crypto::BASELINE_CIPHER) {
+            ciphers.push(crate::crypto::BASELINE_CIPHER.to_string()); // §12.5 mandatory
+        }
 
         let mut transport = Transport::bind(bind_addr, base_key, band_id).await?;
         transport.set_session_key(crate::crypto::derive_session_key(
@@ -92,22 +172,101 @@ impl Band {
         // peer's stream watermarks so its fresh-session packets are accepted.
         let (rebase_tx, _rebase_rx) = tokio::sync::broadcast::channel::<SocketAddr>(64);
 
+        let peers: Peers = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let stream_hub = StreamHub::new(Arc::clone(&transport), rebase_tx.subscribe()).await;
         let channel_hub = ChannelHub::new(Arc::clone(&transport)).await;
-        let control =
-            ControlChannel::new(Arc::clone(&transport), psk.to_vec(), session, rebase_tx).await;
+        let control = ControlChannel::new(
+            Arc::clone(&transport),
+            ControlConfig {
+                psk: psk.to_vec(),
+                session,
+                hostname: hostname.clone(),
+                capabilities: opts.capabilities.clone(),
+                ciphers: ciphers.clone(),
+            },
+            Arc::clone(&peers),
+            rebase_tx,
+        )
+        .await;
+
+        let keepalive_loop = if opts.auto_keepalive {
+            Some(Self::spawn_keepalive(
+                Arc::clone(&transport),
+                Arc::clone(&peers),
+                opts.keepalive_interval,
+                opts.dead_after,
+            ))
+        } else {
+            None
+        };
 
         Ok(Self {
             transport,
             stream_hub,
             channel_hub,
             control: Some(control),
-            hostname: hostname.into(),
+            hostname,
             key: base_key,
             band_id,
             session,
-            _recv_loop: recv_loop,
+            ciphers,
+            capabilities: opts.capabilities,
+            peers,
+            recv_loop,
+            keepalive_loop,
         })
+    }
+
+    /// §4.5 driver: KEEPALIVE to every known peer each interval; evict peers
+    /// whose last authenticated packet is older than `dead_after`.
+    fn spawn_keepalive(
+        transport: Arc<Transport>,
+        peers: Peers,
+        interval: Duration,
+        dead_after: Duration,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let addrs: Vec<SocketAddr> = peers.lock().await.keys().copied().collect();
+                for addr in &addrs {
+                    if let Err(e) = send_control_json(
+                        &transport,
+                        *addr,
+                        TYPE_KEEPALIVE,
+                        serde_json::json!({}),
+                        false,
+                    )
+                    .await
+                    {
+                        debug!("keepalive to {addr} failed: {e}");
+                    }
+                }
+                let seen = transport.last_seen().await;
+                let now = std::time::Instant::now();
+                let mut dead = Vec::new();
+                peers.lock().await.retain(|addr, st| {
+                    let alive = seen
+                        .get(addr)
+                        .is_some_and(|t| now.duration_since(*t) < dead_after);
+                    if !alive {
+                        debug!("peer {} at {addr} timed out; evicting", st.hostname);
+                        dead.push(*addr);
+                    }
+                    alive
+                });
+                for addr in dead {
+                    transport.forget_peer(addr).await;
+                }
+            }
+        })
+    }
+
+    /// Snapshot of the live peer registry (§4.3/§3.5).
+    pub async fn peers(&self) -> HashMap<SocketAddr, PeerState> {
+        self.peers.lock().await.clone()
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -122,35 +281,27 @@ impl Band {
         &self.hostname
     }
 
-    /// Send a HELLO to a peer to introduce ourselves.
+    /// Send a HELLO to a peer to introduce ourselves, advertising our cipher
+    /// preferences and capabilities (§3.5/§12.5).
     pub async fn connect_peer(&self, peer: SocketAddr) -> Result<(), BandError> {
         // Built directly on `transport` rather than the (possibly already-taken)
         // ControlChannel — lets the cockpit `take_control` first then HELLO new
         // peers as they're discovered.
         use crate::control::{Hello, TYPE_HELLO};
-        use crate::framing::ChannelType;
-        use crate::transport::Outbound;
-        let env = serde_json::json!({
-            "type": TYPE_HELLO,
-            "payload": Hello {
-                hostname: self.hostname.clone(),
-                capabilities: Vec::new(),
-                ciphers: vec![crate::crypto::BASELINE_CIPHER.to_string()],
-                session: self.session,
-            }
-        });
-        let bytes = serde_json::to_vec(&env).map_err(crate::control::ControlError::from)?;
-        self.transport
-            .send(Outbound {
-                to: peer,
-                channel_type: ChannelType::Control,
-                channel_id: 0,
-                plaintext: bytes,
-                priority: 0,
-                use_base_key: true, // HELLO bootstraps under the base key
-            })
-            .await
-            .map_err(crate::control::ControlError::from)?;
+        let hello = Hello {
+            hostname: self.hostname.clone(),
+            capabilities: self.capabilities.clone(),
+            ciphers: self.ciphers.clone(),
+            session: self.session,
+        };
+        send_control_json(
+            &self.transport,
+            peer,
+            TYPE_HELLO,
+            serde_json::to_value(&hello).map_err(ControlError::from)?,
+            true, // HELLO bootstraps under the base key
+        )
+        .await?;
         Ok(())
     }
 
@@ -214,6 +365,109 @@ mod tests {
             }
             other => panic!("expected Hello, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn negotiates_aes_and_streams_under_it() {
+        // §3.5 end-to-end: both prefer AES-256-GCM; the responder auto-ACKs
+        // committing it, both sides re-key, and stream data flows under the
+        // negotiated (non-baseline) suite.
+        let opts = || BandOptions {
+            ciphers: vec!["aes256-gcm".into(), "chacha20-poly1305".into()],
+            ..BandOptions::default()
+        };
+        let mut alice = Band::bind_with_options(
+            b"aes-psk",
+            "127.0.0.1:0".parse().unwrap(),
+            "alice",
+            opts(),
+        )
+        .await
+        .unwrap();
+        let mut bob =
+            Band::bind_with_options(b"aes-psk", "127.0.0.1:0".parse().unwrap(), "bob", opts())
+                .await
+                .unwrap();
+
+        let bob_addr = bob.local_addr().unwrap();
+        let alice_addr = alice.local_addr().unwrap();
+        alice.connect_peer(bob_addr).await.unwrap();
+
+        // Bob sees the HELLO; alice receives bob's AUTOMATIC HELLO_ACK
+        // committing aes256-gcm — no manual ack driving.
+        let hello = tokio::time::timeout(std::time::Duration::from_secs(1), bob.control().recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(hello, crate::control::ControlEvent::Hello { .. }));
+        let ack = tokio::time::timeout(std::time::Duration::from_secs(1), alice.control().recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match ack {
+            crate::control::ControlEvent::HelloAck { cipher, hostname, .. } => {
+                assert_eq!(hostname, "bob");
+                assert_eq!(cipher, "aes256-gcm");
+            }
+            other => panic!("expected auto HELLO_ACK, got {other:?}"),
+        }
+
+        // Both registries agree on the committed suite.
+        assert_eq!(alice.peers().await[&bob_addr].cipher, "aes256-gcm");
+        assert_eq!(bob.peers().await[&alice_addr].cipher, "aes256-gcm");
+
+        // Data path actually uses it (alice -> bob and bob -> alice).
+        let mut bob_stream = bob.stream(alice_addr, 9).await;
+        let alice_stream = alice.stream(bob_addr, 9).await;
+        alice_stream.send(0, b"under-aes").await.unwrap();
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(1), bob_stream.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg.data, b"under-aes");
+    }
+
+    #[tokio::test]
+    async fn keepalives_sustain_then_dead_peer_evicted() {
+        // §4.5 with compressed timers: while both bands run, keepalives keep
+        // the peer alive well past dead_after; once bob is dropped, alice
+        // evicts him.
+        let opts = || BandOptions {
+            keepalive_interval: std::time::Duration::from_millis(50),
+            dead_after: std::time::Duration::from_millis(250),
+            ..BandOptions::default()
+        };
+        let mut alice = Band::bind_with_options(
+            b"ka-psk",
+            "127.0.0.1:0".parse().unwrap(),
+            "alice",
+            opts(),
+        )
+        .await
+        .unwrap();
+        let mut bob =
+            Band::bind_with_options(b"ka-psk", "127.0.0.1:0".parse().unwrap(), "bob", opts())
+                .await
+                .unwrap();
+
+        let bob_addr = bob.local_addr().unwrap();
+        alice.connect_peer(bob_addr).await.unwrap();
+        let _ = bob.control().recv().await.unwrap(); // HELLO
+        let _ = alice.control().recv().await.unwrap(); // auto HELLO_ACK
+
+        // Both sides know each other (bob learned alice from her HELLO).
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            alice.peers().await.contains_key(&bob_addr),
+            "live peer must survive several dead_after windows via keepalives"
+        );
+
+        drop(bob); // recv+keepalive loops abort -> bob goes silent
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(
+            !alice.peers().await.contains_key(&bob_addr),
+            "silent peer must be evicted after dead_after"
+        );
     }
 
     #[tokio::test]
