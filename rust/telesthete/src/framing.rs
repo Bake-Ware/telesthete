@@ -16,6 +16,8 @@ use crate::crypto::{
 
 pub const HEADER_LEN: usize = 27;
 pub const MIN_PACKET_LEN: usize = HEADER_LEN + TAG_LEN; // 43
+/// Single wire version (SPEC §12.4): 1.0→1, 1.1→2, 1.2→3.
+pub const PROTOCOL_VERSION: u8 = 3;
 
 /// Multiplexing selector. SPEC §2.
 #[repr(u8)]

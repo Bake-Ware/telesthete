@@ -15,6 +15,7 @@ pub mod band;
 pub mod channel;
 pub mod control;
 pub mod crypto;
+pub mod discovery;
 pub mod framing;
 pub mod stream;
 pub mod transport;
@@ -24,6 +25,7 @@ pub mod wire;
 pub use band::{Band, BandError};
 pub use channel::{ChannelEndpoint, ChannelError, ChannelHub, ChannelMessage, ChannelSender};
 pub use control::{capability, ControlChannel, ControlError, ControlEvent, LOCAL_PSK};
+pub use discovery::{pack_announce, parse_announce, DiscoveredPeer, Discovery, DISCOVERY_PORT};
 pub use crypto::{build_aad, derive_band_id, derive_key, BandId, CryptoError, Key, BAND_ID_LEN};
 pub use framing::{
     decode_packet, encode_packet, ChannelType, FramingError, Header, HEADER_LEN, MIN_PACKET_LEN,
