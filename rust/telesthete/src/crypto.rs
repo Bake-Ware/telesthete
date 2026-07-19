@@ -35,7 +35,7 @@ pub type Key = [u8; KEY_LEN];
 
 #[derive(Debug, Error)]
 pub enum CryptoError {
-    #[error("encrypt failed (XChaCha20-Poly1305)")]
+    #[error("AEAD encrypt failed")]
     Encrypt,
     #[error("decrypt failed (auth tag mismatch or ciphertext truncated)")]
     Decrypt,

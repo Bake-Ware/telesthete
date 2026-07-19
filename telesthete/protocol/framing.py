@@ -38,7 +38,9 @@ class Packet(NamedTuple):
 
 # Packet header format: band_id(16) + channel_type(1) + channel_id(2) + sequence(8)
 HEADER_FORMAT = "!16s B H Q"  # Big-endian: 16 bytes, uint8, uint16, uint64
-HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # Should be 27 bytes
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # 27 bytes (SPEC §12.4)
+AUTH_TAG_SIZE = 16                            # Poly1305 / GMAC tag (SPEC §12.4)
+MIN_PACKET_SIZE = HEADER_SIZE + AUTH_TAG_SIZE  # 43 (SPEC §1/§12.4)
 
 
 def pack_packet(
@@ -103,8 +105,11 @@ def unpack_packet(data: bytes) -> Packet:
     Raises:
         ValueError: If packet is malformed
     """
-    if len(data) < HEADER_SIZE:
-        raise ValueError(f"Packet too short: {len(data)} bytes, expected at least {HEADER_SIZE}")
+    # A legal frame is at least header + a 16-byte AEAD tag (SPEC §1/§12.4).
+    # A 27..42-byte packet has no room for a tag and is malformed.
+    if len(data) < MIN_PACKET_SIZE:
+        raise ValueError(
+            f"Packet too short: {len(data)} bytes, expected at least {MIN_PACKET_SIZE}")
 
     # Unpack header
     header = data[:HEADER_SIZE]

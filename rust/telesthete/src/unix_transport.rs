@@ -38,8 +38,9 @@ use tracing::{debug, warn};
 use crate::framing::{decode_packet, encode_packet, ChannelType, FramingError, Header};
 use crate::transport::SequenceCounter;
 
-/// v1.1 §12.4: 4 planes + 1 fence fd per Stream packet.
-pub const MAX_FDS_PER_PACKET: usize = 5;
+/// v1.1 §12.4: 4 planes + 1 fence fd per Stream packet. Single definition lives
+/// in `wire::dmabuf`; re-exported here so the two never drift.
+pub use crate::wire::dmabuf::MAX_FDS_PER_PACKET;
 
 /// XDG runtime dir env var (per the spec convention).
 pub const SOCKET_DIR_ENV: &str = "XDG_RUNTIME_DIR";

@@ -34,6 +34,17 @@ def test_keys():
         assert crypto.derive_encryption_key(v["psk"], cipher_id).hex() == key_hex, cipher_id
 
 
+def test_unpack_rejects_below_min_packet():
+    # SPEC §1/§12.4: a legal frame is >= 43 bytes (27 header + 16 tag).
+    import pytest
+    from telesthete.protocol import framing
+    assert framing.MIN_PACKET_SIZE == 43
+    with pytest.raises(ValueError):
+        framing.unpack_packet(b"\x00" * (framing.MIN_PACKET_SIZE - 1))
+    p = framing.unpack_packet(b"\x00" * framing.MIN_PACKET_SIZE)
+    assert len(p.ciphertext) == framing.AUTH_TAG_SIZE
+
+
 def test_session_keys():
     # Per-session data keys (SPEC §3.1/§3.3) must match the pinned vectors and
     # differ from the base key.

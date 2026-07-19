@@ -73,6 +73,12 @@ Big-endian: "!16s B H Q"
 | 0x03  | Board     | Replicated state / distributed log.      | Future |
 | 0x04  | Drop      | Chunked, resumable file distribution.    | Future |
 
+A receiver **MUST drop** a frame whose `channel_type` it does not handle (an
+undefined value, or a defined-but-unimplemented type such as Board/Drop). It MAY
+reject at parse time (never constructing a typed header) or at dispatch (no
+registered handler); both are conformant, since the outcome — the frame is
+discarded — is identical. This keeps `channel_type` forward-extensible.
+
 ---
 
 ## 3. Encryption

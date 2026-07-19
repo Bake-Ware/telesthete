@@ -33,6 +33,10 @@ except ImportError:
 
 
 BASELINE_CIPHER = "chacha20-poly1305"
+# Sentinel PSK for the local (AF_UNIX) trust profile: all local processes derive
+# the same band_id/key, so the socket-dir permissions are the real access
+# control, not the crypto (SPEC §3.4/§12.4). Matches the Rust `LOCAL_PSK`.
+LOCAL_PSK = "telesthete-local"
 NONCE_LEN = 12
 TAG_LEN = 16
 KEY_LEN = 32

@@ -5,7 +5,7 @@
 //!  16      1 B   channel_type (uint8)
 //!  17      2 B   channel_id   (uint16 BE)
 //!  19      8 B   sequence     (uint64 BE)
-//!  27    var     ciphertext   (XChaCha20-Poly1305 output)
+//!  27    var     ciphertext   (AEAD output: IETF ChaCha20-Poly1305 or AES-256-GCM)
 //! ```
 
 use thiserror::Error;
