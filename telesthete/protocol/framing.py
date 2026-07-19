@@ -41,6 +41,7 @@ HEADER_FORMAT = "!16s B H Q"  # Big-endian: 16 bytes, uint8, uint16, uint64
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # 27 bytes (SPEC §12.4)
 AUTH_TAG_SIZE = 16                            # Poly1305 / GMAC tag (SPEC §12.4)
 MIN_PACKET_SIZE = HEADER_SIZE + AUTH_TAG_SIZE  # 43 (SPEC §1/§12.4)
+PROTOCOL_VERSION = 3                          # single wire version (SPEC §12.4)
 
 
 def pack_packet(
