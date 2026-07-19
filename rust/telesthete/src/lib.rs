@@ -15,15 +15,19 @@ pub mod band;
 pub mod channel;
 pub mod control;
 pub mod crypto;
+pub mod discovery;
 pub mod framing;
 pub mod stream;
 pub mod transport;
 pub mod unix_transport;
 pub mod wire;
+pub mod board;
+pub mod drop_channel;
 
 pub use band::{Band, BandError};
-pub use channel::{ChannelEndpoint, ChannelError, ChannelHub, ChannelMessage, ChannelSender};
+pub use channel::{ChannelEndpoint, ChannelError, ChannelHub, ChannelMessage};
 pub use control::{capability, ControlChannel, ControlError, ControlEvent, LOCAL_PSK};
+pub use discovery::{pack_announce, parse_announce, DiscoveredPeer, Discovery, DISCOVERY_PORT};
 pub use crypto::{build_aad, derive_band_id, derive_key, BandId, CryptoError, Key, BAND_ID_LEN};
 pub use framing::{
     decode_packet, encode_packet, ChannelType, FramingError, Header, HEADER_LEN, MIN_PACKET_LEN,
@@ -31,10 +35,18 @@ pub use framing::{
 pub use stream::{StreamEndpoint, StreamError, StreamHub, StreamMessage};
 pub use transport::{Inbound, Outbound, Transport, TransportError};
 pub use unix_transport::{
-    UnixInbound, UnixOutbound, UnixTransport, UnixTransportError, MAX_FDS_PER_PACKET,
-    SOCKET_DIR_ENV, SOCKET_DIR_FALLBACK,
+    UnixInbound, UnixOutbound, UnixSeqClient, UnixTransport, UnixTransportError,
+    MAX_FDS_PER_PACKET, SOCKET_DIR_ENV, SOCKET_DIR_FALLBACK,
 };
 pub use wire::{
     DmabufDescriptor, DmabufError, DmabufPlane, StreamFlags, StreamHeader, StreamHeaderError,
     DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR, MAX_PLANES, STREAM_HEADER_LEN,
+};
+pub use board::{
+    BoardChange, BoardCore, BoardEndpoint, BoardEntry, BoardError, BoardHub, SetPayload,
+    DIGEST_INTERVAL,
+};
+pub use drop_channel::{
+    DropError, DropHub, DropReceiver, DropReceiverCore, DropSender, DropSenderCore, OfferPayload,
+    CHUNK_SIZE, MAX_RANGE_CHUNKS, REREQUEST_TIMEOUT,
 };

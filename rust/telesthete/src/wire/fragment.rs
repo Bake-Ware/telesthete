@@ -85,13 +85,24 @@ pub fn fragment(payload: &[u8], chunk_size: usize, fragment_id: &[u8; 16]) -> Ve
 struct Partial {
     total: u16,
     parts: HashMap<u16, Vec<u8>>,
+    /// Monotonic arrival order, so the memory cap evicts the OLDEST buffer
+    /// rather than an arbitrary (possibly currently-assembling) one.
+    order: u64,
 }
 
 /// Collects fragments and emits full payloads. Single-task; not thread-safe.
-#[derive(Default)]
 pub struct Reassembler {
     buffers: HashMap<[u8; 16], Partial>,
     limit: usize,
+    next_order: u64,
+}
+
+impl Default for Reassembler {
+    /// Same as [`Reassembler::new`]. (A derived `Default` would zero `limit`,
+    /// making the memory cap evict every in-progress buffer.)
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Reassembler {
@@ -99,6 +110,7 @@ impl Reassembler {
         Self {
             buffers: HashMap::new(),
             limit: 256,
+            next_order: 0,
         }
     }
 
@@ -107,15 +119,21 @@ impl Reassembler {
     pub fn feed(&mut self, chunk: &[u8]) -> Option<Vec<u8>> {
         let c = parse_chunk(chunk)?;
 
+        let order = self.next_order;
         let entry = self.buffers.entry(c.fragment_id).or_insert_with(|| Partial {
             total: c.total,
             parts: HashMap::new(),
+            order,
         });
+        if entry.parts.is_empty() {
+            self.next_order += 1; // a fresh buffer consumed this order tick
+        }
         if entry.total != c.total {
             // Corrupt sender changed total mid-message; reset this buffer.
             *entry = Partial {
                 total: c.total,
                 parts: HashMap::new(),
+                order: entry.order,
             };
         }
         if entry.parts.contains_key(&c.seq) {
@@ -124,10 +142,16 @@ impl Reassembler {
         entry.parts.insert(c.seq, c.data);
 
         if entry.parts.len() as u16 != c.total {
-            // Bound memory: if we somehow exceed the cap with no completions,
-            // drop the oldest-by-arbitrary buffer (caps unbounded growth).
+            // Bound memory: past the cap, evict the OLDEST buffer — but never the
+            // one we just fed (which would drop the message a chunk just advanced).
             if self.buffers.len() > self.limit {
-                if let Some(k) = self.buffers.keys().next().copied() {
+                let victim = self
+                    .buffers
+                    .iter()
+                    .filter(|(k, _)| **k != c.fragment_id)
+                    .min_by_key(|(_, p)| p.order)
+                    .map(|(k, _)| *k);
+                if let Some(k) = victim {
                     self.buffers.remove(&k);
                 }
             }

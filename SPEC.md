@@ -70,8 +70,14 @@ Big-endian: "!16s B H Q"
 | 0x00  | Control   | Band management, signaling. Always reliable. | 1   |
 | 0x01  | Stream    | Real-time, lossy, prioritized datagrams. | 1     |
 | 0x02  | Channel   | Reliable, ordered byte streams (TCP-over-UDP). | 1  |
-| 0x03  | Board     | Replicated state / distributed log.      | Future |
-| 0x04  | Drop      | Chunked, resumable file distribution.    | Future |
+| 0x03  | Board     | Replicated LWW key-value state (§7).     | v1.2  |
+| 0x04  | Drop      | Chunked, resumable file distribution (§8). | v1.2 |
+
+A receiver **MUST drop** a frame whose `channel_type` it does not handle (an
+undefined value, or a defined-but-unimplemented type such as Board/Drop). It MAY
+reject at parse time (never constructing a typed header) or at dispatch (no
+registered handler); both are conformant, since the outcome — the frame is
+discarded — is identical. This keeps `channel_type` forward-extensible.
 
 ---
 
@@ -82,10 +88,13 @@ Big-endian: "!16s B H Q"
 All derived from a single Pre-Shared Key (PSK) string.
 
 ```
-band_id = SHA256(PSK)[:16]                          # 16 bytes, cleartext routing
-key     = HKDF-SHA256(salt="telesthete-v1",          # 32 bytes, per-cipher key
-                       ikm=PSK,
-                       info="encryption-" + cipher_id)
+band_id  = SHA256(PSK)[:16]                          # 16 bytes, cleartext routing
+base_key = HKDF-SHA256(salt="telesthete-v1",          # 32 bytes, per-cipher key
+                        ikm=PSK,
+                        info="encryption-" + cipher_id)
+data_key = HKDF-SHA256(salt="telesthete-v1",          # 32 bytes, per-session data key
+                        ikm=PSK,
+                        info="encryption-" + cipher_id + "-session-" + epoch_be8)
 ```
 
 `cipher_id` is the negotiated AEAD suite name (§3.2, e.g.
@@ -94,6 +103,17 @@ cipher means the ChaCha key and the AES key are distinct 32-byte values,
 so a packet under one suite can never be confused with another on the
 same band. `band_id` does **not** depend on the cipher — it is constant
 per PSK, so the hub routes regardless of which suite a pair negotiates.
+
+**Session-bound data key (v1.2).** Because the key is band-wide (every member
+derives the same value from the PSK), a HELLO/HELLO_ACK is encrypted under the
+`base_key`, but **every other packet is encrypted under a `data_key` that mixes
+in the sender's session epoch (§4.3)** as a fixed 8-byte big-endian suffix
+(`epoch_be8`). This closes the cross-session replay window: after a sender
+restarts to a new epoch, packets captured from its previous session decrypt
+under neither the new `data_key` nor the `base_key`, so a receiver — which
+learns the sender's epoch from its HELLO and derives that sender's `data_key`
+accordingly — rejects them. A data packet that arrives before the sender's
+HELLO (epoch unknown) is dropped.
 
 Both peers with the same PSK and the same negotiated cipher derive
 identical `key`. The relay (Telesthetium) sees `band_id` for routing but
@@ -143,14 +163,35 @@ AAD = [channel_type (1B)] [channel_id high byte] [channel_id low byte]
 
 ### 3.3 Security Notes
 
-- Sequence numbers MUST be monotonically increasing per sender per Band.
-  Reuse of a sequence number with the same key is catastrophic for any
-  AEAD (both ChaCha20-Poly1305 and AES-256-GCM).
-- The 64-bit sequence space (2^64 packets) is effectively inexhaustible.
-- Receivers **MUST** reject packets whose sequence number is at or below
-  the per-(peer, channel_type, channel_id) high-water mark, and advance
-  the mark on each accepted packet. This is replay protection; it is the
-  same freshness mechanism Streams use (§5.2). *(SHOULD → MUST in v1.2.)*
+- **One sequence source per sender, shared across all channels/streams.** The
+  nonce is derived from the sequence alone (§3.2) and the key is band-wide
+  (§3.1, PSK-only — no per-sender component), so reuse of a sequence number
+  under one key is catastrophic for any AEAD (keystream recovery + tag
+  forgery). A sender therefore MUST draw every packet's sequence — Control,
+  Stream, and Channel alike — from a **single** monotonic counter, never a
+  per-channel one. (A per-channel counter starting at 0 would make Control
+  seq 0 and the first Stream frame collide immediately.)
+- **Counters MUST be CSPRNG-initialized (v1.2).** Because the key is shared by
+  every band member, two senders that both started at 0 (or 1) would reuse
+  `(key, nonce)` on their first packets. Each sender MUST seed its counter from
+  a cryptographically secure RNG (a 63-bit start is RECOMMENDED, leaving ~2^63
+  of headroom before wrap). This makes a cross-sender or cross-restart
+  collision birthday-bounded and negligible rather than guaranteed. Sequences
+  remain monotonically increasing per sender from that random start.
+- The 64-bit sequence space is effectively inexhaustible; a sender MUST NOT let
+  its counter wrap (re-key / re-handshake first).
+- Receivers **MUST** reject packets whose sequence is at or below the
+  per-(peer, channel_type, channel_id) high-water mark, and advance the mark on
+  each accepted packet (replay protection; same freshness mechanism as §5.2).
+  Because senders start at a random value, a receiver **MUST accept the first
+  packet it sees from a peer at whatever sequence it carries** (establishing the
+  mark), then require strictly increasing sequences. *(SHOULD → MUST in v1.2.)*
+- **Restart handling.** A restarted sender picks a new random start that may
+  fall below a receiver's existing high-water mark. To avoid a permanent
+  lockout, HELLO/HELLO_ACK carry a monotonic `session` epoch (§4.3); a receiver
+  that sees a **newer** epoch from a peer MUST rebase (clear) that peer's
+  high-water marks, accepting the fresh session. An older/equal epoch does not
+  rebase, so a replayed HELLO cannot roll the mark backward.
 - Cipher negotiation (§3.5) is downgrade-resistant: HELLO/HELLO_ACK are
   encrypted under the mandatory baseline key, which an attacker without
   the PSK cannot forge or tamper. Telesthete has no anonymous key
@@ -243,7 +284,8 @@ older peer silently drops them rather than erroring.
 ```json
 {"type": 1, "payload": {"hostname": "machine-name",
                          "capabilities": ["af-unix", "webtransport"],
-                         "ciphers": ["aes256-gcm", "chacha20-poly1305"]}}
+                         "ciphers": ["aes256-gcm", "chacha20-poly1305"],
+                         "session": 1737158400123}}
 ```
 
 `capabilities` and `ciphers` are **mandatory** as of v1.2 — capability
@@ -252,13 +294,29 @@ and MUST contain the baseline `chacha20-poly1305` (§3.5). HELLO itself is
 always encrypted with the baseline suite. A peer that omits these fields
 is non-conformant.
 
+`session` is a monotonic per-sender epoch (v1.2) that **MUST strictly increase
+on every restart**. It keys the sender's `data_key` (§3.1) and lets a receiver
+rebase replay high-water marks after that peer restarts (§3.3): a HELLO or
+HELLO_ACK bearing a **newer** epoch than last seen from the peer re-derives its
+`data_key` and rebases its marks (accepting the peer's fresh CSPRNG-seeded
+sequence), while an older or equal epoch does not — so a replayed HELLO cannot
+roll a mark backward or re-key to a stale session. A peer that omits `session`
+is treated as epoch 0.
+
+Milliseconds since the Unix epoch satisfy the requirement on a roughly-synced
+clock. A host whose clock may step backward or start unset (embedded / no-RTC
+devices) MUST persist a monotonic value across restarts, e.g.
+`max(last_saved + 1, now_ms)`; otherwise a peer that saw a higher epoch will
+refuse to rebase and lock the restarted sender out until its session ages off.
+
 ### 4.4 HELLO_ACK (0x02)
 
 ```json
 {"type": 2, "payload": {"hostname": "responder-name",
                          "capabilities": ["..."],
                          "ciphers": ["..."],
-                         "cipher": "aes256-gcm"}}
+                         "cipher": "aes256-gcm",
+                         "session": 1737158400456}}
 ```
 
 `capabilities` and `ciphers` semantics match §4.3 (mandatory). The
@@ -507,10 +565,25 @@ implemented in userspace over UDP.
 ```
 Offset  Size  Field
 0       1 B   flags             bitfield (see below)
-1       8 B   ack_num           uint64 BE, highest in-order seq received
+1       8 B   ack_num           uint64 BE, next channel seq expected (cumulative ACK)
 9       2 B   window            uint16 BE, receiver's available window (packets)
-11      var   data              application payload (may be empty for pure ACKs)
+11      8 B   seq               uint64 BE, channel sequence of this frame (v1.2)
+19      var   data              application payload (may be empty for pure ACKs)
 ```
+
+**Why an inner `seq` (v1.2).** The outer packet sequence (§1) is the AEAD
+nonce and MUST be drawn from the sender's one shared per-session
+`SequenceSource` (§3.3) — shared across every channel and stream — so it
+is strictly increasing but NOT contiguous per channel, and it can never
+be reused. Reliability therefore tracks this inner `seq` instead:
+0-based, contiguous per (channel, direction). SYN, FIN, and data frames
+consume one `seq` each; pure ACKs carry the next unconsumed value
+without consuming it. `ack_num` cumulatively acknowledges every frame
+with `seq < ack_num` (the §6.3 diagram's seq/ack numbers refer to these
+inner values). A retransmission re-encrypts the same (flags, seq, data)
+under a **fresh** outer sequence — retransmitting under the original
+outer sequence with an updated `ack_num`/`window` would be nonce reuse.
+Receivers de-duplicate by inner `seq`.
 
 ### 6.2 Flags
 
@@ -547,9 +620,10 @@ Initiator                           Responder
 ### 6.4 Reliability
 
 - Sliding window flow control (default window: 32 packets).
-- Out-of-order packets buffered and reordered.
-- Unacknowledged packets retransmitted after RTO (default: 500ms).
-- Maximum packet payload: 1024 bytes (fragments larger sends).
+- Out-of-order frames buffered and reordered by inner `seq` (§6.1).
+- Unacknowledged frames retransmitted after RTO (default: 500ms), each
+  retransmission re-encrypted under a fresh outer sequence (§6.1).
+- Maximum frame data: 1024 bytes (larger messages use §6.6).
 
 ### 6.5 States
 
@@ -595,17 +669,98 @@ messages only.
 
 ---
 
-## 7. Board (type 0x03) — Future
+## 7. Board (type 0x03) — v1.2
 
-Replicated state across all peers in a Band. Append-only distributed log.
-Design space reserved. Not yet implemented.
+Replicated key-value state across all peers in a Band: a last-writer-wins
+map that converges without coordination. Board frames are fire-and-forget
+datagrams like Streams; idempotent merges plus periodic anti-entropy make
+per-packet reliability unnecessary.
+
+**channel_id:** board identifier (0-65535); one replicated map per board.
+
+### 7.1 Plaintext Payload (inside ciphertext)
+
+JSON envelope, like Control (§4.1): `{"type": <u8>, "payload": {...}}`.
+
+### 7.2 Message Types
+
+```
+0x01 SET       {"key": str, "value": <json>, "ts": [lamport, actor],
+                "deleted": bool}
+0x02 DIGEST    {"count": int, "hash": hex}     # anti-entropy probe
+0x03 SYNC_REQ  {}                              # digest mismatch -> full sync
+0x04 SNAPSHOT  {"entries": [SET-payload, ...]}
+```
+
+### 7.3 Merge Rule (LWW)
+
+Each entry carries a timestamp `[lamport, actor]` — a Lamport clock plus
+the writer's hostname as a total-order tiebreak. An incoming entry
+replaces the local one iff its `(lamport, actor)` is strictly greater
+(tuple comparison). Local writes bump the board's Lamport clock; every
+merge advances it to `max(local, incoming)`. Deletes are tombstones
+(`deleted: true`, value null) so they propagate; tombstone GC is out of
+scope for v1.2.
+
+### 7.4 Anti-entropy
+
+Every DIGEST interval (reference: 10 s) a peer broadcasts DIGEST with the
+entry count and a hash: SHA-256 over the sorted-by-key concatenation of
+`key || lamport_be8 || actor || deleted_byte` for every entry, hex-encoded.
+A receiver whose own digest differs replies SYNC_REQ; the prober answers
+with SNAPSHOT (fragmented with the §6.6 envelope when it exceeds one
+packet's budget — Board SNAPSHOT is the only Board message that uses the
+envelope, flagged by making every SNAPSHOT ride it, even single-chunk).
+Value bytes are deliberately excluded from the digest: `(lamport, actor)`
+uniquely versions an entry, so equal timestamps imply equal values.
 
 ---
 
-## 8. Drop (type 0x04) — Future
+## 8. Drop (type 0x04) — v1.2
 
-Chunked, resumable file distribution. Design space reserved.
-Not yet implemented. MVP uses Channels for file transfer.
+Chunked, resumable file distribution. Receiver-driven: the receiver asks
+for exactly the chunk ranges it lacks, which makes resume-after-restart
+free (persist which chunks you hold, re-request the rest) and keeps the
+sender stateless beyond the file itself.
+
+**channel_id:** drop identifier (0-65535); one file per drop.
+
+### 8.1 Frames
+
+First byte is the frame type. Types 0x01/0x02/0x04 carry a JSON body;
+CHUNK is binary.
+
+```
+0x01 OFFER     JSON {"name": str, "size": int, "chunk_size": 1024,
+                     "total_chunks": int, "sha256": hex}
+0x02 REQUEST   JSON {"ranges": [[start, end], ...]}   # end exclusive,
+                     chunk indexes; a range spans at most 64 chunks
+0x03 CHUNK     index uint32 BE || chunk bytes
+0x04 DONE      JSON {"sha256": hex}                   # receiver's verdict
+```
+
+### 8.2 Flow
+
+```
+Sender                              Receiver
+  |--- OFFER ----------------------->|          (announce)
+  |<-- REQUEST [[0,64]] -------------|          (pull missing)
+  |--- CHUNK 0..63 ----------------->|
+  |<-- REQUEST [[64,128]] -----------|
+  |          ...                     |
+  |<-- DONE {sha256} ----------------|          (verified)
+```
+
+- `chunk_size` is 1024 bytes (the §6.4 frame-data budget); the final
+  chunk may be short. `total_chunks = ceil(size / chunk_size)`.
+- The receiver re-REQUESTs chunks that do not arrive within a timeout
+  (reference: 1 s per outstanding range); lost CHUNKs need no sender
+  state. At most one window (64 chunks) SHOULD be outstanding.
+- On completion the receiver hashes the assembled file; DONE reports the
+  hex digest, which the sender compares against the OFFER's. A mismatch
+  is reported to the application (re-transfer is an application call).
+- OFFER is re-sent with the same drop_id to resume; a receiver that
+  recognizes `(name, size, sha256)` re-requests only what it lacks.
 
 ---
 
@@ -630,13 +785,18 @@ UDP broadcast. Packet format:
 Offset  Size  Field
 0       4 B   magic             0x54454C45 ("TELE")
 4       1 B   version           = PROTOCOL_VERSION (§12.4)
-5       var   hostname          UTF-8 string, null-terminated
-var     2 B   port              uint16 BE, listening port
+5       1 B   hostname_len      uint8
+6       var   hostname          UTF-8, hostname_len bytes (no terminator)
+6+len   2 B   port              uint16 BE, listening port
 ```
 
 Broadcast interval: 5 seconds. Duplicate detection by (hostname, ip, port).
 There is a single wire version number (§12.4); this field carries it so a
-peer can ignore broadcasts it cannot speak.
+peer can ignore broadcasts it cannot speak. The hostname is
+length-prefixed (v1.2; earlier drafts said null-terminated) so the
+parser needs no scan and embedded-NUL hostnames cannot desynchronize the
+port field. Trailing bytes after the port MUST be ignored
+(forward-extensible).
 
 ### 9.3 WebSocket (Legacy fallback) — Future
 
@@ -843,7 +1003,7 @@ peer.
 
 | Platform        | Transport          | Est. LOC | Notes                        |
 |-----------------|--------------------|----------|------------------------------|
-| Python (ref)    | UDP + asyncio      | ~2000    | Full library                 |
+| Python (ref)    | UDP + AF_UNIX + asyncio | ~3000 | Full library                 |
 | Rust (ref v1.1) | UDP + AF_UNIX + tokio | ~3000 | Full library, dmabuf, fds    |
 | Kotlin/Android  | OkHttp WebSocket   | ~500     | Stream + Control only        |
 | ESP32/C         | WebSocket          | ~300     | Stream + Control only        |
@@ -908,6 +1068,8 @@ Defined `capabilities` strings:
 | `webtransport` | Peer reachable via WebTransport (§9.6).                       |
 | `keyframe-req` | Producer honors `KEYFRAME_REQ` (§4.9).                       |
 | `rate-hint`  | Producer honors `RATE_HINT` (§4.10).                            |
+| `board-v1`   | Peer participates in Board replication (§7).                    |
+| `drop-v1`    | Peer speaks Drop file distribution (§8).                        |
 
 An absent capability = not supported: the sender MUST NOT use that
 feature with the peer and falls back to the baseline the feature extends
@@ -946,6 +1108,7 @@ is used with a peer only if it advertises the matching capability/cipher.
 | AF_UNIX transport             | `af-unix`                        |
 | WebTransport transport        | `webtransport`                   |
 | `KEYFRAME_REQ` / `RATE_HINT`  | `keyframe-req` / `rate-hint`     |
+| Board (§7) / Drop (§8)        | `board-v1` / `drop-v1`           |
 
 Absent capability ⇒ the sender restricts itself to the baseline the
 feature extends. Unknown capabilities/ciphers are ignored, so the set is
@@ -1010,4 +1173,4 @@ in every libsodium binding, Go `x/crypto`, Node `crypto`,
 |---------|------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | 1.0     | 2026-04-07 | Initial spec from Python reference implementation.                                                                                                                                                                     |
 | 1.1     | 2026-05-11 | Added §3.4 local crypto profile, §5.4 StreamHeader + dmabuf descriptor (capability-gated), §9.4 AF_UNIX transport, §9.5 send-loop priority across transports, §12.5 capability negotiation. `PROTOCOL_VERSION` → 2. Backwards-compatible: v1.0 peers continue to interoperate. |
-| 1.2     | 2026-06-30 | **Breaking wire revision** (collapsed into 1.2 — pre-adoption, sole consumer Rook upgraded in lockstep; no version spam). **Browser/edge:** §9.6 WebTransport (Stream→datagrams, Channel/Control→reliable QUIC streams, length-prefixed), §5.5 WebCodecs decode of §5.4 codec Streams, §4.9 `KEYFRAME_REQ` + §4.10 `RATE_HINT`, §9.3 TCP head-of-line caveat. **Crypto remediation:** AEAD is now a negotiated suite — ChaCha20-Poly1305 (IETF) mandatory baseline + AES-256-GCM optional (§3.2); 12-byte nonce (was 24); per-cipher key derivation (§3.1); real AEAD AAD (the pre-v1.2 Python reference wrongly used XSalsa20/`SecretBox` with AAD prepended — non-interoperable with the spec/Rust). **Capability announce is now foundational/mandatory** with an ordered `ciphers` list and end-to-end cipher negotiation (§3.5, §4.3, §12.5). Replay protection §3.3 SHOULD→MUST. Rook's Channel fragmentation envelope promoted to §6.6. Version fields reconciled to one `PROTOCOL_VERSION` (= 3; 1.0→1, 1.1→2, 1.2→3). |
+| 1.2     | 2026-06-30 | **Breaking wire revision** (collapsed into 1.2 — pre-adoption, sole consumer Rook upgraded in lockstep; no version spam). **Browser/edge:** §9.6 WebTransport (Stream→datagrams, Channel/Control→reliable QUIC streams, length-prefixed), §5.5 WebCodecs decode of §5.4 codec Streams, §4.9 `KEYFRAME_REQ` + §4.10 `RATE_HINT`, §9.3 TCP head-of-line caveat. **Crypto remediation:** AEAD is now a negotiated suite — ChaCha20-Poly1305 (IETF) mandatory baseline + AES-256-GCM optional (§3.2); 12-byte nonce (was 24); per-cipher key derivation (§3.1); real AEAD AAD (the pre-v1.2 Python reference wrongly used XSalsa20/`SecretBox` with AAD prepended — non-interoperable with the spec/Rust). **Capability announce is now foundational/mandatory** with an ordered `ciphers` list and end-to-end cipher negotiation (§3.5, §4.3, §12.5). Replay protection §3.3 SHOULD→MUST. Rook's Channel fragmentation envelope promoted to §6.6. **§6 Channel:** inner per-channel `seq` field added to §6.1 — the outer packet sequence is the AEAD nonce from the one shared per-session `SequenceSource` (§3.3) and is not contiguous per channel; reliability (acks, ordering, retransmits, dedup) tracks the inner `seq`, and retransmissions re-encrypt under a fresh outer sequence. **§7 Board / §8 Drop** specified (were "Future"): Board is a last-writer-wins replicated map with Lamport-clock timestamps and digest-driven anti-entropy; Drop is receiver-driven chunked, resumable file distribution; capabilities `board-v1`/`drop-v1`. Version fields reconciled to one `PROTOCOL_VERSION` (= 3; 1.0→1, 1.1→2, 1.2→3). |

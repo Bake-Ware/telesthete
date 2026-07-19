@@ -54,6 +54,7 @@ impl StreamEndpoint {
                 channel_id: self.stream_id,
                 plaintext: payload,
                 priority,
+                use_base_key: false,
             })
             .await?;
         Ok(())
@@ -70,10 +71,23 @@ pub struct StreamHub {
     transport: Arc<Transport>,
     /// Per-stream-id senders.
     senders: Arc<Mutex<HashMap<u16, mpsc::UnboundedSender<StreamMessage>>>>,
+    /// The demux task. Aborted on drop so it releases its `Arc<Transport>` (the
+    /// task holds the socket alive otherwise, since its route sender lives in
+    /// the same Transport it never exits on its own).
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for StreamHub {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl StreamHub {
-    pub async fn new(transport: Arc<Transport>) -> Self {
+    pub async fn new(
+        transport: Arc<Transport>,
+        mut rebase_rx: tokio::sync::broadcast::Receiver<SocketAddr>,
+    ) -> Self {
         let inbound = transport.route(ChannelType::Stream).await;
         let senders: Arc<Mutex<HashMap<u16, mpsc::UnboundedSender<StreamMessage>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -81,24 +95,39 @@ impl StreamHub {
             Arc::new(Mutex::new(HashMap::new()));
 
         let senders_ref = Arc::clone(&senders);
-        tokio::spawn(async move {
+        let wm = Arc::clone(&watermarks);
+        let task = tokio::spawn(async move {
             let mut rx = inbound;
-            while let Some(in_pkt) = rx.recv().await {
-                if let Some(msg) = handle_stream_inbound(&in_pkt, &watermarks).await {
-                    let senders = senders_ref.lock().await;
-                    if let Some(tx) = senders.get(&in_pkt.header.channel_id) {
-                        let _ = tx.send(msg);
-                    } else {
-                        debug!(
-                            "no Stream subscriber for stream_id={}",
-                            in_pkt.header.channel_id
-                        );
-                    }
+            loop {
+                tokio::select! {
+                    pkt = rx.recv() => match pkt {
+                        Some(in_pkt) => {
+                            if let Some(msg) = handle_stream_inbound(&in_pkt, &wm).await {
+                                let senders = senders_ref.lock().await;
+                                if let Some(tx) = senders.get(&in_pkt.header.channel_id) {
+                                    let _ = tx.send(msg);
+                                } else {
+                                    debug!(
+                                        "no Stream subscriber for stream_id={}",
+                                        in_pkt.header.channel_id
+                                    );
+                                }
+                            }
+                        }
+                        None => break,
+                    },
+                    // Peer restarted (SPEC §3.3/§4.3): clear its stream watermarks
+                    // so its fresh-session packets (new random start) are accepted.
+                    peer = rebase_rx.recv() => match peer {
+                        Ok(addr) => { wm.lock().await.retain(|(a, _), _| *a != addr); }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    },
                 }
             }
         });
 
-        Self { transport, senders }
+        Self { transport, senders, task }
     }
 
     pub async fn open(&self, peer: SocketAddr, stream_id: u16) -> StreamEndpoint {
@@ -123,13 +152,17 @@ async fn handle_stream_inbound(
     }
     let key = (in_pkt.from, in_pkt.header.channel_id);
     {
+        // Accept the first packet seen from a (peer, stream) at whatever random
+        // sequence the sender started from (SPEC §3.3); thereafter require
+        // strictly increasing sequences. A prior `or_insert(0)` wrongly dropped
+        // any first packet at sequence 0 — including a conformant peer's.
         let mut wm = watermarks.lock().await;
-        let entry = wm.entry(key).or_insert(0);
-        if in_pkt.header.sequence <= *entry {
-            // Stale — drop.
-            return None;
+        match wm.get(&key) {
+            Some(&prev) if in_pkt.header.sequence <= prev => return None, // stale
+            _ => {
+                wm.insert(key, in_pkt.header.sequence);
+            }
         }
-        *entry = in_pkt.header.sequence;
     }
     let priority = in_pkt.payload[0];
     let data = in_pkt.payload[1..].to_vec();

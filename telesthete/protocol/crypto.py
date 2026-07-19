@@ -21,7 +21,10 @@ associated data — never prepended to the plaintext.
 
 import hashlib
 import hmac
+import logging
 from typing import Tuple
+
+_log = logging.getLogger(__name__)
 
 try:
     from nacl import bindings as _na
@@ -30,6 +33,10 @@ except ImportError:
 
 
 BASELINE_CIPHER = "chacha20-poly1305"
+# Sentinel PSK for the local (AF_UNIX) trust profile: all local processes derive
+# the same band_id/key, so the socket-dir permissions are the real access
+# control, not the crypto (SPEC §3.4/§12.4). Matches the Rust `LOCAL_PSK`.
+LOCAL_PSK = "telesthete-local"
 NONCE_LEN = 12
 TAG_LEN = 16
 KEY_LEN = 32
@@ -42,13 +49,24 @@ def derive_band_id(psk: str) -> bytes:
     return hashlib.sha256(psk.encode("utf-8")).digest()[:16]
 
 
-def derive_encryption_key(psk: str, cipher_id: str = BASELINE_CIPHER) -> bytes:
-    """32-byte per-cipher AEAD key via HKDF-SHA256. SPEC §3.1.
+def derive_encryption_key(psk: str, cipher_id: str = BASELINE_CIPHER,
+                          session: int = None) -> bytes:
+    """32-byte AEAD key via HKDF-SHA256. SPEC §3.1.
 
     info = "encryption-" + cipher_id, so each suite gets a distinct key.
+
+    When ``session`` is given, the sender's monotonic session epoch is mixed in
+    as a fixed 8-byte big-endian suffix (``"-session-" || epoch``), yielding a
+    per-session **data key**. Packets encrypted under an old session's key then
+    fail authentication after that sender restarts to a new epoch, which closes
+    the cross-session replay window (SPEC §3.3). HELLO/HELLO_ACK use the base key
+    (``session=None``) so a receiver can decrypt the handshake and learn the
+    peer's epoch before deriving its data key.
     """
     salt = b"telesthete-v1"
     info = b"encryption-" + cipher_id.encode("utf-8")
+    if session is not None:
+        info += b"-session-" + int(session).to_bytes(8, "big")
     # HKDF-Extract
     prk = hmac.new(salt, psk.encode("utf-8"), hashlib.sha256).digest()
     # HKDF-Expand, single 32-byte block
@@ -59,9 +77,17 @@ def derive_encryption_key(psk: str, cipher_id: str = BASELINE_CIPHER) -> bytes:
 def select_cipher(initiator_prefs, responder_supported) -> str:
     """Pick the negotiated AEAD suite per SPEC §3.5: the first entry in the
     *initiator's* ordered preference list that the *responder* also supports.
-    Falls back to the mandatory baseline (which both MUST support), so this
-    never fails."""
+
+    Per §3.5 rule 2 / §12.5, both lists MUST include the mandatory baseline
+    (``chacha20-poly1305``). A list that omits it is non-conformant; we normalize
+    by treating the baseline as always supported (it is mandatory) so selection
+    never fails, and log the violation for the operator.
+    """
+    if BASELINE_CIPHER not in responder_supported:
+        _log.warning("cipher list omits the mandatory baseline (SPEC §12.5); "
+                     "treating baseline as supported")
     supported = set(responder_supported)
+    supported.add(BASELINE_CIPHER)  # baseline is mandatory (§3.5 rule 2)
     for cid in initiator_prefs:
         if cid in supported:
             return cid
@@ -88,12 +114,14 @@ class BandCrypto:
         cipher_id: AEAD suite (default: the mandatory baseline).
     """
 
-    def __init__(self, psk: str, cipher_id: str = BASELINE_CIPHER):
+    def __init__(self, psk: str, cipher_id: str = BASELINE_CIPHER, session: int = None):
         if cipher_id not in SUPPORTED_CIPHERS:
             raise ValueError(f"unsupported cipher_id: {cipher_id!r}")
         self.cipher_id = cipher_id
+        self.session = session
         self.band_id = derive_band_id(psk)
-        self.key = derive_encryption_key(psk, cipher_id)
+        # session=None -> base key (HELLO/HELLO_ACK); session=epoch -> data key.
+        self.key = derive_encryption_key(psk, cipher_id, session=session)
         self._aesgcm = None
         if cipher_id == "aes256-gcm":
             # Optional suite — pulled in lazily so the baseline has no extra dep.

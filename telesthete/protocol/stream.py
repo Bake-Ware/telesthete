@@ -11,6 +11,7 @@ from typing import Callable, Optional, Dict
 from collections import defaultdict
 
 from .framing import pack_stream_message, unpack_packet, ChannelType
+from .sequence import SequenceSource
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,10 @@ class Stream:
         crypto=None,
         transport=None,
         priority: int = 128,
-        crypto_for=None
+        crypto_for=None,
+        seq_source=None,
+        send_crypto=None,
+        recv_crypto=None
     ):
         """
         Initialize a Stream
@@ -46,20 +50,30 @@ class Stream:
         """
         self.band_id = band_id
         self.stream_id = stream_id
-        if crypto_for is not None:
-            self._crypto_for = crypto_for
+        # Per-session data keys: send uses OUR epoch, recv uses the PEER's
+        # (SPEC §3.1/§3.3). Falls back to the legacy single-crypto resolver, or a
+        # fixed BandCrypto, for standalone/test use.
+        if send_crypto is not None and recv_crypto is not None:
+            self._send_crypto = send_crypto
+            self._recv_crypto = recv_crypto
+        elif crypto_for is not None:
+            self._send_crypto = lambda addr: crypto_for(addr)
+            self._recv_crypto = lambda addr: crypto_for(addr)
         else:
-            self._crypto_for = lambda addr, cipher_id=None: crypto
+            self._send_crypto = lambda addr: crypto
+            self._recv_crypto = lambda addr: crypto
         self.crypto = crypto
         self.transport = transport
         self.priority = priority
 
-        # Sequence number for outbound packets
-        self._send_sequence = 0
+        # Shared per-sender sequence source (SPEC §3.3). One per band, shared with
+        # Control/Channel so nonces never collide; a private one if omitted.
+        self._seq_source = seq_source if seq_source is not None else SequenceSource()
 
-        # High-water mark for inbound packets (per peer)
-        # Maps peer_addr -> highest_sequence_seen
-        self._recv_watermark: Dict[tuple, int] = defaultdict(lambda: -1)
+        # High-water mark for inbound packets (per peer). A missing entry means
+        # "not yet seen" -> the first packet is accepted at whatever (random)
+        # sequence the sender started from; thereafter strictly increasing.
+        self._recv_watermark: Dict[tuple, int] = {}
 
         # Receive callback
         self._on_receive: Optional[Callable] = None
@@ -97,9 +111,8 @@ class Stream:
             data: Payload to send
         """
 
-        # Increment sequence
-        sequence = self._send_sequence
-        self._send_sequence += 1
+        # Draw one sequence from the shared per-sender source (SPEC §3.3).
+        sequence = self._seq_source.next()
 
         # Build associated data for AEAD
         aad = bytes([
@@ -108,17 +121,23 @@ class Stream:
             self.stream_id & 0xFF
         ])
 
-        # Prepend priority and timestamp to payload
-        timestamp = int(time.time() * 1000) & 0xFFFFFFFF  # 32-bit milliseconds
-        payload = bytes([self.priority]) + timestamp.to_bytes(4, 'big') + data
+        # SPEC §5.1 stream payload = priority (1 byte) || data. (A prior
+        # implementation inserted a 4-byte timestamp here, which broke interop
+        # with the Rust reference; removed to conform.)
+        payload = bytes([self.priority]) + data
 
-        # Encrypt per destination under that peer's negotiated suite (SPEC §3.5)
-        # and send. Sequence is shared across destinations.
+        # Encrypt per destination under our session data key for that peer's
+        # negotiated suite (SPEC §3.1/§3.5). Sequence is shared across dests.
         for dest in self._destinations:
-            crypto = self._crypto_for(dest)
+            crypto = self._send_crypto(dest)
             ciphertext = crypto.encrypt(sequence, payload, aad)
             packet = pack_stream_message(self.band_id, self.stream_id, sequence, ciphertext)
             self.transport.send(dest, packet)
+
+    def reset_peer(self, peer_addr: tuple):
+        """Forget a peer's watermark so its next packet is accepted afresh.
+        Called when the peer (re)starts a session (SPEC §3.3)."""
+        self._recv_watermark.pop(peer_addr, None)
 
     def on_receive(self, callback: Callable[[bytes, tuple, int], None]):
         """
@@ -153,9 +172,11 @@ class Stream:
                 logger.warning(f"Wrong stream ID: {packet.channel_id}")
                 return
 
-            # Check high-water mark (drop stale/replayed packets, SPEC §3.3)
-            watermark = self._recv_watermark[peer_addr]
-            if packet.sequence <= watermark:
+            # Check high-water mark (drop stale/replayed packets, SPEC §3.3).
+            # First packet from a peer is accepted at its random start; then
+            # strictly increasing.
+            watermark = self._recv_watermark.get(peer_addr)
+            if watermark is not None and packet.sequence <= watermark:
                 logger.debug(f"Dropping stale packet: seq={packet.sequence}, watermark={watermark}")
                 return
 
@@ -166,18 +187,26 @@ class Stream:
                 self.stream_id & 0xFF
             ])
 
-            # Decrypt under the sender's negotiated suite (raises on auth
-            # failure before we advance the watermark, so a forged high-seq
-            # packet cannot wedge the mark)
-            payload = self._crypto_for(peer_addr).decrypt(packet.sequence, packet.ciphertext, aad)
+            # Decrypt under the sender's session data key (its epoch, learned
+            # from its HELLO). `None` -> we have not seen the peer's HELLO yet
+            # (or it restarted and we've not re-handshaked), so drop. Raises on
+            # auth failure before we advance the watermark, so a forged or
+            # old-session packet cannot wedge the mark.
+            rc = self._recv_crypto(peer_addr)
+            if rc is None:
+                logger.debug(f"No session key for {peer_addr} yet; dropping stream packet")
+                return
+            payload = rc.decrypt(packet.sequence, packet.ciphertext, aad)
 
             # Authenticated and fresh: advance the watermark.
             self._recv_watermark[peer_addr] = packet.sequence
 
-            # Extract priority and timestamp
-            priority = payload[0]
-            timestamp = int.from_bytes(payload[1:5], 'big')
-            data = payload[5:]
+            # SPEC §5.1: payload = priority (1 byte) || data. The wire carries no
+            # timestamp; the receive callback gets a local receive time for
+            # compatibility with its (data, peer, timestamp) shape.
+            priority = payload[0]  # noqa: F841 — reserved for §5.3 priority handling
+            data = payload[1:]
+            timestamp = int(time.time() * 1000)
 
             # Call receive handler
             if self._on_receive:

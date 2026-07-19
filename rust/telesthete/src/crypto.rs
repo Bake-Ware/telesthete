@@ -35,7 +35,7 @@ pub type Key = [u8; KEY_LEN];
 
 #[derive(Debug, Error)]
 pub enum CryptoError {
-    #[error("encrypt failed (XChaCha20-Poly1305)")]
+    #[error("AEAD encrypt failed")]
     Encrypt,
     #[error("decrypt failed (auth tag mismatch or ciphertext truncated)")]
     Decrypt,
@@ -68,6 +68,24 @@ pub fn derive_key_for(psk: &[u8], cipher_id: &str) -> Key {
 /// Baseline (`chacha20-poly1305`) key. SPEC §3.1.
 pub fn derive_key(psk: &[u8]) -> Key {
     derive_key_for(psk, BASELINE_CIPHER)
+}
+
+/// Per-session **data key** (SPEC §3.1/§3.3): the sender's monotonic session
+/// epoch is mixed into HKDF as a fixed 8-byte big-endian suffix
+/// (`"encryption-" + cipher_id + "-session-" + epoch`). Packets under an old
+/// epoch's key fail authentication after the sender restarts, closing the
+/// cross-session replay window. HELLO/HELLO_ACK keep the base [`derive_key_for`]
+/// so a receiver can bootstrap the peer's epoch.
+pub fn derive_session_key(psk: &[u8], cipher_id: &str, session: u64) -> Key {
+    let hk = Hkdf::<Sha256>::new(Some(b"telesthete-v1"), psk);
+    let mut info = b"encryption-".to_vec();
+    info.extend_from_slice(cipher_id.as_bytes());
+    info.extend_from_slice(b"-session-");
+    info.extend_from_slice(&session.to_be_bytes());
+    let mut okm = [0u8; KEY_LEN];
+    hk.expand(&info, &mut okm)
+        .expect("HKDF expand of 32 bytes from SHA-256 cannot fail");
+    okm
 }
 
 /// Build the 12-byte nonce: 4 zero bytes, then sequence as 8 BE bytes. SPEC §3.2.
@@ -113,8 +131,14 @@ pub fn build_aad(channel_type: u8, channel_id: u16) -> [u8; 3] {
 /// Falls back to the mandatory baseline (both MUST support it), so it never
 /// fails. Mirrors `telesthete.protocol.crypto.select_cipher`.
 pub fn select_cipher(initiator_prefs: &[String], responder_supported: &[String]) -> String {
+    // SPEC §3.5 rule 2 / §12.5: both lists MUST include the mandatory baseline.
+    // A list that omits it is non-conformant; normalize by treating the baseline
+    // as always supported (it is mandatory) so selection never fails.
+    if !responder_supported.iter().any(|s| s == BASELINE_CIPHER) {
+        tracing::warn!("cipher list omits the mandatory baseline (SPEC §12.5)");
+    }
     for cid in initiator_prefs {
-        if responder_supported.iter().any(|s| s == cid) {
+        if cid == BASELINE_CIPHER || responder_supported.iter().any(|s| s == cid) {
             return cid.clone();
         }
     }
@@ -261,11 +285,23 @@ mod tests {
             "band_id diverged"
         );
 
-        // Per-cipher key derivation (both suites).
+        // Per-cipher base key derivation (both suites).
         for (cipher_id, key_hex) in v["keys"].as_object().unwrap() {
             Suite::from_id(cipher_id).expect("known cipher in vectors");
             let key = derive_key_for(psk, cipher_id);
             assert_eq!(to_hex(&key), key_hex.as_str().unwrap(), "key diverged: {cipher_id}");
+        }
+
+        // Per-session data keys (SPEC §3.1/§3.3): must be byte-identical to Python.
+        for case in v["session_keys"]["vectors"].as_array().unwrap() {
+            let cipher_id = case["cipher"].as_str().unwrap();
+            let session = case["session"].as_u64().unwrap();
+            let key = derive_session_key(psk, cipher_id, session);
+            assert_eq!(
+                to_hex(&key),
+                case["key_hex"].as_str().unwrap(),
+                "session key diverged: {cipher_id} session={session}"
+            );
         }
 
         for case in v["aead"].as_array().unwrap() {

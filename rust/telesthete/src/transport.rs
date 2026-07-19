@@ -17,8 +17,8 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use crate::crypto::Key;
-use crate::framing::{decode_packet, encode_packet, ChannelType, FramingError, Header};
+use crate::crypto::{Key, Suite};
+use crate::framing::{decode_packet_suite, encode_packet_suite, ChannelType, FramingError, Header};
 
 /// Inbound packet decoded into header + cleartext payload + sender address.
 #[derive(Debug, Clone)]
@@ -37,6 +37,9 @@ pub struct Outbound {
     pub plaintext: Vec<u8>,
     /// Priority hint (lower = higher priority). Currently informational only.
     pub priority: u8,
+    /// Encrypt under the base key rather than the session data key. Set for
+    /// HELLO/HELLO_ACK so a receiver can bootstrap our epoch (SPEC §3.1/§3.3).
+    pub use_base_key: bool,
 }
 
 #[derive(Debug, Error)]
@@ -49,22 +52,54 @@ pub enum TransportError {
     Closed,
 }
 
-/// Per-peer monotonic sequence counter. SPEC §3.3: must never repeat per key.
-#[derive(Debug, Default)]
+/// One monotonic sequence counter per sender (shared across this sender's
+/// channels/streams). The AEAD nonce is the sequence and the key is band-wide
+/// (SPEC §3.1), so the sequence MUST NOT repeat under one key across senders or
+/// restarts. It is therefore CSPRNG-initialized (SPEC §3.3) with ~2^63 headroom
+/// before wrap, making a cross-sender collision negligible rather than
+/// guaranteed (two senders both starting at 0/1 would collide immediately).
+#[derive(Debug)]
 pub struct SequenceCounter(std::sync::atomic::AtomicU64);
 
 impl SequenceCounter {
+    /// CSPRNG-seeded start (SPEC §3.3).
+    pub fn random() -> Self {
+        let mut b = [0u8; 8];
+        getrandom::getrandom(&mut b).expect("CSPRNG unavailable");
+        Self(std::sync::atomic::AtomicU64::new(u64::from_be_bytes(b) >> 1))
+    }
+
+    /// Return the current value, then advance by one.
     pub fn next(&self) -> u64 {
-        self.0
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .wrapping_add(1)
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Default for SequenceCounter {
+    fn default() -> Self {
+        Self::random()
     }
 }
 
 /// UDP transport runtime. Owns the socket and the send/recv loops.
 pub struct Transport {
     socket: Arc<UdpSocket>,
-    key: Key,
+    /// Base key (HELLO/HELLO_ACK). Also the send/recv key until a session is
+    /// configured, so a plain `bind` behaves exactly as before.
+    base_key: Key,
+    /// Our own per-session data key for sending non-HELLO packets (SPEC §3.3).
+    /// Defaults to `base_key`; set via [`Self::set_session_key`]. Baseline
+    /// suite; superseded per peer by `send_keys` once a cipher is negotiated.
+    session_key: Key,
+    /// Per-peer send keys: our epoch under the suite negotiated with that peer
+    /// (§3.5). Falls back to `session_key` + baseline when absent.
+    send_keys: Arc<Mutex<HashMap<SocketAddr, (Key, Suite)>>>,
+    /// Per-peer session data keys + negotiated suite (derived from each peer's
+    /// HELLO epoch) used to decrypt that peer's data packets. Updated on restart.
+    peer_keys: Arc<Mutex<HashMap<SocketAddr, (Key, Suite)>>>,
+    /// Last time an authenticated packet arrived from each peer. Drives §4.5
+    /// dead-peer detection in the Band.
+    last_seen: Arc<Mutex<HashMap<SocketAddr, std::time::Instant>>>,
     band_id: [u8; 16],
     seq: Arc<SequenceCounter>,
     /// Per-channel-type inbound dispatch (control, stream, channel).
@@ -77,11 +112,48 @@ impl Transport {
         debug!("telesthete transport bound on {}", socket.local_addr()?);
         Ok(Self {
             socket,
-            key,
+            base_key: key,
+            session_key: key, // no session configured yet -> data uses base key
+            send_keys: Arc::new(Mutex::new(HashMap::new())),
+            peer_keys: Arc::new(Mutex::new(HashMap::new())),
+            last_seen: Arc::new(Mutex::new(HashMap::new())),
             band_id,
             seq: Arc::new(SequenceCounter::default()),
             routes: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Configure our own per-session data key (SPEC §3.3), used for all sent
+    /// non-HELLO packets. Call once, before the transport is shared/used.
+    pub fn set_session_key(&mut self, key: Key) {
+        self.session_key = key;
+    }
+
+    /// Register (or replace) a peer's per-session data key + negotiated suite,
+    /// derived from the epoch in its HELLO. Used to decrypt that peer's data
+    /// packets; replacing it on a restart makes the peer's old-session packets
+    /// fail authentication.
+    pub async fn register_peer_key(&self, addr: SocketAddr, key: Key, suite: Suite) {
+        self.peer_keys.lock().await.insert(addr, (key, suite));
+    }
+
+    /// Register (or replace) the key we SEND to `addr` with: our epoch under
+    /// the suite negotiated with that peer (§3.5). Without an entry, sends use
+    /// the baseline `session_key`.
+    pub async fn register_send_key(&self, addr: SocketAddr, key: Key, suite: Suite) {
+        self.send_keys.lock().await.insert(addr, (key, suite));
+    }
+
+    /// When each peer's last authenticated packet arrived (§4.5). Snapshot.
+    pub async fn last_seen(&self) -> HashMap<SocketAddr, std::time::Instant> {
+        self.last_seen.lock().await.clone()
+    }
+
+    /// Forget a peer's liveness + key state (dead-peer eviction, GOODBYE).
+    pub async fn forget_peer(&self, addr: SocketAddr) {
+        self.last_seen.lock().await.remove(&addr);
+        self.peer_keys.lock().await.remove(&addr);
+        self.send_keys.lock().await.remove(&addr);
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -100,11 +172,26 @@ impl Transport {
         rx
     }
 
-    /// Encrypt + send one packet.
+    /// Encrypt + send one packet. HELLO/HELLO_ACK (`use_base_key`) go under the
+    /// base key so a receiver can bootstrap our epoch; everything else uses our
+    /// per-session data key (SPEC §3.1/§3.3).
     pub async fn send(&self, out: Outbound) -> Result<(), TransportError> {
         let seq = self.seq.next();
-        let pkt = encode_packet(
-            &self.key,
+        let (key, suite) = if out.use_base_key {
+            (self.base_key, Suite::ChaCha20Poly1305)
+        } else {
+            // Per-peer negotiated suite (§3.5) when one is registered, else the
+            // baseline session key.
+            self.send_keys
+                .lock()
+                .await
+                .get(&out.to)
+                .copied()
+                .unwrap_or((self.session_key, Suite::ChaCha20Poly1305))
+        };
+        let pkt = encode_packet_suite(
+            suite,
+            &key,
             &self.band_id,
             out.channel_type,
             out.channel_id,
@@ -120,7 +207,9 @@ impl Transport {
     pub fn spawn_recv_loop(&self) -> tokio::task::JoinHandle<()> {
         let socket = Arc::clone(&self.socket);
         let routes = Arc::clone(&self.routes);
-        let key = self.key;
+        let base_key = self.base_key;
+        let peer_keys = Arc::clone(&self.peer_keys);
+        let last_seen = Arc::clone(&self.last_seen);
         let band_id = self.band_id;
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65_535];
@@ -132,10 +221,19 @@ impl Transport {
                         continue;
                     }
                 };
-                let (header, payload) = match decode_packet(&key, &buf[..n]) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        debug!("decode_packet from {from} failed: {e}");
+                // Try the peer's session data key first (its data packets), then
+                // the base key (its HELLO/HELLO_ACK). An old-session packet after
+                // a restart fails both — its epoch's key is gone — so it is
+                // dropped (SPEC §3.3).
+                let peer_key = peer_keys.lock().await.get(&from).copied();
+                let (header, payload) = match peer_key
+                    .and_then(|(k, s)| decode_packet_suite(s, &k, &buf[..n]).ok())
+                    .or_else(|| {
+                        decode_packet_suite(Suite::ChaCha20Poly1305, &base_key, &buf[..n]).ok()
+                    }) {
+                    Some(v) => v,
+                    None => {
+                        debug!("decode_packet from {from} failed under all keys");
                         continue;
                     }
                 };
@@ -143,6 +241,11 @@ impl Transport {
                     debug!("dropping packet from {from}: foreign band_id");
                     continue;
                 }
+                // Authenticated + our band: refresh liveness (§4.5).
+                last_seen
+                    .lock()
+                    .await
+                    .insert(from, std::time::Instant::now());
                 let inbound = Inbound {
                     from,
                     header,
@@ -197,6 +300,7 @@ mod tests {
                 channel_id: 1,
                 plaintext: b"hello bob".to_vec(),
                 priority: 0,
+                use_base_key: false,
             })
             .await
             .unwrap();
@@ -234,6 +338,7 @@ mod tests {
                 channel_id: 1,
                 plaintext: b"foreign".to_vec(),
                 priority: 0,
+                use_base_key: false,
             })
             .await
             .unwrap();

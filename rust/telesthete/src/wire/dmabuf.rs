@@ -57,6 +57,8 @@ pub enum DmabufError {
     TooShort { got: usize, need: usize },
     #[error("plane_count {0} out of range (1..={MAX_PLANES})")]
     PlaneCountOutOfRange(u8),
+    #[error("fd_count {0} exceeds MAX_FDS_PER_PACKET ({MAX_FDS_PER_PACKET})")]
+    FdCountOutOfRange(u8),
     #[error("fd_count {fd} cannot serve plane fd_index {idx}")]
     FdIndexOutOfRange { fd: u8, idx: u8 },
     #[error("REUSE set but fd_count={0} (expected 0 or 1 with WITH_FENCE)")]
@@ -82,10 +84,16 @@ impl DmabufDescriptor {
                 need,
             });
         }
-        let plane_count = self.planes.len() as u8;
-        if !(1..=MAX_PLANES as u8).contains(&plane_count) {
-            return Err(DmabufError::PlaneCountOutOfRange(plane_count));
+        // Validate the count as usize BEFORE the u8 cast — `260 as u8 == 4`
+        // would otherwise pass the range check and write a header claiming 4
+        // planes while the loop emits all 260.
+        if !(1..=MAX_PLANES).contains(&self.planes.len()) {
+            return Err(DmabufError::PlaneCountOutOfRange(self.planes.len().min(255) as u8));
         }
+        if self.fd_count as usize > MAX_FDS_PER_PACKET {
+            return Err(DmabufError::FdCountOutOfRange(self.fd_count));
+        }
+        let plane_count = self.planes.len() as u8; // in 1..=MAX_PLANES; cast is exact
 
         out[0..4].copy_from_slice(&self.width.to_be_bytes());
         out[4..8].copy_from_slice(&self.height.to_be_bytes());
@@ -120,6 +128,11 @@ impl DmabufDescriptor {
 
         if !(1..=MAX_PLANES as u8).contains(&plane_count) {
             return Err(DmabufError::PlaneCountOutOfRange(plane_count));
+        }
+        // Bound fd_count so a descriptor can't claim more fds than a packet may
+        // carry (§9.4 MAX_FDS_PER_PACKET); check_flags only bounds the planes.
+        if fd_count as usize > MAX_FDS_PER_PACKET {
+            return Err(DmabufError::FdCountOutOfRange(fd_count));
         }
         let need = Self::encoded_len(plane_count as usize);
         if input.len() < need {
@@ -345,6 +358,133 @@ mod tests {
             DmabufDescriptor::parse(&buf),
             Err(DmabufError::PlaneCountOutOfRange(_))
         ));
+    }
+
+    #[test]
+    fn write_rejects_260_planes_instead_of_truncating() {
+        // 260 as u8 == 4: without the usize-first check, the header would
+        // claim 4 planes while the body carries 260.
+        let plane = DmabufPlane {
+            offset: 0,
+            stride: 4,
+            fd_index: 0,
+        };
+        let desc = DmabufDescriptor {
+            width: 1,
+            height: 1,
+            fourcc: fourcc(b"XR24"),
+            modifier: 0,
+            planes: vec![plane; 260],
+            fd_count: 1,
+        };
+        let mut buf = vec![0u8; DmabufDescriptor::encoded_len(260)];
+        assert!(matches!(
+            desc.write(&mut buf),
+            Err(DmabufError::PlaneCountOutOfRange(_))
+        ));
+    }
+
+    #[test]
+    fn write_rejects_fd_count_above_packet_max() {
+        let desc = DmabufDescriptor {
+            width: 1,
+            height: 1,
+            fourcc: fourcc(b"XR24"),
+            modifier: 0,
+            planes: vec![DmabufPlane {
+                offset: 0,
+                stride: 4,
+                fd_index: 0,
+            }],
+            fd_count: 200,
+        };
+        let mut buf = vec![0u8; DmabufDescriptor::encoded_len(1)];
+        assert!(matches!(
+            desc.write(&mut buf),
+            Err(DmabufError::FdCountOutOfRange(200))
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_fd_count_above_packet_max() {
+        let good = DmabufDescriptor {
+            width: 1,
+            height: 1,
+            fourcc: fourcc(b"XR24"),
+            modifier: 0,
+            planes: vec![DmabufPlane {
+                offset: 0,
+                stride: 4,
+                fd_index: 0,
+            }],
+            fd_count: 1,
+        };
+        let mut buf = vec![0u8; DmabufDescriptor::encoded_len(1)];
+        good.write(&mut buf).unwrap();
+        buf[21] = 200; // fd_count way past MAX_FDS_PER_PACKET
+        assert!(matches!(
+            DmabufDescriptor::parse(&buf),
+            Err(DmabufError::FdCountOutOfRange(200))
+        ));
+    }
+
+    /// Byte-identical with the Python reference: tests/vectors.json `dmabuf`
+    /// and `stream_header`.
+    #[test]
+    fn conformance_vectors_match_python() {
+        use crate::wire::stream::{StreamFlags, StreamHeader, STREAM_HEADER_LEN};
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/vectors.json");
+        let raw = std::fs::read_to_string(path).expect("read tests/vectors.json");
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        fn to_hex(b: &[u8]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
+
+        if let Some(cases) = v.get("stream_header").and_then(|c| c.as_array()) {
+            assert!(!cases.is_empty());
+            for case in cases {
+                let h = StreamHeader {
+                    flags: StreamFlags::from_bits(case["flags"].as_u64().unwrap() as u8)
+                        .unwrap(),
+                    frame_id: case["frame_id"].as_u64().unwrap() as u32,
+                };
+                let mut buf = [0u8; STREAM_HEADER_LEN];
+                h.write(&mut buf).unwrap();
+                assert_eq!(to_hex(&buf), case["packed_hex"].as_str().unwrap());
+            }
+        }
+
+        if let Some(cases) = v.get("dmabuf").and_then(|c| c.as_array()) {
+            assert!(!cases.is_empty());
+            for case in cases {
+                let planes: Vec<DmabufPlane> = case["planes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| DmabufPlane {
+                        offset: p["offset"].as_u64().unwrap() as u32,
+                        stride: p["stride"].as_u64().unwrap() as u32,
+                        fd_index: p["fd_index"].as_u64().unwrap() as u8,
+                    })
+                    .collect();
+                let desc = DmabufDescriptor {
+                    width: case["width"].as_u64().unwrap() as u32,
+                    height: case["height"].as_u64().unwrap() as u32,
+                    fourcc: u32::from_le_bytes(
+                        case["fourcc"].as_str().unwrap().as_bytes().try_into().unwrap(),
+                    ),
+                    modifier: u64::from_str_radix(case["modifier"].as_str().unwrap(), 16)
+                        .unwrap(),
+                    fd_count: case["fd_count"].as_u64().unwrap() as u8,
+                    planes,
+                };
+                let mut buf = vec![0u8; DmabufDescriptor::encoded_len(desc.planes.len())];
+                desc.write(&mut buf).unwrap();
+                assert_eq!(to_hex(&buf), case["packed_hex"].as_str().unwrap(), "{case}");
+                assert_eq!(DmabufDescriptor::parse(&buf).unwrap(), desc);
+            }
+        }
     }
 
     #[test]

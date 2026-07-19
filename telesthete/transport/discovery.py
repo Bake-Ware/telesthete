@@ -7,22 +7,53 @@ Discovers peers on the local network without needing to know their addresses.
 import asyncio
 import socket
 import logging
-from typing import Callable, Optional, Set, Tuple
+from collections import OrderedDict
+from typing import Callable, Optional, Tuple
+
+from ..protocol.framing import PROTOCOL_VERSION
 
 logger = logging.getLogger(__name__)
+
+MAGIC = b"TELE"  # 0x54454C45 (SPEC §9.2)
+
+
+def pack_announce(hostname: str, port: int) -> bytes:
+    """SPEC §9.2: magic(4) || version(1) || hostname_len(1) || hostname || port(2 BE)."""
+    hostname_bytes = hostname.encode("utf-8")
+    if len(hostname_bytes) > 255:
+        hostname_bytes = hostname_bytes[:255]
+    return (MAGIC + bytes([PROTOCOL_VERSION, len(hostname_bytes)])
+            + hostname_bytes + port.to_bytes(2, "big"))
+
+
+def parse_announce(data: bytes) -> Optional[Tuple[str, int]]:
+    """Parse a §9.2 announce -> (hostname, port), or None if not ours / not
+    speakable. Trailing bytes after the port are ignored (forward-extensible)."""
+    if len(data) < 8 or not data.startswith(MAGIC):
+        return None
+    if data[4] != PROTOCOL_VERSION:
+        return None  # a version we cannot speak
+    hostname_len = data[5]
+    end = 6 + hostname_len
+    if len(data) < end + 2:
+        return None
+    try:
+        hostname = data[6:end].decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    port = int.from_bytes(data[end:end + 2], "big")
+    return hostname, port
 
 
 class Discovery:
     """
-    UDP broadcast-based peer discovery for LAN
+    UDP broadcast-based peer discovery for LAN (SPEC §9.2)
 
     Broadcasts "I exist" messages on the local network and listens for
     responses from other peers.
     """
 
     DISCOVERY_PORT = 9998  # Port for discovery broadcasts
-    MAGIC = b"TELESTHETE"  # Magic bytes to identify our broadcasts
-    VERSION = 1
 
     def __init__(self, hostname: str, listen_port: int, on_peer_found: Callable[[str, str, int], None]):
         """
@@ -40,9 +71,12 @@ class Discovery:
         # Socket for sending/receiving broadcasts
         self.socket: Optional[socket.socket] = None
 
-        # Discovered peers (to avoid duplicate callbacks)
-        # Set of (hostname, ip, port)
-        self._discovered: Set[Tuple[str, str, int]] = set()
+        # Discovered peers (to avoid duplicate callbacks), as an insertion-
+        # ordered LRU keyed by (hostname, ip, port). Bounded so unauthenticated
+        # LAN beacons — an attacker can spoof unlimited (hostname, port) pairs —
+        # cannot grow it without limit; the oldest entry is evicted at the cap.
+        self._discovered: "OrderedDict[Tuple[str, str, int], None]" = OrderedDict()
+        self._max_discovered = 4096
 
         # Running state
         self._running = False
@@ -146,21 +180,9 @@ class Discovery:
 
     def _send_broadcast(self):
         """
-        Send a discovery broadcast packet
+        Send a discovery broadcast packet (SPEC §9.2)
         """
-        # Packet format:
-        # MAGIC (10 bytes) + VERSION (1 byte) + HOSTNAME_LEN (1 byte) + HOSTNAME + PORT (2 bytes)
-
-        hostname_bytes = self.hostname.encode('utf-8')[:255]
-        hostname_len = len(hostname_bytes)
-
-        packet = (
-            self.MAGIC +
-            bytes([self.VERSION]) +
-            bytes([hostname_len]) +
-            hostname_bytes +
-            self.listen_port.to_bytes(2, 'big')
-        )
+        packet = pack_announce(self.hostname, self.listen_port)
 
         # Broadcast to local network
         # Using 255.255.255.255 for simplicity
@@ -180,29 +202,10 @@ class Discovery:
             addr: Sender (ip, port) - note this is the discovery port, not listen port
         """
         try:
-            # Check magic
-            if not data.startswith(self.MAGIC):
+            parsed = parse_announce(data)
+            if parsed is None:
                 return
-
-            offset = len(self.MAGIC)
-
-            # Check version
-            version = data[offset]
-            if version != self.VERSION:
-                logger.debug(f"Discovery packet with wrong version: {version}")
-                return
-
-            offset += 1
-
-            # Parse hostname
-            hostname_len = data[offset]
-            offset += 1
-
-            hostname = data[offset:offset + hostname_len].decode('utf-8')
-            offset += hostname_len
-
-            # Parse port
-            port = int.from_bytes(data[offset:offset + 2], 'big')
+            hostname, port = parsed
 
             peer_ip = addr[0]
 
@@ -215,9 +218,11 @@ class Discovery:
             if peer_tuple in self._discovered:
                 return
 
-            # New peer discovered
+            # New peer discovered — record, evicting the oldest past the cap.
             logger.info(f"Discovered peer: {hostname} at {peer_ip}:{port}")
-            self._discovered.add(peer_tuple)
+            self._discovered[peer_tuple] = None
+            while len(self._discovered) > self._max_discovered:
+                self._discovered.popitem(last=False)
 
             # Call callback
             self.on_peer_found(hostname, peer_ip, port)

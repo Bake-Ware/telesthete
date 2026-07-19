@@ -7,10 +7,13 @@ A Band is a PSK-scoped encrypted communication context between peers.
 import asyncio
 import logging
 import socket
+import time
 from typing import Optional, Dict, Callable, List
 
 from .protocol.crypto import BandCrypto, select_cipher, BASELINE_CIPHER
+from .protocol.sequence import SequenceSource
 from .protocol.stream import Stream
+from .protocol.channel import Channel
 from .protocol.control import ControlChannel, ControlMessageType
 from .protocol.framing import ChannelType
 from .transport.udp import UDPTransport
@@ -26,6 +29,11 @@ class Band:
     This is the main entry point for the Telesthete API.
     """
 
+    # Hard cap on the peer registry (defense against spoofed-HELLO-replay
+    # growth; keepalive eviction handles the steady state). Displaces the
+    # least-recently-seen peer when full.
+    MAX_PEERS = 4096
+
     def __init__(
         self,
         psk: str,
@@ -33,7 +41,8 @@ class Band:
         bind_address: str = "0.0.0.0",
         bind_port: int = 9999,
         capabilities: Optional[List[str]] = None,
-        ciphers: Optional[List[str]] = None
+        ciphers: Optional[List[str]] = None,
+        session_epoch: Optional[int] = None
     ):
         """
         Initialize a Band
@@ -58,17 +67,43 @@ class Band:
         if BASELINE_CIPHER not in self.ciphers:
             self.ciphers.append(BASELINE_CIPHER)  # baseline is mandatory
 
-        # Per-cipher BandCrypto cache (band_id is cipher-independent).
-        self._cryptos: Dict[str, BandCrypto] = {}
-        self.crypto = self._crypto_for_cipher(BASELINE_CIPHER)
+        # BandCrypto cache keyed by (cipher_id, session_epoch). session=None is
+        # the base key used for HELLO/HELLO_ACK; a session epoch gives the
+        # per-session data key (SPEC §3.1/§3.3).
+        self._cryptos: Dict[tuple, BandCrypto] = {}
+        self.crypto = self._crypto(BASELINE_CIPHER, None)  # base
         self.band_id = self.crypto.band_id
+
+        # One sequence source for this sender, shared across Control, every
+        # Stream AND every reliable Channel, so no two packets we emit reuse an
+        # AEAD (key, nonce) — the nonce is the sequence (SPEC §3.3).
+        self.seq_source = SequenceSource()
+
+        # This band instance's session epoch (SPEC §4.3). Advertised in HELLO so
+        # a peer that has seen an earlier session rebases its replay watermark
+        # after we restart, instead of dropping our fresh (lower-sequence) HELLO.
+        #
+        # It MUST increase on every restart (§4.3). The default — milliseconds
+        # since the Unix epoch — is monotonic on a roughly-synced clock. A
+        # consumer whose host clock can step backward or start unset (embedded /
+        # no-RTC devices) MUST pass a persisted monotonic value instead, e.g.
+        # ``max(last_saved + 1, now_ms)``, or a peer that saw a higher epoch will
+        # refuse to rebase and lock this instance out until it ages out.
+        self.session_epoch = (
+            int(session_epoch) if session_epoch is not None
+            else int(time.time() * 1000))
 
         # Transport
         self.transport = UDPTransport(bind_address, bind_port)
 
-        # Control channel (per-peer negotiated cipher resolver)
+        # Control channel (per-peer negotiated cipher resolver). Restart of a
+        # peer (new session epoch) rebases that peer's Stream watermarks too.
         self.control = ControlChannel(self.band_id, transport=self.transport,
-                                      crypto_for=self.crypto_for_peer)
+                                      base_crypto=self.base_crypto,
+                                      send_crypto=self.send_crypto,
+                                      recv_crypto=self.recv_crypto,
+                                      seq_source=self.seq_source,
+                                      on_new_session=self._on_new_session)
 
         # Peers
         self.peers: Dict[tuple, Peer] = {}
@@ -77,6 +112,18 @@ class Band:
         self.streams: Dict[int, Stream] = {}
         self._next_stream_id = 1
 
+        # Reliable Channels (SPEC §6), keyed by channel_id. The CHANNEL
+        # transport handler is registered lazily on first use.
+        self.channels: Dict[int, Channel] = {}
+        self._channel_handler_registered = False
+
+        # Boards (§7) and Drops (§8), keyed by board_id / drop_id. Handlers
+        # registered lazily on first use, like Channel.
+        self.boards: Dict[int, "Board"] = {}
+        self._board_handler_registered = False
+        self.drops: Dict[int, object] = {}
+        self._drop_handler_registered = False
+
         # Running state
         self._running = False
         self._tasks = []
@@ -84,20 +131,35 @@ class Band:
         # Register transport handlers
         self._setup_handlers()
 
-    def _crypto_for_cipher(self, cipher_id: str) -> BandCrypto:
-        c = self._cryptos.get(cipher_id)
+    def _crypto(self, cipher_id: str, session: Optional[int]) -> BandCrypto:
+        key = (cipher_id, session)
+        c = self._cryptos.get(key)
         if c is None:
-            c = BandCrypto(self.psk, cipher_id)
-            self._cryptos[cipher_id] = c
+            c = BandCrypto(self.psk, cipher_id, session=session)
+            self._cryptos[key] = c
         return c
 
-    def crypto_for_peer(self, peer_addr: tuple, cipher_id: Optional[str] = None) -> BandCrypto:
-        """Resolve the BandCrypto for a peer's negotiated suite (SPEC §3.5).
-        `cipher_id` overrides (used for the baseline HELLO bootstrap)."""
-        if cipher_id is None:
-            peer = self.peers.get(peer_addr)
-            cipher_id = peer.cipher if (peer and peer.cipher) else BASELINE_CIPHER
-        return self._crypto_for_cipher(cipher_id)
+    def _peer_cipher(self, peer_addr: tuple) -> str:
+        peer = self.peers.get(peer_addr)
+        return peer.cipher if (peer and peer.cipher) else BASELINE_CIPHER
+
+    def base_crypto(self) -> BandCrypto:
+        """Base key (baseline suite, no session) for HELLO/HELLO_ACK (SPEC §3.5)."""
+        return self._crypto(BASELINE_CIPHER, None)
+
+    def send_crypto(self, peer_addr: tuple) -> BandCrypto:
+        """Data key for sending to a peer: our OWN session epoch + the peer's
+        negotiated suite (SPEC §3.1/§3.3)."""
+        return self._crypto(self._peer_cipher(peer_addr), self.session_epoch)
+
+    def recv_crypto(self, peer_addr: tuple) -> Optional[BandCrypto]:
+        """Data key for decrypting from a peer: the PEER's session epoch (learned
+        from its HELLO) + its negotiated suite. `None` until we've seen the
+        peer's HELLO — a data packet that arrives first is simply dropped."""
+        peer = self.peers.get(peer_addr)
+        if peer is None or peer.session_epoch < 0:
+            return None
+        return self._crypto(self._peer_cipher(peer_addr), peer.session_epoch)
 
     def _setup_handlers(self):
         """Setup packet handlers for transport"""
@@ -144,12 +206,23 @@ class Band:
     def _ensure_peer(self, peer_addr: tuple, hostname: str) -> Peer:
         peer = self.peers.get(peer_addr)
         if peer is None:
+            # Bound the registry: a replayed HELLO spoofed from many source
+            # addresses could otherwise grow it without limit before keepalive
+            # eviction catches up. Past the cap, evict the least-recently-seen
+            # peer so a genuine newcomer can still displace a stale phantom.
+            if len(self.peers) >= self.MAX_PEERS:
+                stale = min(self.peers.values(), key=lambda p: p.last_seen)
+                logger.warning(f"Peer registry full ({self.MAX_PEERS}); "
+                               f"evicting least-recently-seen {stale.address}")
+                self._remove_peer(stale.address)
             logger.info(f"Peer joined: {hostname} at {peer_addr}")
             peer = Peer(peer_addr, hostname)
             self.peers[peer_addr] = peer
             self.control.add_destination(peer_addr)
             for stream in self.streams.values():
                 stream.add_destination(peer_addr)
+            for board in self.boards.values():
+                board.add_destination(peer_addr)
         return peer
 
     def _on_hello(self, peer_addr: tuple, payload: dict):
@@ -159,22 +232,63 @@ class Band:
         selected = select_cipher(init_ciphers, self.ciphers)
 
         peer = self._ensure_peer(peer_addr, hostname)
+        # Absent session defaults to 0 (matching the Rust serde default), NOT the
+        # peer's -1 sentinel: a peer that omits the field must still get a usable
+        # epoch, else recv_crypto stays None and every data packet is dropped
+        # forever. A conformant peer always sends session (§4.3).
+        epoch = int(payload.get("session", 0))
+        if epoch < peer.session_epoch:
+            # §4.3 monotonicity: an older-epoch HELLO is a replay from before a
+            # restart. Adopting it would downgrade the peer's session key and
+            # wedge its live session, so ignore it entirely (no ACK either).
+            logger.debug(f"Ignoring stale-epoch HELLO from {peer_addr} (epoch {epoch})")
+            return
         peer.capabilities = payload.get("capabilities", [])
         peer.cipher = selected
+        peer.session_epoch = epoch
         peer.update_last_seen()
 
-        # Commit the negotiated suite back to the initiator.
+        # Commit the negotiated suite back to the initiator, with our epoch.
         self.control.send_hello_ack(self.hostname, peer_addr,
                                     capabilities=self.capabilities,
-                                    ciphers=self.ciphers, cipher=selected)
+                                    ciphers=self.ciphers, cipher=selected,
+                                    session=self.session_epoch)
 
     def _on_hello_ack(self, peer_addr: tuple, payload: dict):
         """Handle HELLO_ACK: adopt the cipher the responder committed (§3.5)."""
         hostname = payload.get("hostname", str(peer_addr))
         peer = self._ensure_peer(peer_addr, hostname)
+        epoch = int(payload.get("session", 0))  # see _on_hello: 0 default, not -1
+        if epoch < peer.session_epoch:
+            # §4.3 monotonicity — see _on_hello.
+            logger.debug(f"Ignoring stale-epoch HELLO_ACK from {peer_addr} (epoch {epoch})")
+            return
         peer.capabilities = payload.get("capabilities", [])
-        peer.cipher = payload.get("cipher", BASELINE_CIPHER)
+        committed = payload.get("cipher", BASELINE_CIPHER)
+        if committed not in self.ciphers:
+            # §3.5: the responder must commit a suite we offered. An unknown or
+            # unsupported string would derive a key we can't reproduce and wedge
+            # the data path — fall back to the mandatory baseline instead.
+            logger.warning(f"Peer {peer_addr} committed unsupported cipher "
+                           f"{committed!r}; using baseline")
+            committed = BASELINE_CIPHER
+        peer.cipher = committed
+        peer.session_epoch = epoch
         peer.update_last_seen()
+
+    def _on_new_session(self, peer_addr: tuple):
+        """A peer (re)started its session: rebase its Stream and Channel
+        watermarks so its fresh (possibly lower) sequences are accepted
+        (SPEC §3.3/§4.3). The Control watermark is rebased by the
+        ControlChannel itself."""
+        for stream in self.streams.values():
+            stream.reset_peer(peer_addr)
+        for channel in self.channels.values():
+            channel.reset_peer(peer_addr)
+        for board in self.boards.values():
+            board.reset_peer(peer_addr)
+        for drop_ep in self.drops.values():
+            drop_ep.reset_peer(peer_addr)
 
     def _on_keepalive(self, peer_addr: tuple, payload: dict):
         """Handle KEEPALIVE from peer"""
@@ -219,9 +333,13 @@ class Band:
         if stream_id in self.streams:
             return self.streams[stream_id]
 
-        # Create new stream (per-peer negotiated cipher resolver)
+        # Create new stream: per-session data keys (send=own epoch, recv=peer
+        # epoch) + the band's shared sequence source so nonces never collide
+        # with Control/other streams (SPEC §3.1/§3.3).
         stream = Stream(self.band_id, stream_id, transport=self.transport,
-                        priority=priority, crypto_for=self.crypto_for_peer)
+                        priority=priority,
+                        send_crypto=self.send_crypto, recv_crypto=self.recv_crypto,
+                        seq_source=self.seq_source)
 
         # Add all current peers as destinations
         for peer_addr in self.peers.keys():
@@ -231,6 +349,152 @@ class Band:
         logger.info(f"Opened stream {stream_id} with priority {priority}")
 
         return stream
+
+    def channel(self, channel_id: int, peer_addr: tuple) -> Channel:
+        """
+        Open or get a reliable Channel to a peer (SPEC §6)
+
+        Args:
+            channel_id: Channel ID (0-65535)
+            peer_addr: (host, port) of the single peer this channel talks to
+
+        Returns:
+            Channel instance (call `await channel.open()` to start the §6.3
+            handshake on the initiating side)
+        """
+        if channel_id in self.channels:
+            return self.channels[channel_id]
+
+        # Per-session data keys (send=own epoch, recv=peer epoch) + the band's
+        # shared sequence source, so Channel outer sequences (= AEAD nonces)
+        # never collide with Control/Stream traffic (SPEC §3.1/§3.3).
+        channel = Channel(self.band_id, channel_id, peer_addr,
+                          transport=self.transport,
+                          send_crypto=self.send_crypto,
+                          recv_crypto=self.recv_crypto,
+                          seq_source=self.seq_source)
+        self.channels[channel_id] = channel
+        self._register_channel_handler()
+        logger.info(f"Opened channel {channel_id} to {peer_addr}")
+        return channel
+
+    def _register_channel_handler(self):
+        """Register CHANNEL routing on first use (idempotent)."""
+        if self._channel_handler_registered:
+            return
+        self._channel_handler_registered = True
+
+        def handle_channel(peer_addr, packet_bytes):
+            if peer_addr in self.peers:
+                self.peers[peer_addr].update_last_seen()
+            from .protocol.framing import unpack_packet
+            try:
+                packet = unpack_packet(packet_bytes)
+            except ValueError:
+                return
+            channel = self.channels.get(packet.channel_id)
+            if channel is None:
+                logger.warning(f"No channel with ID {packet.channel_id}")
+                return
+            # A channel is bound to one peer; another sender's packet on this
+            # channel_id must not reach its state machine.
+            if peer_addr != channel.peer_addr:
+                logger.debug(f"Dropping channel {packet.channel_id} packet "
+                             f"from non-peer {peer_addr}")
+                return
+            channel.handle_packet(peer_addr, packet_bytes)
+
+        self.transport.register_handler(ChannelType.CHANNEL, handle_channel)
+
+    def board(self, board_id: int) -> "Board":
+        """
+        Open or get a replicated Board (SPEC §7)
+
+        Every known peer is a replication destination; new peers are added as
+        they HELLO. Advertises `board-v1` (§12.5).
+        """
+        from .protocol.board import Board
+        if board_id in self.boards:
+            return self.boards[board_id]
+        board = Board(self.band_id, board_id, self.hostname,
+                      transport=self.transport,
+                      send_crypto=self.send_crypto,
+                      recv_crypto=self.recv_crypto,
+                      seq_source=self.seq_source)
+        for peer_addr in self.peers:
+            board.add_destination(peer_addr)
+        self.boards[board_id] = board
+        if "board-v1" not in self.capabilities:
+            self.capabilities.append("board-v1")
+        self._register_board_handler()
+        return board
+
+    def _register_board_handler(self):
+        if self._board_handler_registered:
+            return
+        self._board_handler_registered = True
+
+        def handle_board(peer_addr, packet_bytes):
+            if peer_addr in self.peers:
+                self.peers[peer_addr].update_last_seen()
+            from .protocol.framing import unpack_packet
+            try:
+                packet = unpack_packet(packet_bytes)
+            except ValueError:
+                return
+            board = self.boards.get(packet.channel_id)
+            if board is not None:
+                board.handle_packet(peer_addr, packet_bytes)
+
+        self.transport.register_handler(ChannelType.BOARD, handle_board)
+
+    def drop_sender(self, drop_id: int, name: str, data: bytes) -> "DropSender":
+        """Offer a file on a Drop (SPEC §8). Advertises `drop-v1` (§12.5)."""
+        from .protocol.drop import DropSender
+        sender = DropSender(self.band_id, drop_id, name, data,
+                            transport=self.transport,
+                            send_crypto=self.send_crypto,
+                            recv_crypto=self.recv_crypto,
+                            seq_source=self.seq_source)
+        self.drops[drop_id] = sender
+        if "drop-v1" not in self.capabilities:
+            self.capabilities.append("drop-v1")
+        self._register_drop_handler()
+        return sender
+
+    def drop_receiver(self, drop_id: int, have=None) -> "DropReceiver":
+        """Receive a file offered on a Drop (SPEC §8); `have` resumes from
+        persisted chunks."""
+        from .protocol.drop import DropReceiver
+        receiver = DropReceiver(self.band_id, drop_id, have=have,
+                                transport=self.transport,
+                                send_crypto=self.send_crypto,
+                                recv_crypto=self.recv_crypto,
+                                seq_source=self.seq_source)
+        self.drops[drop_id] = receiver
+        if "drop-v1" not in self.capabilities:
+            self.capabilities.append("drop-v1")
+        self._register_drop_handler()
+        return receiver
+
+    def _register_drop_handler(self):
+        if self._drop_handler_registered:
+            return
+        self._drop_handler_registered = True
+
+        def handle_drop(peer_addr, packet_bytes):
+            if peer_addr in self.peers:
+                self.peers[peer_addr].update_last_seen()
+            from .protocol.framing import unpack_packet
+            try:
+                packet = unpack_packet(packet_bytes)
+            except ValueError:
+                return
+            endpoint = self.drops.get(packet.channel_id)
+            if endpoint is not None:
+                endpoint.handle_packet(peer_addr, packet_bytes)
+
+        self.transport.register_handler(ChannelType.DROP, handle_drop)
 
     def connect_peer(self, host: str, port: int):
         """
@@ -242,9 +506,11 @@ class Band:
         """
         peer_addr = (host, port)
 
-        # Send HELLO advertising our capabilities + ordered ciphers (§3.5)
+        # Send HELLO advertising our capabilities + ordered ciphers (§3.5) and
+        # our session epoch (§4.3).
         self.control.send_hello(self.hostname, peer_addr,
-                                capabilities=self.capabilities, ciphers=self.ciphers)
+                                capabilities=self.capabilities, ciphers=self.ciphers,
+                                session=self.session_epoch)
         logger.info(f"Connecting to peer at {peer_addr}")
 
     def get_peers(self) -> List[Peer]:
@@ -288,11 +554,18 @@ class Band:
         self.control.send_goodbye()
         await asyncio.sleep(0.1)  # Give time for goodbye to send
 
+        # Cancel per-Channel retransmit tasks: they hold the transport and would
+        # keep resending (and stay alive) after the socket closes otherwise.
+        channel_tasks = [c._retransmit_task for c in self.channels.values()
+                         if c._retransmit_task is not None]
+        for t in channel_tasks:
+            t.cancel()
+
         # Stop tasks
         for task in self._tasks:
             task.cancel()
 
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        await asyncio.gather(*self._tasks, *channel_tasks, return_exceptions=True)
 
         # Stop transport
         await self.transport.stop()

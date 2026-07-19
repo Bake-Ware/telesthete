@@ -108,5 +108,151 @@
         "01abababababababababababababababab000100020304"
       ]
     }
+  ],
+  "session_keys": {
+    "_comment": "Per-session data keys: HKDF info = 'encryption-'+cipher+'-session-'+epoch(8 BE). SPEC \u00a73.1/\u00a73.3.",
+    "vectors": [
+      {
+        "cipher": "chacha20-poly1305",
+        "session": 1,
+        "key_hex": "9e0f0ed432ecf3f18eae75326875a922c3b3a2ad0e77ef5a907012fa16341d82"
+      },
+      {
+        "cipher": "chacha20-poly1305",
+        "session": 1737158400123,
+        "key_hex": "1bc98368db951994615c384b806d94de1135340e076a4a47b4cc1d57399ba045"
+      },
+      {
+        "cipher": "aes256-gcm",
+        "session": 1,
+        "key_hex": "4a50a06daaeede63f231ef2bb7ded09dc59f0d7cc34abe3ada4cb5f46dfa14e0"
+      },
+      {
+        "cipher": "aes256-gcm",
+        "session": 1737158400123,
+        "key_hex": "984ffb52aed25236e191cd6393169fa304ccac092ed617ac65f04e1359e912c5"
+      }
+    ]
+  },
+  "stream_header": [
+    {
+      "flags": 1,
+      "frame_id": 0,
+      "packed_hex": "0100000000000000"
+    },
+    {
+      "flags": 6,
+      "frame_id": 3735928559,
+      "packed_hex": "06000000deadbeef"
+    },
+    {
+      "flags": 48,
+      "frame_id": 7,
+      "packed_hex": "3000000000000007"
+    },
+    {
+      "flags": 8,
+      "frame_id": 16909060,
+      "packed_hex": "0800000001020304"
+    }
+  ],
+  "dmabuf": [
+    {
+      "width": 1920,
+      "height": 1080,
+      "fourcc": "XR24",
+      "modifier": "0000000000000000",
+      "planes": [
+        {
+          "offset": 0,
+          "stride": 7680,
+          "fd_index": 0
+        }
+      ],
+      "fd_count": 1,
+      "packed_hex": "000007800000043858523234000000000000000001010000000000001e0000"
+    },
+    {
+      "width": 3840,
+      "height": 2160,
+      "fourcc": "NV12",
+      "modifier": "ffff000102030405",
+      "planes": [
+        {
+          "offset": 0,
+          "stride": 3840,
+          "fd_index": 0
+        },
+        {
+          "offset": 8294400,
+          "stride": 3840,
+          "fd_index": 0
+        }
+      ],
+      "fd_count": 2,
+      "packed_hex": "00000f00000008704e563132ffff00010203040502020000000000000f0000007e900000000f0000"
+    }
+  ],
+  "channel_frame": [
+    {
+      "flags": 1,
+      "ack_num": 0,
+      "window": 32,
+      "seq": 0,
+      "data_hex": "",
+      "packed_hex": "01000000000000000000200000000000000000"
+    },
+    {
+      "flags": 4,
+      "ack_num": 1,
+      "window": 32,
+      "seq": 5,
+      "data_hex": "68656c6c6f",
+      "packed_hex": "0400000000000000010020000000000000000568656c6c6f"
+    }
+  ],
+  "board_digest": [
+    {
+      "entries": [
+        {
+          "key": "alpha",
+          "lamport": 1,
+          "actor": "alice",
+          "deleted": false
+        },
+        {
+          "key": "beta",
+          "lamport": 2,
+          "actor": "bob",
+          "deleted": false
+        }
+      ],
+      "count": 2,
+      "hash": "d18a4f0a2660047d273372990ca14fed2c93d5911990bdce43f9aafbde0bbd10"
+    },
+    {
+      "entries": [
+        {
+          "key": "zeta",
+          "lamport": 5,
+          "actor": "host-2",
+          "deleted": true
+        },
+        {
+          "key": "alpha",
+          "lamport": 3,
+          "actor": "host-1",
+          "deleted": false
+        },
+        {
+          "key": "mid/key",
+          "lamport": 9223372036854775813,
+          "actor": "host-3",
+          "deleted": false
+        }
+      ],
+      "count": 3,
+      "hash": "2b43690b607f5bf427d3fc5d6ae458bd20cb76772112a10e8b2694aef0c29fa9"
+    }
   ]
 }
