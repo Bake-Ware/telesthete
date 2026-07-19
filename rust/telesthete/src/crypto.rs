@@ -113,8 +113,14 @@ pub fn build_aad(channel_type: u8, channel_id: u16) -> [u8; 3] {
 /// Falls back to the mandatory baseline (both MUST support it), so it never
 /// fails. Mirrors `telesthete.protocol.crypto.select_cipher`.
 pub fn select_cipher(initiator_prefs: &[String], responder_supported: &[String]) -> String {
+    // SPEC §3.5 rule 2 / §12.5: both lists MUST include the mandatory baseline.
+    // A list that omits it is non-conformant; normalize by treating the baseline
+    // as always supported (it is mandatory) so selection never fails.
+    if !responder_supported.iter().any(|s| s == BASELINE_CIPHER) {
+        tracing::warn!("cipher list omits the mandatory baseline (SPEC §12.5)");
+    }
     for cid in initiator_prefs {
-        if responder_supported.iter().any(|s| s == cid) {
+        if cid == BASELINE_CIPHER || responder_supported.iter().any(|s| s == cid) {
             return cid.clone();
         }
     }

@@ -57,6 +57,10 @@ pub struct Hello {
     /// Ordered AEAD preference list (§3.5). MUST include the baseline.
     #[serde(default)]
     pub ciphers: Vec<String>,
+    /// Monotonic session epoch (§4.3). A newer value rebases the receiver's
+    /// replay watermark after a restart; `default` -> 0 for older peers.
+    #[serde(default)]
+    pub session: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -69,6 +73,9 @@ pub struct HelloAck {
     /// Committed negotiated suite, chosen by the responder (§3.5).
     #[serde(default)]
     pub cipher: String,
+    /// Monotonic session epoch (§4.3), as in [`Hello`].
+    #[serde(default)]
+    pub session: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -115,6 +122,9 @@ struct ControlEnvelope {
 pub struct ControlChannel {
     transport: Arc<Transport>,
     inbound: mpsc::UnboundedReceiver<ControlEvent>,
+    /// This sender's session epoch (§4.3), advertised in HELLO/HELLO_ACK so a
+    /// peer rebases its replay watermark when we restart.
+    session: u64,
 }
 
 impl ControlChannel {
@@ -126,62 +136,87 @@ impl ControlChannel {
             // Transport already authenticated the packet, so a forged seq never
             // reaches here; advancing on receipt is safe.
             let mut watermark: HashMap<SocketAddr, u64> = HashMap::new();
+            let mut sessions: HashMap<SocketAddr, u64> = HashMap::new();
             while let Some(pkt) = raw.recv().await {
                 let seq = pkt.header.sequence;
+                // Parse first (on already-authenticated plaintext): a HELLO /
+                // HELLO_ACK carrying a newer session epoch (§3.3/§4.3) rebases
+                // this peer's replay watermark BEFORE the replay check, so a
+                // restarted peer's fresh (possibly lower) sequence is accepted
+                // rather than locked out.
+                let env = match serde_json::from_slice::<ControlEnvelope>(&pkt.payload) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        debug!("bad control envelope from {}: {e}", pkt.from);
+                        continue;
+                    }
+                };
+                if env.type_ == TYPE_HELLO || env.type_ == TYPE_HELLO_ACK {
+                    let ep = env
+                        .payload
+                        .get("session")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    if sessions.get(&pkt.from).map_or(true, |&prev| ep > prev) {
+                        sessions.insert(pkt.from, ep);
+                        watermark.remove(&pkt.from);
+                    }
+                }
+                // Replay protection (SPEC §3.3): accept the first packet seen
+                // from a peer at its random start, then strictly increasing.
                 if matches!(watermark.get(&pkt.from), Some(&wm) if seq <= wm) {
                     debug!("drop replayed/stale control seq={seq} from {}", pkt.from);
                     continue;
                 }
                 watermark.insert(pkt.from, seq);
-                match serde_json::from_slice::<ControlEnvelope>(&pkt.payload) {
-                    Ok(env) => {
-                        let event = match env.type_ {
-                            TYPE_HELLO => match serde_json::from_value::<Hello>(env.payload) {
-                                Ok(h) => ControlEvent::Hello {
-                                    from: pkt.from,
-                                    hostname: h.hostname,
-                                    capabilities: h.capabilities,
-                                    ciphers: h.ciphers,
-                                },
-                                Err(e) => {
-                                    debug!("bad HELLO: {e}");
-                                    continue;
-                                }
-                            },
-                            TYPE_HELLO_ACK => match serde_json::from_value::<HelloAck>(env.payload)
-                            {
-                                Ok(h) => ControlEvent::HelloAck {
-                                    from: pkt.from,
-                                    hostname: h.hostname,
-                                    capabilities: h.capabilities,
-                                    ciphers: h.ciphers,
-                                    cipher: h.cipher,
-                                },
-                                Err(e) => {
-                                    debug!("bad HELLO_ACK: {e}");
-                                    continue;
-                                }
-                            },
-                            TYPE_KEEPALIVE => ControlEvent::Keepalive { from: pkt.from },
-                            TYPE_GOODBYE => ControlEvent::Goodbye { from: pkt.from },
-                            _ => ControlEvent::Other {
-                                from: pkt.from,
-                                type_: env.type_,
-                                payload: env.payload,
-                            },
-                        };
-                        if tx.send(event).is_err() {
-                            return;
+                let event = match env.type_ {
+                    TYPE_HELLO => match serde_json::from_value::<Hello>(env.payload) {
+                        Ok(h) => ControlEvent::Hello {
+                            from: pkt.from,
+                            hostname: h.hostname,
+                            capabilities: h.capabilities,
+                            ciphers: h.ciphers,
+                        },
+                        Err(e) => {
+                            debug!("bad HELLO: {e}");
+                            continue;
                         }
-                    }
-                    Err(e) => debug!("bad control envelope from {}: {e}", pkt.from),
+                    },
+                    TYPE_HELLO_ACK => match serde_json::from_value::<HelloAck>(env.payload) {
+                        Ok(h) => ControlEvent::HelloAck {
+                            from: pkt.from,
+                            hostname: h.hostname,
+                            capabilities: h.capabilities,
+                            ciphers: h.ciphers,
+                            cipher: h.cipher,
+                        },
+                        Err(e) => {
+                            debug!("bad HELLO_ACK: {e}");
+                            continue;
+                        }
+                    },
+                    TYPE_KEEPALIVE => ControlEvent::Keepalive { from: pkt.from },
+                    TYPE_GOODBYE => ControlEvent::Goodbye { from: pkt.from },
+                    _ => ControlEvent::Other {
+                        from: pkt.from,
+                        type_: env.type_,
+                        payload: env.payload,
+                    },
+                };
+                if tx.send(event).is_err() {
+                    return;
                 }
             }
         });
 
+        let session = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         Self {
             transport,
             inbound: rx,
+            session,
         }
     }
 
@@ -207,6 +242,7 @@ impl ControlChannel {
                 hostname: hostname.into(),
                 capabilities: capabilities.iter().map(|s| (*s).to_string()).collect(),
                 ciphers: ciphers.iter().map(|s| (*s).to_string()).collect(),
+                session: self.session,
             },
         )
         .await
@@ -245,6 +281,7 @@ impl ControlChannel {
                 capabilities: capabilities.iter().map(|s| (*s).to_string()).collect(),
                 ciphers: ciphers.iter().map(|s| (*s).to_string()).collect(),
                 cipher: cipher.into(),
+                session: self.session,
             },
         )
         .await
@@ -298,11 +335,43 @@ mod tests {
             hostname: "alice".into(),
             capabilities: vec![capability::AF_UNIX.into(), capability::WEBTRANSPORT.into()],
             ciphers: vec!["aes256-gcm".into(), "chacha20-poly1305".into()],
+            session: 0,
         };
         let parsed: Hello = serde_json::from_str(&serde_json::to_string(&h).unwrap()).unwrap();
         assert_eq!(parsed.hostname, "alice");
         assert_eq!(parsed.capabilities, h.capabilities);
         assert_eq!(parsed.ciphers, h.ciphers);
+    }
+
+    #[test]
+    fn hello_round_trips_session_epoch() {
+        // §4.3 restart-safety field survives serialize/parse; absent -> 0.
+        let h = Hello {
+            hostname: "a".into(),
+            capabilities: vec![],
+            ciphers: vec!["chacha20-poly1305".into()],
+            session: 1_737_000_000_000,
+        };
+        let parsed: Hello = serde_json::from_str(&serde_json::to_string(&h).unwrap()).unwrap();
+        assert_eq!(parsed.session, 1_737_000_000_000);
+        let minimal: Hello = serde_json::from_str(r#"{"hostname":"b"}"#).unwrap();
+        assert_eq!(minimal.session, 0);
+    }
+
+    #[test]
+    fn select_cipher_normalizes_missing_baseline() {
+        // §3.5/§12.5: a responder list without the baseline still resolves.
+        assert_eq!(
+            select_cipher(&["chacha20-poly1305".into()], &["aes256-gcm".into()]),
+            "chacha20-poly1305"
+        );
+        assert_eq!(
+            select_cipher(
+                &["aes256-gcm".into()],
+                &["aes256-gcm".into(), "chacha20-poly1305".into()]
+            ),
+            "aes256-gcm"
+        );
     }
 
     #[test]
@@ -330,6 +399,7 @@ mod tests {
             capabilities: vec![],
             ciphers: vec!["chacha20-poly1305".into()],
             cipher: "aes256-gcm".into(),
+            session: 0,
         };
         let parsed: HelloAck = serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
         assert_eq!(parsed.cipher, "aes256-gcm");

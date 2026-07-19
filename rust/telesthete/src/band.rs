@@ -42,6 +42,10 @@ pub struct Band {
     hostname: String,
     key: Key,
     band_id: BandId,
+    /// This Band instance's session epoch (§4.3), fixed at creation and
+    /// advertised in HELLO so a peer rebases its replay watermark when we
+    /// restart.
+    session: u64,
     _recv_loop: JoinHandle<()>,
 }
 
@@ -61,6 +65,11 @@ impl Band {
         let channel_hub = ChannelHub::new(Arc::clone(&transport)).await;
         let control = ControlChannel::new(Arc::clone(&transport)).await;
 
+        let session = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
         Ok(Self {
             transport,
             stream_hub,
@@ -69,6 +78,7 @@ impl Band {
             hostname: hostname.into(),
             key,
             band_id,
+            session,
             _recv_loop: recv_loop,
         })
     }
@@ -99,6 +109,7 @@ impl Band {
                 hostname: self.hostname.clone(),
                 capabilities: Vec::new(),
                 ciphers: vec![crate::crypto::BASELINE_CIPHER.to_string()],
+                session: self.session,
             }
         });
         let bytes = serde_json::to_vec(&env).map_err(crate::control::ControlError::from)?;
