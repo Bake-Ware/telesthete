@@ -128,22 +128,23 @@ pub struct ControlChannel {
 }
 
 impl ControlChannel {
-    pub async fn new(transport: Arc<Transport>) -> Self {
+    pub async fn new(
+        transport: Arc<Transport>,
+        psk: Vec<u8>,
+        session: u64,
+        rebase_tx: tokio::sync::broadcast::Sender<SocketAddr>,
+    ) -> Self {
         let mut raw = transport.route(ChannelType::Control).await;
         let (tx, rx) = mpsc::unbounded_channel();
+        let task_transport = Arc::clone(&transport);
         tokio::spawn(async move {
-            // Replay protection (SPEC §3.3): highest accepted sequence per peer.
-            // Transport already authenticated the packet, so a forged seq never
-            // reaches here; advancing on receipt is safe.
+            // Replay protection (SPEC §3.3): highest accepted sequence per peer;
+            // `sessions` tracks each peer's epoch for restart rebase. Transport
+            // already authenticated the packet, so this runs on trusted plaintext.
             let mut watermark: HashMap<SocketAddr, u64> = HashMap::new();
             let mut sessions: HashMap<SocketAddr, u64> = HashMap::new();
             while let Some(pkt) = raw.recv().await {
                 let seq = pkt.header.sequence;
-                // Parse first (on already-authenticated plaintext): a HELLO /
-                // HELLO_ACK carrying a newer session epoch (§3.3/§4.3) rebases
-                // this peer's replay watermark BEFORE the replay check, so a
-                // restarted peer's fresh (possibly lower) sequence is accepted
-                // rather than locked out.
                 let env = match serde_json::from_slice::<ControlEnvelope>(&pkt.payload) {
                     Ok(e) => e,
                     Err(e) => {
@@ -151,68 +152,93 @@ impl ControlChannel {
                         continue;
                     }
                 };
-                if env.type_ == TYPE_HELLO || env.type_ == TYPE_HELLO_ACK {
-                    let ep = env
-                        .payload
-                        .get("session")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    if sessions.get(&pkt.from).map_or(true, |&prev| ep > prev) {
-                        sessions.insert(pkt.from, ep);
-                        watermark.remove(&pkt.from);
+                match env.type_ {
+                    TYPE_HELLO | TYPE_HELLO_ACK => {
+                        // Parse the typed body FIRST so a bad-body packet never
+                        // mutates replay/session state.
+                        let (event, ep) = if env.type_ == TYPE_HELLO {
+                            match serde_json::from_value::<Hello>(env.payload) {
+                                Ok(h) => (
+                                    ControlEvent::Hello {
+                                        from: pkt.from,
+                                        hostname: h.hostname,
+                                        capabilities: h.capabilities,
+                                        ciphers: h.ciphers,
+                                    },
+                                    h.session,
+                                ),
+                                Err(e) => {
+                                    debug!("bad HELLO: {e}");
+                                    continue;
+                                }
+                            }
+                        } else {
+                            match serde_json::from_value::<HelloAck>(env.payload) {
+                                Ok(h) => (
+                                    ControlEvent::HelloAck {
+                                        from: pkt.from,
+                                        hostname: h.hostname,
+                                        capabilities: h.capabilities,
+                                        ciphers: h.ciphers,
+                                        cipher: h.cipher,
+                                    },
+                                    h.session,
+                                ),
+                                Err(e) => {
+                                    debug!("bad HELLO_ACK: {e}");
+                                    continue;
+                                }
+                            }
+                        };
+                        // Session (re)start (SPEC §3.3/§4.3): a strictly-newer
+                        // epoch re-keys the peer (new data key via
+                        // register_peer_key), clears its control watermark, and
+                        // signals the StreamHub to clear its stream watermarks —
+                        // so a restarted peer is accepted and its old-session
+                        // packets fail authentication under the new key.
+                        if sessions.get(&pkt.from).map_or(true, |&prev| ep > prev) {
+                            sessions.insert(pkt.from, ep);
+                            let peer_key = crate::crypto::derive_session_key(
+                                &psk,
+                                crate::crypto::BASELINE_CIPHER,
+                                ep,
+                            );
+                            task_transport.register_peer_key(pkt.from, peer_key).await;
+                            watermark.remove(&pkt.from);
+                            let _ = rebase_tx.send(pkt.from);
+                        }
+                        if matches!(watermark.get(&pkt.from), Some(&wm) if seq <= wm) {
+                            debug!("drop replayed control HELLO seq={seq} from {}", pkt.from);
+                            continue;
+                        }
+                        watermark.insert(pkt.from, seq);
+                        if tx.send(event).is_err() {
+                            return;
+                        }
                     }
-                }
-                // Replay protection (SPEC §3.3): accept the first packet seen
-                // from a peer at its random start, then strictly increasing.
-                if matches!(watermark.get(&pkt.from), Some(&wm) if seq <= wm) {
-                    debug!("drop replayed/stale control seq={seq} from {}", pkt.from);
-                    continue;
-                }
-                watermark.insert(pkt.from, seq);
-                let event = match env.type_ {
-                    TYPE_HELLO => match serde_json::from_value::<Hello>(env.payload) {
-                        Ok(h) => ControlEvent::Hello {
-                            from: pkt.from,
-                            hostname: h.hostname,
-                            capabilities: h.capabilities,
-                            ciphers: h.ciphers,
-                        },
-                        Err(e) => {
-                            debug!("bad HELLO: {e}");
+                    _ => {
+                        if matches!(watermark.get(&pkt.from), Some(&wm) if seq <= wm) {
+                            debug!("drop replayed/stale control seq={seq} from {}", pkt.from);
                             continue;
                         }
-                    },
-                    TYPE_HELLO_ACK => match serde_json::from_value::<HelloAck>(env.payload) {
-                        Ok(h) => ControlEvent::HelloAck {
-                            from: pkt.from,
-                            hostname: h.hostname,
-                            capabilities: h.capabilities,
-                            ciphers: h.ciphers,
-                            cipher: h.cipher,
-                        },
-                        Err(e) => {
-                            debug!("bad HELLO_ACK: {e}");
-                            continue;
+                        watermark.insert(pkt.from, seq);
+                        let event = match env.type_ {
+                            TYPE_KEEPALIVE => ControlEvent::Keepalive { from: pkt.from },
+                            TYPE_GOODBYE => ControlEvent::Goodbye { from: pkt.from },
+                            _ => ControlEvent::Other {
+                                from: pkt.from,
+                                type_: env.type_,
+                                payload: env.payload,
+                            },
+                        };
+                        if tx.send(event).is_err() {
+                            return;
                         }
-                    },
-                    TYPE_KEEPALIVE => ControlEvent::Keepalive { from: pkt.from },
-                    TYPE_GOODBYE => ControlEvent::Goodbye { from: pkt.from },
-                    _ => ControlEvent::Other {
-                        from: pkt.from,
-                        type_: env.type_,
-                        payload: env.payload,
-                    },
-                };
-                if tx.send(event).is_err() {
-                    return;
+                    }
                 }
             }
         });
 
-        let session = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
         Self {
             transport,
             inbound: rx,
@@ -313,6 +339,9 @@ impl ControlChannel {
                 channel_id: 0,
                 plaintext: bytes,
                 priority: 0,
+                // HELLO/HELLO_ACK use the base key so a receiver can bootstrap
+                // our epoch; other control messages use the session data key.
+                use_base_key: matches!(type_, TYPE_HELLO | TYPE_HELLO_ACK),
             })
             .await?;
         Ok(())

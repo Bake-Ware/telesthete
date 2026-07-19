@@ -54,6 +54,7 @@ impl StreamEndpoint {
                 channel_id: self.stream_id,
                 plaintext: payload,
                 priority,
+                use_base_key: false,
             })
             .await?;
         Ok(())
@@ -73,7 +74,10 @@ pub struct StreamHub {
 }
 
 impl StreamHub {
-    pub async fn new(transport: Arc<Transport>) -> Self {
+    pub async fn new(
+        transport: Arc<Transport>,
+        mut rebase_rx: tokio::sync::broadcast::Receiver<SocketAddr>,
+    ) -> Self {
         let inbound = transport.route(ChannelType::Stream).await;
         let senders: Arc<Mutex<HashMap<u16, mpsc::UnboundedSender<StreamMessage>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -81,19 +85,34 @@ impl StreamHub {
             Arc::new(Mutex::new(HashMap::new()));
 
         let senders_ref = Arc::clone(&senders);
+        let wm = Arc::clone(&watermarks);
         tokio::spawn(async move {
             let mut rx = inbound;
-            while let Some(in_pkt) = rx.recv().await {
-                if let Some(msg) = handle_stream_inbound(&in_pkt, &watermarks).await {
-                    let senders = senders_ref.lock().await;
-                    if let Some(tx) = senders.get(&in_pkt.header.channel_id) {
-                        let _ = tx.send(msg);
-                    } else {
-                        debug!(
-                            "no Stream subscriber for stream_id={}",
-                            in_pkt.header.channel_id
-                        );
-                    }
+            loop {
+                tokio::select! {
+                    pkt = rx.recv() => match pkt {
+                        Some(in_pkt) => {
+                            if let Some(msg) = handle_stream_inbound(&in_pkt, &wm).await {
+                                let senders = senders_ref.lock().await;
+                                if let Some(tx) = senders.get(&in_pkt.header.channel_id) {
+                                    let _ = tx.send(msg);
+                                } else {
+                                    debug!(
+                                        "no Stream subscriber for stream_id={}",
+                                        in_pkt.header.channel_id
+                                    );
+                                }
+                            }
+                        }
+                        None => break,
+                    },
+                    // Peer restarted (SPEC §3.3/§4.3): clear its stream watermarks
+                    // so its fresh-session packets (new random start) are accepted.
+                    peer = rebase_rx.recv() => match peer {
+                        Ok(addr) => { wm.lock().await.retain(|(a, _), _| *a != addr); }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    },
                 }
             }
         });

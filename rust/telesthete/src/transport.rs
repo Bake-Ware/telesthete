@@ -37,6 +37,9 @@ pub struct Outbound {
     pub plaintext: Vec<u8>,
     /// Priority hint (lower = higher priority). Currently informational only.
     pub priority: u8,
+    /// Encrypt under the base key rather than the session data key. Set for
+    /// HELLO/HELLO_ACK so a receiver can bootstrap our epoch (SPEC §3.1/§3.3).
+    pub use_base_key: bool,
 }
 
 #[derive(Debug, Error)]
@@ -81,7 +84,15 @@ impl Default for SequenceCounter {
 /// UDP transport runtime. Owns the socket and the send/recv loops.
 pub struct Transport {
     socket: Arc<UdpSocket>,
-    key: Key,
+    /// Base key (HELLO/HELLO_ACK). Also the send/recv key until a session is
+    /// configured, so a plain `bind` behaves exactly as before.
+    base_key: Key,
+    /// Our own per-session data key for sending non-HELLO packets (SPEC §3.3).
+    /// Defaults to `base_key`; set via [`Self::set_session_key`].
+    session_key: Key,
+    /// Per-peer session data keys (derived from each peer's HELLO epoch) used to
+    /// decrypt that peer's data packets. Updated on restart.
+    peer_keys: Arc<Mutex<HashMap<SocketAddr, Key>>>,
     band_id: [u8; 16],
     seq: Arc<SequenceCounter>,
     /// Per-channel-type inbound dispatch (control, stream, channel).
@@ -94,11 +105,26 @@ impl Transport {
         debug!("telesthete transport bound on {}", socket.local_addr()?);
         Ok(Self {
             socket,
-            key,
+            base_key: key,
+            session_key: key, // no session configured yet -> data uses base key
+            peer_keys: Arc::new(Mutex::new(HashMap::new())),
             band_id,
             seq: Arc::new(SequenceCounter::default()),
             routes: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Configure our own per-session data key (SPEC §3.3), used for all sent
+    /// non-HELLO packets. Call once, before the transport is shared/used.
+    pub fn set_session_key(&mut self, key: Key) {
+        self.session_key = key;
+    }
+
+    /// Register (or replace) a peer's per-session data key, derived from the
+    /// epoch in its HELLO. Used to decrypt that peer's data packets; replacing
+    /// it on a restart makes the peer's old-session packets fail authentication.
+    pub async fn register_peer_key(&self, addr: SocketAddr, key: Key) {
+        self.peer_keys.lock().await.insert(addr, key);
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -117,11 +143,18 @@ impl Transport {
         rx
     }
 
-    /// Encrypt + send one packet.
+    /// Encrypt + send one packet. HELLO/HELLO_ACK (`use_base_key`) go under the
+    /// base key so a receiver can bootstrap our epoch; everything else uses our
+    /// per-session data key (SPEC §3.1/§3.3).
     pub async fn send(&self, out: Outbound) -> Result<(), TransportError> {
         let seq = self.seq.next();
+        let key = if out.use_base_key {
+            &self.base_key
+        } else {
+            &self.session_key
+        };
         let pkt = encode_packet(
-            &self.key,
+            key,
             &self.band_id,
             out.channel_type,
             out.channel_id,
@@ -137,7 +170,8 @@ impl Transport {
     pub fn spawn_recv_loop(&self) -> tokio::task::JoinHandle<()> {
         let socket = Arc::clone(&self.socket);
         let routes = Arc::clone(&self.routes);
-        let key = self.key;
+        let base_key = self.base_key;
+        let peer_keys = Arc::clone(&self.peer_keys);
         let band_id = self.band_id;
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65_535];
@@ -149,10 +183,18 @@ impl Transport {
                         continue;
                     }
                 };
-                let (header, payload) = match decode_packet(&key, &buf[..n]) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        debug!("decode_packet from {from} failed: {e}");
+                // Try the peer's session data key first (its data packets), then
+                // the base key (its HELLO/HELLO_ACK). An old-session packet after
+                // a restart fails both — its epoch's key is gone — so it is
+                // dropped (SPEC §3.3).
+                let peer_key = peer_keys.lock().await.get(&from).copied();
+                let (header, payload) = match peer_key
+                    .and_then(|k| decode_packet(&k, &buf[..n]).ok())
+                    .or_else(|| decode_packet(&base_key, &buf[..n]).ok())
+                {
+                    Some(v) => v,
+                    None => {
+                        debug!("decode_packet from {from} failed under all keys");
                         continue;
                     }
                 };
@@ -214,6 +256,7 @@ mod tests {
                 channel_id: 1,
                 plaintext: b"hello bob".to_vec(),
                 priority: 0,
+                use_base_key: false,
             })
             .await
             .unwrap();
@@ -251,6 +294,7 @@ mod tests {
                 channel_id: 1,
                 plaintext: b"foreign".to_vec(),
                 priority: 0,
+                use_base_key: false,
             })
             .await
             .unwrap();

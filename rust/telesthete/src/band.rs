@@ -56,19 +56,34 @@ impl Band {
         bind_addr: SocketAddr,
         hostname: impl Into<String>,
     ) -> Result<Self, BandError> {
-        let key = derive_key(psk);
+        let base_key = derive_key(psk);
         let band_id = derive_band_id(psk);
-        let transport = Arc::new(Transport::bind(bind_addr, key, band_id).await?);
-        let recv_loop = transport.spawn_recv_loop();
 
-        let stream_hub = StreamHub::new(Arc::clone(&transport)).await;
-        let channel_hub = ChannelHub::new(Arc::clone(&transport)).await;
-        let control = ControlChannel::new(Arc::clone(&transport)).await;
-
+        // One session epoch for this Band instance (§4.3), sampled once and used
+        // for our data key, our HELLO payloads, and connect_peer — so a peer
+        // never sees two different epochs from us.
         let session = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+
+        let mut transport = Transport::bind(bind_addr, base_key, band_id).await?;
+        transport.set_session_key(crate::crypto::derive_session_key(
+            psk,
+            crate::crypto::BASELINE_CIPHER,
+            session,
+        ));
+        let transport = Arc::new(transport);
+        let recv_loop = transport.spawn_recv_loop();
+
+        // The control task signals a peer restart here; the StreamHub clears that
+        // peer's stream watermarks so its fresh-session packets are accepted.
+        let (rebase_tx, _rebase_rx) = tokio::sync::broadcast::channel::<SocketAddr>(64);
+
+        let stream_hub = StreamHub::new(Arc::clone(&transport), rebase_tx.subscribe()).await;
+        let channel_hub = ChannelHub::new(Arc::clone(&transport)).await;
+        let control =
+            ControlChannel::new(Arc::clone(&transport), psk.to_vec(), session, rebase_tx).await;
 
         Ok(Self {
             transport,
@@ -76,7 +91,7 @@ impl Band {
             channel_hub,
             control: Some(control),
             hostname: hostname.into(),
-            key,
+            key: base_key,
             band_id,
             session,
             _recv_loop: recv_loop,
@@ -120,6 +135,7 @@ impl Band {
                 channel_id: 0,
                 plaintext: bytes,
                 priority: 0,
+                use_base_key: true, // HELLO bootstraps under the base key
             })
             .await
             .map_err(crate::control::ControlError::from)?;
@@ -193,12 +209,21 @@ mod tests {
         let alice = Band::bind(b"stream-psk", "127.0.0.1:0".parse().unwrap(), "alice")
             .await
             .unwrap();
-        let bob = Band::bind(b"stream-psk", "127.0.0.1:0".parse().unwrap(), "bob")
+        let mut bob = Band::bind(b"stream-psk", "127.0.0.1:0".parse().unwrap(), "bob")
             .await
             .unwrap();
 
         let bob_addr = bob.local_addr().unwrap();
-        let mut bob_stream = bob.stream(alice.local_addr().unwrap(), 7).await;
+        let alice_addr = alice.local_addr().unwrap();
+        // Handshake first: session-keyed data requires bob to learn alice's
+        // epoch from her HELLO before it can decrypt her stream (SPEC §3.3).
+        alice.connect_peer(bob_addr).await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), bob.control().recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut bob_stream = bob.stream(alice_addr, 7).await;
         let alice_stream = alice.stream(bob_addr, 7).await;
 
         alice_stream.send(0, b"hello world").await.unwrap();
@@ -218,12 +243,20 @@ mod tests {
         let alice = Band::bind(b"stale-psk", "127.0.0.1:0".parse().unwrap(), "alice")
             .await
             .unwrap();
-        let bob = Band::bind(b"stale-psk", "127.0.0.1:0".parse().unwrap(), "bob")
+        let mut bob = Band::bind(b"stale-psk", "127.0.0.1:0".parse().unwrap(), "bob")
             .await
             .unwrap();
 
         let bob_addr = bob.local_addr().unwrap();
-        let mut bob_stream = bob.stream(alice.local_addr().unwrap(), 1).await;
+        let alice_addr = alice.local_addr().unwrap();
+        // Handshake first so bob learns alice's session epoch (SPEC §3.3).
+        alice.connect_peer(bob_addr).await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), bob.control().recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut bob_stream = bob.stream(alice_addr, 1).await;
         let alice_stream = alice.stream(bob_addr, 1).await;
 
         for _ in 0..3 {
@@ -237,5 +270,100 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 3, "all 3 distinct-sequence frames should arrive");
+    }
+
+    #[tokio::test]
+    async fn restart_rekeys_peer_and_accepts_new_session() {
+        // A restarted peer (newer session epoch, from the SAME address) must be
+        // re-keyed so its new-session data decrypts. Driven via a raw alice
+        // Transport with two epochs, avoiding a same-port rebind (the detached
+        // recv loop keeps the old socket bound — tracked separately).
+        use crate::crypto::{derive_band_id, derive_key, derive_session_key, BASELINE_CIPHER};
+        use crate::framing::ChannelType;
+        use crate::transport::{Outbound, Transport};
+        use std::time::Duration;
+
+        let psk = b"restart-rekey-psk";
+        let mut bob = Band::bind(psk, "127.0.0.1:0".parse().unwrap(), "bob")
+            .await
+            .unwrap();
+        let bob_addr = bob.local_addr().unwrap();
+
+        let mut alice = Transport::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            derive_key(psk),
+            derive_band_id(psk),
+        )
+        .await
+        .unwrap();
+        let alice_addr = alice.local_addr().unwrap();
+
+        let hello = |epoch: u64| -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "type": 1u8,
+                "payload": {"hostname":"alice","capabilities":[],
+                            "ciphers":["chacha20-poly1305"],"session": epoch}
+            }))
+            .unwrap()
+        };
+        let spl = |d: &[u8]| -> Vec<u8> {
+            let mut p = vec![0u8];
+            p.extend_from_slice(d);
+            p
+        };
+        let ctl = |pl: Vec<u8>| Outbound {
+            to: bob_addr,
+            channel_type: ChannelType::Control,
+            channel_id: 0,
+            plaintext: pl,
+            priority: 0,
+            use_base_key: true,
+        };
+        let strm = |pl: Vec<u8>| Outbound {
+            to: bob_addr,
+            channel_type: ChannelType::Stream,
+            channel_id: 5,
+            plaintext: pl,
+            priority: 0,
+            use_base_key: false,
+        };
+
+        // --- session 1 (epoch 1000) ---
+        alice.set_session_key(derive_session_key(psk, BASELINE_CIPHER, 1000));
+        alice.send(ctl(hello(1000))).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(1), bob.control().recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut bob_stream = bob.stream(alice_addr, 5).await;
+        alice.send(strm(spl(b"s1"))).await.unwrap();
+        let m = tokio::time::timeout(Duration::from_secs(1), bob_stream.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.data, b"s1");
+
+        // --- restart: session 2 (epoch 2000) from the SAME address ---
+        alice.set_session_key(derive_session_key(psk, BASELINE_CIPHER, 2000));
+        alice.send(ctl(hello(2000))).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(1), bob.control().recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // Data under the NEW session key must decrypt (bob re-keyed on the newer
+        // epoch); with the old key it would be dropped at the transport.
+        let mut got = false;
+        for _ in 0..5 {
+            alice.send(strm(spl(b"s2"))).await.unwrap();
+            if let Ok(Some(m)) =
+                tokio::time::timeout(Duration::from_millis(250), bob_stream.recv()).await
+            {
+                if m.data == b"s2" {
+                    got = true;
+                    break;
+                }
+            }
+        }
+        assert!(got, "restarted peer's data must decrypt under the re-keyed session");
     }
 }
