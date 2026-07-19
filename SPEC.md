@@ -1003,7 +1003,7 @@ peer.
 
 | Platform        | Transport          | Est. LOC | Notes                        |
 |-----------------|--------------------|----------|------------------------------|
-| Python (ref)    | UDP + asyncio      | ~2000    | Full library                 |
+| Python (ref)    | UDP + AF_UNIX + asyncio | ~3000 | Full library                 |
 | Rust (ref v1.1) | UDP + AF_UNIX + tokio | ~3000 | Full library, dmabuf, fds    |
 | Kotlin/Android  | OkHttp WebSocket   | ~500     | Stream + Control only        |
 | ESP32/C         | WebSocket          | ~300     | Stream + Control only        |

@@ -632,4 +632,66 @@ mod tests {
         }
         assert!(got, "restarted peer's data must decrypt under the re-keyed session");
     }
+
+    // Bring both Bands to a Control HELLO handshake so session-keyed Channel
+    // data decrypts (SPEC §3.3), like `band_stream_roundtrip`. Returns the
+    // peer addresses (alice_addr, bob_addr).
+    async fn hello_pair(alice: &Band, bob: &mut Band) -> (SocketAddr, SocketAddr) {
+        let bob_addr = bob.local_addr().unwrap();
+        let alice_addr = alice.local_addr().unwrap();
+        alice.connect_peer(bob_addr).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(1), bob.control().recv())
+            .await
+            .unwrap()
+            .unwrap();
+        (alice_addr, bob_addr)
+    }
+
+    #[tokio::test]
+    async fn band_channel_handshake_and_message() {
+        // §6.3 3-way handshake over loopback UDP; bob auto-ESTABLISHED on SYN.
+        let alice = Band::bind(b"chan-psk", "127.0.0.1:0".parse().unwrap(), "alice")
+            .await
+            .unwrap();
+        let mut bob = Band::bind(b"chan-psk", "127.0.0.1:0".parse().unwrap(), "bob")
+            .await
+            .unwrap();
+        let (alice_addr, bob_addr) = hello_pair(&alice, &mut bob).await;
+
+        // Both sides open the endpoint before traffic (like Streams).
+        let mut bob_chan = bob.channel(alice_addr, 9).await;
+        let alice_chan = alice.channel(bob_addr, 9).await;
+
+        alice_chan.connect().await.unwrap();
+        alice_chan.send_message(b"reliable hello").await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), bob_chan.recv_message())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, b"reliable hello");
+    }
+
+    #[tokio::test]
+    async fn band_channel_large_message_fragments() {
+        // §6.6 fragmentation round-trip through send_message/recv_message.
+        let alice = Band::bind(b"chan-frag-psk", "127.0.0.1:0".parse().unwrap(), "alice")
+            .await
+            .unwrap();
+        let mut bob = Band::bind(b"chan-frag-psk", "127.0.0.1:0".parse().unwrap(), "bob")
+            .await
+            .unwrap();
+        let (alice_addr, bob_addr) = hello_pair(&alice, &mut bob).await;
+
+        let mut bob_chan = bob.channel(alice_addr, 3).await;
+        let alice_chan = alice.channel(bob_addr, 3).await;
+        alice_chan.connect().await.unwrap();
+
+        let msg: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        alice_chan.send_message(&msg).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(3), bob_chan.recv_message())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, msg);
+    }
 }
