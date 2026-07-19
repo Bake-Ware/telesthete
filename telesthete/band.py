@@ -13,6 +13,7 @@ from typing import Optional, Dict, Callable, List
 from .protocol.crypto import BandCrypto, select_cipher, BASELINE_CIPHER
 from .protocol.sequence import SequenceSource
 from .protocol.stream import Stream
+from .protocol.channel import Channel
 from .protocol.control import ControlChannel, ControlMessageType
 from .protocol.framing import ChannelType
 from .transport.udp import UDPTransport
@@ -68,10 +69,9 @@ class Band:
         self.crypto = self._crypto(BASELINE_CIPHER, None)  # base
         self.band_id = self.crypto.band_id
 
-        # One sequence source for this sender, shared across the live channels
-        # (Control + Stream) so no two packets we emit reuse an AEAD (key, nonce)
-        # — the nonce is the sequence (SPEC §3.3). The reliable Channel is
-        # deferred to a later phase and is intentionally NOT wired into the Band.
+        # One sequence source for this sender, shared across Control, every
+        # Stream AND every reliable Channel, so no two packets we emit reuse an
+        # AEAD (key, nonce) — the nonce is the sequence (SPEC §3.3).
         self.seq_source = SequenceSource()
 
         # This band instance's session epoch (SPEC §4.3). Advertised in HELLO so
@@ -106,6 +106,11 @@ class Band:
         # Streams
         self.streams: Dict[int, Stream] = {}
         self._next_stream_id = 1
+
+        # Reliable Channels (SPEC §6), keyed by channel_id. The CHANNEL
+        # transport handler is registered lazily on first use.
+        self.channels: Dict[int, Channel] = {}
+        self._channel_handler_registered = False
 
         # Running state
         self._running = False
@@ -237,11 +242,14 @@ class Band:
         peer.update_last_seen()
 
     def _on_new_session(self, peer_addr: tuple):
-        """A peer (re)started its session: rebase its Stream watermarks so its
-        fresh (possibly lower) sequences are accepted (SPEC §3.3/§4.3). The
-        Control watermark is rebased by the ControlChannel itself."""
+        """A peer (re)started its session: rebase its Stream and Channel
+        watermarks so its fresh (possibly lower) sequences are accepted
+        (SPEC §3.3/§4.3). The Control watermark is rebased by the
+        ControlChannel itself."""
         for stream in self.streams.values():
             stream.reset_peer(peer_addr)
+        for channel in self.channels.values():
+            channel.reset_peer(peer_addr)
 
     def _on_keepalive(self, peer_addr: tuple, payload: dict):
         """Handle KEEPALIVE from peer"""
@@ -302,6 +310,62 @@ class Band:
         logger.info(f"Opened stream {stream_id} with priority {priority}")
 
         return stream
+
+    def channel(self, channel_id: int, peer_addr: tuple) -> Channel:
+        """
+        Open or get a reliable Channel to a peer (SPEC §6)
+
+        Args:
+            channel_id: Channel ID (0-65535)
+            peer_addr: (host, port) of the single peer this channel talks to
+
+        Returns:
+            Channel instance (call `await channel.open()` to start the §6.3
+            handshake on the initiating side)
+        """
+        if channel_id in self.channels:
+            return self.channels[channel_id]
+
+        # Per-session data keys (send=own epoch, recv=peer epoch) + the band's
+        # shared sequence source, so Channel outer sequences (= AEAD nonces)
+        # never collide with Control/Stream traffic (SPEC §3.1/§3.3).
+        channel = Channel(self.band_id, channel_id, peer_addr,
+                          transport=self.transport,
+                          send_crypto=self.send_crypto,
+                          recv_crypto=self.recv_crypto,
+                          seq_source=self.seq_source)
+        self.channels[channel_id] = channel
+        self._register_channel_handler()
+        logger.info(f"Opened channel {channel_id} to {peer_addr}")
+        return channel
+
+    def _register_channel_handler(self):
+        """Register CHANNEL routing on first use (idempotent)."""
+        if self._channel_handler_registered:
+            return
+        self._channel_handler_registered = True
+
+        def handle_channel(peer_addr, packet_bytes):
+            if peer_addr in self.peers:
+                self.peers[peer_addr].update_last_seen()
+            from .protocol.framing import unpack_packet
+            try:
+                packet = unpack_packet(packet_bytes)
+            except ValueError:
+                return
+            channel = self.channels.get(packet.channel_id)
+            if channel is None:
+                logger.warning(f"No channel with ID {packet.channel_id}")
+                return
+            # A channel is bound to one peer; another sender's packet on this
+            # channel_id must not reach its state machine.
+            if peer_addr != channel.peer_addr:
+                logger.debug(f"Dropping channel {packet.channel_id} packet "
+                             f"from non-peer {peer_addr}")
+                return
+            channel.handle_packet(peer_addr, packet_bytes)
+
+        self.transport.register_handler(ChannelType.CHANNEL, handle_channel)
 
     def connect_peer(self, host: str, port: int):
         """

@@ -264,15 +264,24 @@ def test_stale_epoch_hello_cannot_downgrade_peer():
     assert b.peers[("p", 1)].cipher == "aes256-gcm"
 
 
-def test_channel_is_not_wired_into_band():
-    # Regression guard (Phase 6 deferral): the reliable Channel still has an
-    # unfixed per-object counter, so it MUST NOT be on the live path or it would
-    # silently reintroduce nonce reuse. If a future change wires it up, this
-    # fails until Channel draws from the shared SequenceSource.
+def test_channel_is_wired_into_band():
+    # Phase 6 (replaces the deferral guard): the reliable Channel now draws
+    # outer sequences from the Band's ONE shared SequenceSource — the old
+    # per-object counter starting at 0 was guaranteed nonce reuse — so it IS on
+    # the live path: Band.channel() registers CHANNEL routing and constructs
+    # with the session-keyed resolvers.
     from telesthete.band import Band
     from telesthete.protocol.framing import ChannelType
     b = Band(psk="channel-guard-psk", bind_port=0)
-    registered = set(b.transport._handlers.keys())
-    assert ChannelType.CHANNEL not in registered, "Channel must not be wired (nonce-unsafe until Phase 6)"
-    assert ChannelType.CONTROL in registered
-    assert ChannelType.STREAM in registered
+    assert ChannelType.CONTROL in b.transport._handlers
+    assert ChannelType.STREAM in b.transport._handlers
+
+    ch = b.channel(7, ("1.2.3.4", 5))
+    assert ChannelType.CHANNEL in b.transport._handlers
+    assert ch._seq_source is b.seq_source, "Channel must share the band source"
+    # Channels resolve through the Band's per-session send/recv crypto.
+    assert ch._send_crypto == b.send_crypto
+    assert ch._recv_crypto == b.recv_crypto
+    # Same object back; handler registration is idempotent.
+    assert b.channel(7, ("1.2.3.4", 5)) is ch
+    assert len(b.transport._handlers[ChannelType.CHANNEL]) == 1
