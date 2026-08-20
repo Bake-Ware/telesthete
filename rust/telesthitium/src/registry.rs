@@ -119,6 +119,12 @@ pub struct Registry {
     bands: Mutex<HashMap<BandId, HashMap<PeerKey, Peer>>>,
     limits: Limits,
     next_conn: AtomicU64,
+    /// Federation egress (SPEC §10 extension): when a link to another hub is
+    /// active, locally-sourced frames are also handed here to be relayed across
+    /// the link. `None` (the default, and the case for every hub with no
+    /// `HUB_FED_*` config) means the relay hot path is byte-for-byte unchanged —
+    /// federation adds one `Option` check and nothing else.
+    fed: Mutex<Option<mpsc::Sender<(BandId, Arc<[u8]>)>>>,
 }
 
 impl Registry {
@@ -127,6 +133,42 @@ impl Registry {
             bands: Mutex::new(HashMap::new()),
             limits,
             next_conn: AtomicU64::new(1),
+            fed: Mutex::new(None),
+        }
+    }
+
+    /// Install the federation egress channel. Frames sourced from *local* peers
+    /// are copied here after local fan-out; the federation task relays them to
+    /// linked hubs that have the band. Idempotent; the last set wins.
+    pub fn set_federation(&self, tx: mpsc::Sender<(BandId, Arc<[u8]>)>) {
+        *self.fed.lock().unwrap() = Some(tx);
+    }
+
+    /// Band ids that currently have at least one **local** (non-link) peer.
+    /// Advertised to linked hubs so they only relay frames we can actually
+    /// deliver.
+    pub fn local_bands(&self) -> Vec<BandId> {
+        self.bands.lock().unwrap().keys().copied().collect()
+    }
+
+    /// Inject a frame that arrived over a federation link: fan out to **every**
+    /// eligible local peer in the band and — crucially — do NOT re-federate it
+    /// (one-hop rule; a hub never re-forwards a hub-sourced frame). This is the
+    /// link-ingress counterpart to [`Registry::forward`].
+    pub fn inject_from_link(&self, band: &BandId, frame: Arc<[u8]>) {
+        let sinks: Vec<Sink> = {
+            let bands = self.bands.lock().unwrap();
+            match bands.get(band) {
+                None => return,
+                Some(peers) => peers
+                    .iter()
+                    .filter(|(_, p)| p.eligible)
+                    .map(|(_, p)| p.sink.clone())
+                    .collect(),
+            }
+        };
+        for sink in sinks {
+            let _ = sink.try_send(frame.clone());
         }
     }
 
@@ -227,6 +269,13 @@ impl Registry {
                 }
                 Err(SendDrop::Closed) => {}
             }
+        }
+        // Federation tail: a locally-sourced frame is also offered to linked
+        // hubs (the federation task filters to links that have this band). No-op
+        // and near-free when no link is configured (`fed` is `None`).
+        let fed = self.fed.lock().unwrap();
+        if let Some(tx) = fed.as_ref() {
+            let _ = tx.try_send((*band, frame));
         }
     }
 

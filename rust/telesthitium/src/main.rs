@@ -62,6 +62,23 @@ async fn main() -> anyhow::Result<()> {
     let (sd_tx, sd_rx) = watch::channel(false);
     let mut tasks = Vec::new();
 
+    // Federation (SPEC §10 extension) — pool this hub's registry with linked
+    // hubs. Entirely inert unless HUB_FED_LISTEN or HUB_FED_LINK is set, so a
+    // standard single-hub deployment is byte-for-byte unchanged.
+    if let Some(fed_cfg) = telesthitium::federation::FedConfig::from_env() {
+        tracing::info!(
+            listen = ?fed_cfg.listen,
+            links = ?fed_cfg.links,
+            inbound_active = fed_cfg.inbound_active,
+            "federation enabled"
+        );
+        tasks.extend(telesthitium::federation::spawn(
+            fed_cfg,
+            registry.clone(),
+            sd_rx.clone(),
+        ));
+    }
+
     if let Some(bind) = cfg.udp_bind {
         let (registry, mut rx, q) = (registry.clone(), sd_rx.clone(), cfg.conn_queue);
         tasks.push(tokio::spawn(async move {

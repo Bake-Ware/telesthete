@@ -20,6 +20,7 @@
 //! whole frames and never inspects payloads.
 
 pub mod config;
+pub mod federation;
 pub mod frame;
 pub mod registry;
 pub mod tls;
