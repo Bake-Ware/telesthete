@@ -1,6 +1,7 @@
 # Releasing Telesthete
 
-Current release: **0.2.0** (Telesthete wire **v1.2**, `PROTOCOL_VERSION = 3`).
+Current Python package: **0.3.0** (Telesthete wire **v1.2** incl. the §10.1
+addressed-routing addendum, `PROTOCOL_VERSION = 3`). Rust crates: 0.2.0.
 
 Both reference implementations are pinned to the wire by shared conformance
 vectors (`tests/vectors.json`). **Do not publish if the conformance tests fail** —
@@ -12,6 +13,7 @@ that is exactly the cross-impl drift the vectors exist to catch.
 # Python
 python tests/test_vectors.py && python tests/test_negotiation.py \
   && python tests/test_replay.py && python tests/test_fragment.py \
+  && python -m pytest -q tests/test_route.py \
   && python tests/test_end_to_end.py
 
 # Rust
@@ -21,7 +23,7 @@ cd rust && cargo test && cargo build --release && cd ..
 ## PyPI (Python package `telesthete`)
 
 ```bash
-python -m build            # produces dist/telesthete-0.2.0{.tar.gz,-py3-none-any.whl}
+python -m build            # produces dist/telesthete-0.3.0{.tar.gz,-py3-none-any.whl}
 python -m twine check dist/*
 python -m twine upload dist/*        # needs a PyPI token
 ```
