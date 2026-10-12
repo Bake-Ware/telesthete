@@ -12,6 +12,14 @@
 //! channels give backpressure-by-drop so one slow peer can't grow memory
 //! without limit (conformance D3). Every peer — UDP included — has its own
 //! queue, so a burst to one peer can never crowd out another's traffic.
+//!
+//! **Addressed routing (SPEC §10.1).** The only cleartext the registry acts on
+//! beyond `band_id` is the header's `channel_type`/`channel_id`: a ROUTE
+//! (0x05) frame declares its sender's route id and is consumed here, never
+//! relayed; a CHANNEL (0x02) frame whose nonzero `channel_id` some peer has
+//! declared goes only to those peers. Everything else — and any CHANNEL frame
+//! for an id nobody declared — is broadcast exactly as before, so bands with
+//! no declaring peer see byte-for-byte the old behaviour.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -20,8 +28,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use telesthete::BandId;
+use telesthete::{BandId, ChannelType};
 use tokio::sync::mpsc;
+
+use crate::frame::RouteInfo;
 
 /// Caps and validation policy. `Copy` for cheap threading through config.
 #[derive(Debug, Clone, Copy)]
@@ -107,6 +117,10 @@ struct Peer {
     eligible: bool,
     /// Packets observed from this peer (drives UDP validation).
     seen: u32,
+    /// Route id this peer declared with a ROUTE frame (SPEC §10.1), if any.
+    /// One per peer; a later declaration replaces it, `channel_id` 0 clears
+    /// it. Lives on the peer so eviction/disconnect forgets it for free.
+    route: Option<u16>,
 }
 
 /// Why a peer could not be admitted.
@@ -159,16 +173,22 @@ impl Registry {
     /// eligible local peer in the band and — crucially — do NOT re-federate it
     /// (one-hop rule; a hub never re-forwards a hub-sourced frame). This is the
     /// link-ingress counterpart to [`Registry::forward`].
+    ///
+    /// Addressed routing applies here too, against *local* declarations: a
+    /// CHANNEL frame for a route id a local peer declared reaches only that
+    /// peer. (Declarations themselves never cross a link.)
     pub fn inject_from_link(&self, band: &BandId, frame: Arc<[u8]>) {
+        let Some(info) = crate::frame::route_info(&frame) else {
+            return;
+        };
+        if info.channel_type == Some(ChannelType::Route) {
+            return; // never deliverable; a well-behaved hub never sends one
+        }
         let sinks: Vec<Sink> = {
             let bands = self.bands.lock().unwrap();
             match bands.get(band) {
                 None => return,
-                Some(peers) => peers
-                    .iter()
-                    .filter(|(_, p)| p.eligible)
-                    .map(|(_, p)| p.sink.clone())
-                    .collect(),
+                Some(peers) => Self::targets(peers, None, &info),
             }
         };
         for sink in sinks {
@@ -249,27 +269,65 @@ impl Registry {
                 last_seen: Instant::now(),
                 eligible,
                 seen: 1,
+                route: None,
             },
         );
         Ok(())
     }
 
+    /// The sinks a frame should reach: eligible peers other than `from`,
+    /// narrowed to the declarers of `channel_id` when it is an addressed
+    /// CHANNEL frame whose id at least one peer in the band declared (§10.1).
+    ///
+    /// "Declared" means by some peer *other than the sender*: if the sender is
+    /// the only declarer, the addressee must be a peer that never declared
+    /// (e.g. an old peer whose derived id collides), so we fall back to
+    /// broadcast rather than drop it. A not-yet-eligible declarer does count,
+    /// so its traffic isn't sprayed band-wide while it validates. Delivery
+    /// still honours eligibility (D4) and never echoes (B1).
+    fn targets(
+        peers: &HashMap<PeerKey, Peer>,
+        from: Option<&PeerKey>,
+        info: &RouteInfo,
+    ) -> Vec<Sink> {
+        let addressed = info.channel_type == Some(ChannelType::Channel)
+            && info.channel_id != 0
+            && peers
+                .iter()
+                .any(|(k, p)| Some(k) != from && p.route == Some(info.channel_id));
+        peers
+            .iter()
+            .filter(|(k, p)| Some(*k) != from && p.eligible)
+            .filter(|(_, p)| !addressed || p.route == Some(info.channel_id))
+            .map(|(_, p)| p.sink.clone())
+            .collect()
+    }
+
     /// Relay one whole frame to every *other* eligible peer in the band
-    /// (conformance B1/B2/B4). Synchronous: collects sinks under the lock, then
-    /// dispatches without holding it. Frames to full queues are dropped and
-    /// counted (D3); closed queues are ignored (the peer's disconnect path
-    /// removes it).
+    /// (conformance B1/B2/B4), or — for an addressed CHANNEL frame — only to
+    /// the peers that declared its route id (K2). A ROUTE frame records the
+    /// sender's route id and is consumed, never relayed or federated (K1).
+    /// Synchronous: collects sinks under the lock, then dispatches without
+    /// holding it. Frames to full queues are dropped and counted (D3); closed
+    /// queues are ignored (the peer's disconnect path removes it).
     pub fn forward(&self, band: &BandId, from: &PeerKey, frame: Arc<[u8]>) {
+        // Every transport validates the frame before calling us; re-parsing the
+        // 19 cleartext bytes here keeps the transports routing-agnostic.
+        let Some(info) = crate::frame::route_info(&frame) else {
+            return;
+        };
         let sinks: Vec<Sink> = {
-            let bands = self.bands.lock().unwrap();
-            match bands.get(band) {
-                None => return,
-                Some(peers) => peers
-                    .iter()
-                    .filter(|(k, p)| **k != *from && p.eligible)
-                    .map(|(_, p)| p.sink.clone())
-                    .collect(),
+            let mut bands = self.bands.lock().unwrap();
+            let Some(peers) = bands.get_mut(band) else {
+                return;
+            };
+            if info.channel_type == Some(ChannelType::Route) {
+                if let Some(p) = peers.get_mut(from) {
+                    p.route = (info.channel_id != 0).then_some(info.channel_id);
+                }
+                return;
             }
+            Self::targets(peers, Some(from), &info)
         };
         for sink in sinks {
             match sink.try_send(frame.clone()) {
@@ -352,6 +410,16 @@ impl Registry {
             .unwrap()
             .get(band)
             .is_some_and(|p| p.contains_key(key))
+    }
+
+    /// The route id a peer has declared (SPEC §10.1), if it exists and declared one.
+    pub fn route_of(&self, band: &BandId, key: &PeerKey) -> Option<u16> {
+        self.bands
+            .lock()
+            .unwrap()
+            .get(band)
+            .and_then(|p| p.get(key))
+            .and_then(|peer| peer.route)
     }
 
     /// Whether a peer is currently an eligible relay destination, if it exists.
@@ -602,6 +670,215 @@ mod tests {
         r.disconnect(&band(1), &k);
         assert!(!r.contains(&band(1), &k));
         assert_eq!(r.band_count(), 0);
+    }
+
+    // -- K: addressed routing (SPEC §10.1) ---------------------------------
+
+    /// A 43-byte frame with an explicit cleartext channel_type / channel_id.
+    fn typed(b: BandId, ct: u8, cid: u16) -> Arc<[u8]> {
+        let mut v = vec![0u8; 43];
+        v[..16].copy_from_slice(&b);
+        v[16] = ct;
+        v[17..19].copy_from_slice(&cid.to_be_bytes());
+        Arc::from(v.as_slice())
+    }
+
+    const ROUTE: u8 = 0x05;
+    const CHANNEL: u8 = 0x02;
+
+    fn drain(rx: &mut mpsc::Receiver<Arc<[u8]>>) -> usize {
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        n
+    }
+
+    /// Band 1 with conn peers 1..=n; returns their receivers.
+    fn band_of(r: &Registry, n: u64) -> Vec<mpsc::Receiver<Arc<[u8]>>> {
+        (1..=n)
+            .map(|i| {
+                let (s, rx) = conn(64);
+                r.connect(band(1), PeerKey::Conn(i), s).unwrap();
+                rx
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn route_frame_is_consumed_and_recorded() {
+        // K1 — a ROUTE frame records the sender's id and reaches nobody.
+        let r = Registry::new(big());
+        let mut rx = band_of(&r, 3);
+        r.forward(&band(1), &PeerKey::Conn(1), typed(band(1), ROUTE, 7));
+        assert_eq!(r.route_of(&band(1), &PeerKey::Conn(1)), Some(7));
+        assert_eq!(r.route_of(&band(1), &PeerKey::Conn(2)), None);
+        for q in rx.iter_mut() {
+            assert_eq!(drain(q), 0, "ROUTE frames must never be relayed");
+        }
+    }
+
+    #[tokio::test]
+    async fn route_frame_is_not_federated() {
+        // K1 — nor offered to a federation link.
+        let r = Registry::new(big());
+        let (ftx, mut frx) = mpsc::channel(8);
+        r.set_federation(ftx);
+        let _rx = band_of(&r, 2);
+        r.forward(&band(1), &PeerKey::Conn(1), typed(band(1), ROUTE, 7));
+        assert!(frx.try_recv().is_err(), "ROUTE frames must not cross a link");
+        r.forward(&band(1), &PeerKey::Conn(1), typed(band(1), CHANNEL, 0));
+        assert!(frx.try_recv().is_ok(), "data frames still federate");
+    }
+
+    #[tokio::test]
+    async fn addressed_channel_reaches_only_declarers() {
+        // K2 — incl. a collision: two peers declaring the same id both get it.
+        let r = Registry::new(big());
+        let mut rx = band_of(&r, 4);
+        r.forward(&band(1), &PeerKey::Conn(1), typed(band(1), ROUTE, 7));
+        r.forward(&band(1), &PeerKey::Conn(2), typed(band(1), ROUTE, 9));
+        r.forward(&band(1), &PeerKey::Conn(3), typed(band(1), ROUTE, 7));
+        r.forward(&band(1), &PeerKey::Conn(4), typed(band(1), CHANNEL, 7));
+        let got: Vec<usize> = rx.iter_mut().map(drain).collect();
+        assert_eq!(got, vec![1, 0, 1, 0]);
+        r.forward(&band(1), &PeerKey::Conn(4), typed(band(1), CHANNEL, 9));
+        let got: Vec<usize> = rx.iter_mut().map(drain).collect();
+        assert_eq!(got, vec![0, 1, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn undeclared_or_zero_or_non_channel_broadcasts() {
+        // K3 — channel_id 0, an id nobody declared, and every non-CHANNEL type
+        // (whose channel_id means something else: stream/board/drop id) all
+        // keep the old broadcast behaviour.
+        let r = Registry::new(big());
+        let mut rx = band_of(&r, 3);
+        r.forward(&band(1), &PeerKey::Conn(1), typed(band(1), ROUTE, 7));
+        for f in [
+            typed(band(1), CHANNEL, 0),
+            typed(band(1), CHANNEL, 42),
+            typed(band(1), 0x00, 7),
+            typed(band(1), 0x01, 7),
+            typed(band(1), 0x03, 7),
+            typed(band(1), 0x04, 7),
+            typed(band(1), 0x7F, 7), // unknown type
+        ] {
+            r.forward(&band(1), &PeerKey::Conn(3), f);
+            let got: Vec<usize> = rx.iter_mut().map(drain).collect();
+            assert_eq!(got, vec![1, 1, 0], "must broadcast to all but the sender");
+        }
+    }
+
+    #[tokio::test]
+    async fn addressed_never_echoes_and_sole_self_declarer_falls_back() {
+        // K4 — never echoed. If the sender is the only declarer of the id, the
+        // addressee must be an undeclared peer: fall back to broadcast.
+        let r = Registry::new(big());
+        let mut rx = band_of(&r, 3);
+        r.forward(&band(1), &PeerKey::Conn(1), typed(band(1), ROUTE, 7));
+        r.forward(&band(1), &PeerKey::Conn(1), typed(band(1), CHANNEL, 7));
+        let got: Vec<usize> = rx.iter_mut().map(drain).collect();
+        assert_eq!(got, vec![0, 1, 1]);
+        // With another declarer, only that declarer gets it — still no echo.
+        r.forward(&band(1), &PeerKey::Conn(2), typed(band(1), ROUTE, 7));
+        r.forward(&band(1), &PeerKey::Conn(1), typed(band(1), CHANNEL, 7));
+        let got: Vec<usize> = rx.iter_mut().map(drain).collect();
+        assert_eq!(got, vec![0, 1, 0]);
+    }
+
+    #[tokio::test]
+    async fn addressed_honours_eligibility() {
+        // K5 — a still-validating UDP declarer is not a destination (D4), and
+        // its id is still "known", so the frame is not sprayed band-wide.
+        let r = Registry::new(big()); // udp_validation_packets = 2
+        let addr: SocketAddr = "127.0.0.1:6200".parse().unwrap();
+        let (us, mut urx) = udp(8, addr);
+        r.observe_udp(band(1), addr, || us).unwrap();
+        r.forward(&band(1), &PeerKey::Udp(addr), typed(band(1), ROUTE, 7));
+        let mut rx = band_of(&r, 2);
+        r.forward(&band(1), &PeerKey::Conn(1), typed(band(1), CHANNEL, 7));
+        assert_eq!(drain(&mut urx), 0);
+        assert_eq!(drain(&mut rx[1]), 0);
+        // Once validated it receives its addressed traffic.
+        r.observe_udp(band(1), addr, || udp(8, addr).0).unwrap();
+        r.forward(&band(1), &PeerKey::Conn(1), typed(band(1), CHANNEL, 7));
+        assert_eq!(drain(&mut urx), 1);
+        assert_eq!(drain(&mut rx[1]), 0);
+    }
+
+    #[tokio::test]
+    async fn redeclare_replaces_and_zero_clears() {
+        // K6
+        let r = Registry::new(big());
+        let mut rx = band_of(&r, 3);
+        r.forward(&band(1), &PeerKey::Conn(1), typed(band(1), ROUTE, 7));
+        r.forward(&band(1), &PeerKey::Conn(1), typed(band(1), ROUTE, 8));
+        assert_eq!(r.route_of(&band(1), &PeerKey::Conn(1)), Some(8));
+        r.forward(&band(1), &PeerKey::Conn(3), typed(band(1), CHANNEL, 7));
+        let got: Vec<usize> = rx.iter_mut().map(drain).collect();
+        assert_eq!(got, vec![1, 1, 0], "old id forgotten -> broadcast");
+        r.forward(&band(1), &PeerKey::Conn(1), typed(band(1), ROUTE, 0));
+        assert_eq!(r.route_of(&band(1), &PeerKey::Conn(1)), None);
+    }
+
+    #[tokio::test]
+    async fn route_forgotten_on_disconnect_and_prune() {
+        // K7 — routes live on the peer entry, so removal forgets them.
+        let r = Registry::new(Limits {
+            udp_validation_packets: 1,
+            ..big()
+        });
+        let mut rx = band_of(&r, 3);
+        r.forward(&band(1), &PeerKey::Conn(1), typed(band(1), ROUTE, 7));
+        r.disconnect(&band(1), &PeerKey::Conn(1));
+        r.forward(&band(1), &PeerKey::Conn(3), typed(band(1), CHANNEL, 7));
+        assert_eq!(drain(&mut rx[1]), 1, "departed declarer -> broadcast again");
+
+        let addr: SocketAddr = "127.0.0.1:6201".parse().unwrap();
+        r.observe_udp(band(1), addr, || udp(8, addr).0).unwrap();
+        r.forward(&band(1), &PeerKey::Udp(addr), typed(band(1), ROUTE, 9));
+        std::thread::sleep(Duration::from_millis(20));
+        r.touch(&band(1), &PeerKey::Conn(2)); // conn peers are never pruned anyway
+        r.prune(Duration::from_millis(5));
+        assert!(!r.contains(&band(1), &PeerKey::Udp(addr)));
+        r.forward(&band(1), &PeerKey::Conn(3), typed(band(1), CHANNEL, 9));
+        assert_eq!(drain(&mut rx[1]), 1, "pruned declarer -> broadcast again");
+    }
+
+    #[tokio::test]
+    async fn routes_are_band_scoped() {
+        // K8 — a declaration in band 1 has no effect on band 2.
+        let r = Registry::new(big());
+        let (s1, mut r1) = conn(8);
+        let (s2, mut r2) = conn(8);
+        let (s3, mut r3) = conn(8);
+        r.connect(band(1), PeerKey::Conn(1), s1).unwrap();
+        r.connect(band(2), PeerKey::Conn(2), s2).unwrap();
+        r.connect(band(2), PeerKey::Conn(3), s3).unwrap();
+        r.forward(&band(1), &PeerKey::Conn(1), typed(band(1), ROUTE, 7));
+        r.forward(&band(2), &PeerKey::Conn(3), typed(band(2), CHANNEL, 7));
+        assert_eq!(drain(&mut r1), 0);
+        assert_eq!(drain(&mut r2), 1);
+        assert_eq!(drain(&mut r3), 0);
+    }
+
+    #[tokio::test]
+    async fn link_injection_honours_local_routes() {
+        // K9 — frames from a federation link are addressed against local
+        // declarations; a ROUTE frame arriving over a link is dropped.
+        let r = Registry::new(big());
+        let mut rx = band_of(&r, 3);
+        r.forward(&band(1), &PeerKey::Conn(2), typed(band(1), ROUTE, 7));
+        r.inject_from_link(&band(1), typed(band(1), CHANNEL, 7));
+        let got: Vec<usize> = rx.iter_mut().map(drain).collect();
+        assert_eq!(got, vec![0, 1, 0]);
+        r.inject_from_link(&band(1), typed(band(1), CHANNEL, 0));
+        let got: Vec<usize> = rx.iter_mut().map(drain).collect();
+        assert_eq!(got, vec![1, 1, 1]);
+        r.inject_from_link(&band(1), typed(band(1), ROUTE, 7));
+        let got: Vec<usize> = rx.iter_mut().map(drain).collect();
+        assert_eq!(got, vec![0, 0, 0]);
     }
 
     #[tokio::test]

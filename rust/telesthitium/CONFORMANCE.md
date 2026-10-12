@@ -4,8 +4,8 @@ The reference hub implements **SPEC §10** in full: it matches peers by `band_id
 and bridges opaque ciphertext between them across every transport §10 names —
 UDP (§9.1), WebSocket/WSS (§9.3), WebTransport/HTTP-3 (§9.6), and AF_UNIX (§9.4).
 
-**Status: complete.** Every claim below is covered by a test — 39 unit tests
-plus 16 integration tests (55 total), all green. Run them with
+**Status: complete.** Every claim below is covered by a test — 49 unit tests
+plus 20 integration tests (69 total), all green. Run them with
 `cargo test -p telesthitium`.
 
 **What the hub is NOT.** The hub *cannot decrypt* (§10): it holds no PSK and
@@ -13,8 +13,9 @@ never derives a `Key`. It therefore does not implement crypto (§3), the control
 channel semantics (§4), Channel reliability (§6), Stream watermarking (§5),
 capability/cipher negotiation (§12.5), or LAN discovery (§9.2 — explicitly a
 peer, no-hub mechanism). The hub reads only the **cleartext** header fields
-(§1): `band_id` for routing, and `channel_type`/`channel_id` for selecting the
-correct WebTransport carrier (§9.6). Everything from offset 27 on is opaque.
+(§1): `band_id` for routing, `channel_type`/`channel_id` for addressed routing
+(§10.1) and for selecting the correct WebTransport carrier (§9.6). Everything
+from offset 27 on is opaque.
 
 ## A. Frame routing (§1, §12.4) — `src/frame.rs`
 
@@ -23,7 +24,7 @@ correct WebTransport carrier (§9.6). Everything from offset 27 on is opaque.
 | A1 | `band_id` = bytes 0..16 (cleartext, raw). | `frame::band_id_is_first_16` |
 | A2 | `channel_type` = byte 16; `channel_id` = bytes 17..19 (uint16 BE). | `frame::reads_channel_type_and_id_be` |
 | A3 | `MIN_PACKET_SIZE` = 43; shorter packets are malformed and dropped. | `frame::rejects_below_min_packet`, `frame::accepts_exactly_min` |
-| A4 | Unknown `channel_type` (0x05+) still yields `band_id`+`channel_id` for routing. | `frame::unknown_channel_type_still_routable` |
+| A4 | Unknown `channel_type` (0x06+) still yields `band_id`+`channel_id` for routing. | `frame::unknown_channel_type_still_routable` |
 | A5 | Routing agrees byte-for-byte with the library (`telesthete::{Header, ChannelType}`). | `frame::matches_library_header` |
 
 ## B. Band registry & relay semantics (§10) — `src/registry.rs`
@@ -54,7 +55,7 @@ correct WebTransport carrier (§9.6). Everything from offset 27 on is opaque.
 | D3 | A slow peer's outbound queue is bounded; overflow drops (logged). | `registry::slow_peer_queue_bounded` |
 | D4 | A UDP source is not a relay destination until it has sent `udp_validation_packets` (default 2). This is a mild robustness gate, **not** a return-routability proof — see the caveat under Deviations. | `registry::udp_dest_requires_validation`, `registry::udp_validation_disabled_when_one` |
 | D5 | Connection peers (WSS/WT/AF_UNIX) are eligible destinations immediately. | `registry::conn_peer_eligible_immediately` |
-| D6 | Every UDP peer has its own bounded egress queue (`HUB_UDP_PEER_QUEUE`), so one peer's overflow never drops another peer's frames. | `registry::udp_peer_queues_are_independent`, `udp::each_udp_peer_gets_its_own_queue` |
+| D6 | Every UDP peer has its own bounded egress queue (`HUB_UDP_PEER_QUEUE`), so one peer's overflow never drops another peer's frames. | `registry::udp_peer_queues_are_independent`, `udp::each_udp_peer_gets_its_own_queue`, `it_route::burst_to_one_udp_peer_does_not_starve_another` |
 
 ## E. UDP transport (§9.1) — `src/udp.rs`, `tests/it_udp.rs`
 
@@ -99,6 +100,22 @@ correct WebTransport carrier (§9.6). Everything from offset 27 on is opaque.
 | I2 | One SEQPACKET message = one Telesthete packet (boundaries preserved). | `local_peer_bridged_with_boundaries` |
 | I3 | The socket directory is created 0700 (directory perms are the access control). | `socket_dir_is_0700` |
 
+## K. Addressed routing (§10.1) — `src/registry.rs`, `tests/it_route.rs`
+
+| ID | Claim | Test |
+|----|-------|------|
+| K0 | `channel_type` 0x05 parses as Route; its `channel_id` is the declared id. | `frame::route_type_is_parsed` |
+| K1 | A Route frame records the sender's route id and is never relayed or federated. | `registry::route_frame_is_consumed_and_recorded`, `registry::route_frame_is_not_federated` |
+| K2 | A Channel frame with a nonzero `channel_id` another peer declared reaches only the declarer(s) — all of them on a collision. | `registry::addressed_channel_reaches_only_declarers` |
+| K3 | `channel_id` 0, an undeclared id, and every non-Channel type are broadcast unchanged. | `registry::undeclared_or_zero_or_non_channel_broadcasts` |
+| K4 | Addressed frames are never echoed; if the sender is the only declarer, the frame is broadcast. | `registry::addressed_never_echoes_and_sole_self_declarer_falls_back` |
+| K5 | Eligibility (D4) still gates delivery; a validating declarer's id still suppresses broadcast. | `registry::addressed_honours_eligibility` |
+| K6 | A re-declaration replaces the id; declaring 0 withdraws it. | `registry::redeclare_replaces_and_zero_clears` |
+| K7 | Route ids are forgotten on disconnect and on idle eviction. | `registry::route_forgotten_on_disconnect_and_prune` |
+| K8 | Declarations are band-scoped. | `registry::routes_are_band_scoped` |
+| K9 | Link-injected frames are addressed against local declarations; a Route frame from a link is dropped. | `registry::link_injection_honours_local_routes` |
+| K10 | End to end over UDP sockets: addressed, broadcast, and undeclared frames reach the right peers. | `it_route::addressed_frames_reach_only_the_declarer` |
+
 ## J. Operability
 
 | ID | Claim | Test |
@@ -135,6 +152,10 @@ correct WebTransport carrier (§9.6). Everything from offset 27 on is opaque.
   peers; a WSS/WebTransport/AF_UNIX peer's liveness is its transport connection
   (removed on disconnect, plus a WS ping/idle-timeout for dead-but-unclosed
   sockets), so a legitimate receive-only listener is never silently dropped.
+- **Addressed routing (§10.1)** reads `channel_type`/`channel_id`, which are
+  not authenticated to the hub (it has no key). A header forger could already
+  drop or redirect frames, so this adds no capability; payload AEAD is
+  unchanged. See SPEC §10.1 Security.
 - **Connections are pinned to one band.** Although §10 routes purely by
   `band_id`, each WSS/WebTransport/AF_UNIX connection is bound to the band of its
   first frame (or, for WebTransport, its `?band=` query); frames naming a

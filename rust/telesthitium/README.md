@@ -6,8 +6,8 @@ The **reference relay hub** for the Telesthete wire protocol — SPEC §10
 The hub matches peers by the cleartext 16-byte `band_id` prefix of each frame
 and bridges opaque ciphertext between every peer in the same band. It holds no
 PSK and **cannot decrypt** — it reads only the cleartext header (`band_id`, and
-`channel_type`/`channel_id` for WebTransport carrier selection); everything from
-offset 27 on is opaque.
+`channel_type`/`channel_id` for addressed routing and WebTransport carrier
+selection); everything from offset 27 on is opaque.
 
 It terminates all four transports §10 names and bridges freely between them:
 
@@ -30,7 +30,7 @@ From the repo's `rust/` workspace:
 cd rust
 cargo build --release -p telesthitium
 # binary: target/release/telesthete-hub
-cargo test -p telesthitium          # 55 tests
+cargo test -p telesthitium          # 69 tests
 ```
 
 ## Run
@@ -122,5 +122,14 @@ sudo systemctl enable --now telesthete-hub
   shorter packets are dropped.
 - Discovery is implicit: sending a frame for a `band_id` registers the peer for
   that band. The hub never originates frames of its own.
+- **Addressed routing (SPEC §10.1).** A peer may declare a 16-bit route id by
+  sending a Route (`channel_type` 0x05) frame whose `channel_id` is the id; the
+  hub records it and does not relay the frame. Channel (0x02) frames whose
+  nonzero `channel_id` another peer in the band declared then go only to the
+  declaring peer(s). Everything else — `channel_id` 0, ids nobody declared,
+  and every other channel type — is broadcast as before, so bands without a
+  declaring peer behave exactly as they always have. Declarations are
+  forgotten when the peer is evicted or disconnects; peers re-declare with
+  their keepalives.
 - Eviction: peers unseen for `HUB_PEER_TTL_SECS` are dropped; empty bands are
   reaped.
