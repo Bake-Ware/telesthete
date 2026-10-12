@@ -10,7 +10,8 @@
 //! keeps [`Registry::forward`] fully synchronous (no I/O under lock): it
 //! collects sinks under the lock, releases it, then `try_send`s. Bounded
 //! channels give backpressure-by-drop so one slow peer can't grow memory
-//! without limit (conformance D3).
+//! without limit (conformance D3). Every peer — UDP included — has its own
+//! queue, so a burst to one peer can never crowd out another's traffic.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -56,9 +57,12 @@ impl Default for Limits {
 /// into a bounded channel that the owning transport drains.
 #[derive(Clone)]
 pub enum Sink {
-    /// A UDP peer: frames go to the shared UDP writer task with the peer's addr.
+    /// A UDP peer: frames go to that peer's own bounded queue, drained by a
+    /// per-peer writer task onto the shared socket. Per-peer (not one shared
+    /// queue) so a large burst to one peer can't fill the queue and drop
+    /// unrelated peers' frames. `addr` is kept for logging.
     Udp {
-        tx: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
+        tx: mpsc::Sender<Arc<[u8]>>,
         addr: SocketAddr,
     },
     /// A connection-oriented peer (WSS / WebTransport / AF_UNIX): frames go to
@@ -69,7 +73,7 @@ pub enum Sink {
 impl Sink {
     fn try_send(&self, frame: Arc<[u8]>) -> Result<(), SendDrop> {
         match self {
-            Sink::Udp { tx, addr } => tx.try_send((*addr, frame)).map_err(|e| match e {
+            Sink::Udp { tx, .. } => tx.try_send(frame).map_err(|e| match e {
                 mpsc::error::TrySendError::Full(_) => SendDrop::Full,
                 mpsc::error::TrySendError::Closed(_) => SendDrop::Closed,
             }),
@@ -181,14 +185,20 @@ impl Registry {
     /// Eligible as a destination immediately (D5).
     pub fn connect(&self, band: BandId, key: PeerKey, sink: Sink) -> Result<(), RegError> {
         let mut bands = self.bands.lock().unwrap();
-        Self::insert(&mut bands, &self.limits, band, key, sink, true)
+        Self::insert(&mut bands, &self.limits, band, key, || sink, true)
     }
 
     /// Register-or-refresh a UDP peer from an inbound datagram. Tracks
     /// validation and flips the peer eligible once it has proven routability
-    /// (D4). The `sink` is only used on first sight; refreshes keep the
-    /// original.
-    pub fn observe_udp(&self, band: BandId, addr: SocketAddr, sink: Sink) -> Result<(), RegError> {
+    /// (D4). `make_sink` is called only on first sight, and only once the peer
+    /// is admitted, so the transport can allocate the peer's own queue (and
+    /// writer) lazily; refreshes keep the original sink.
+    pub fn observe_udp(
+        &self,
+        band: BandId,
+        addr: SocketAddr,
+        make_sink: impl FnOnce() -> Sink,
+    ) -> Result<(), RegError> {
         let key = PeerKey::Udp(addr);
         let mut bands = self.bands.lock().unwrap();
         if let Some(peer) = bands.get_mut(&band).and_then(|p| p.get_mut(&key)) {
@@ -199,7 +209,7 @@ impl Registry {
             }
             return Ok(());
         }
-        Self::insert(&mut bands, &self.limits, band, key, sink, false)
+        Self::insert(&mut bands, &self.limits, band, key, make_sink, false)
     }
 
     /// Refresh an existing peer's liveness on an inbound frame (used by
@@ -217,7 +227,7 @@ impl Registry {
         limits: &Limits,
         band: BandId,
         key: PeerKey,
-        sink: Sink,
+        make_sink: impl FnOnce() -> Sink,
         conn: bool,
     ) -> Result<(), RegError> {
         let is_new_band = !bands.contains_key(&band);
@@ -235,7 +245,7 @@ impl Registry {
         peers.insert(
             key,
             Peer {
-                sink,
+                sink: make_sink(),
                 last_seen: Instant::now(),
                 eligible,
                 seen: 1,
@@ -374,7 +384,7 @@ mod tests {
         (Sink::Conn(tx), rx)
     }
 
-    type UdpRx = mpsc::Receiver<(SocketAddr, Arc<[u8]>)>;
+    type UdpRx = mpsc::Receiver<Arc<[u8]>>;
 
     fn udp(cap: usize, addr: SocketAddr) -> (Sink, UdpRx) {
         let (tx, rx) = mpsc::channel(cap);
@@ -437,8 +447,8 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:6000".parse().unwrap();
         let (us, mut urx) = udp(8, addr);
         let (cs, mut crx) = conn(8);
-        r.observe_udp(band(1), addr, us).unwrap();
-        r.observe_udp(band(1), addr, udp(8, addr).0).unwrap(); // 2nd packet -> eligible
+        r.observe_udp(band(1), addr, || us).unwrap();
+        r.observe_udp(band(1), addr, || udp(8, addr).0).unwrap(); // 2nd packet -> eligible
         r.connect(band(1), PeerKey::Conn(1), cs).unwrap();
         assert_eq!(r.peer_count(&band(1)), 2);
         r.forward(&band(1), &PeerKey::Conn(99), frame(band(1)));
@@ -460,9 +470,9 @@ mod tests {
         // D4 — one packet is not enough to become a destination.
         let r = Registry::new(big()); // udp_validation_packets = 2
         let addr: SocketAddr = "127.0.0.1:6001".parse().unwrap();
-        r.observe_udp(band(1), addr, udp(8, addr).0).unwrap();
+        r.observe_udp(band(1), addr, || udp(8, addr).0).unwrap();
         assert_eq!(r.is_eligible(&band(1), &PeerKey::Udp(addr)), Some(false));
-        r.observe_udp(band(1), addr, udp(8, addr).0).unwrap();
+        r.observe_udp(band(1), addr, || udp(8, addr).0).unwrap();
         assert_eq!(r.is_eligible(&band(1), &PeerKey::Udp(addr)), Some(true));
     }
 
@@ -473,7 +483,7 @@ mod tests {
             ..big()
         });
         let addr: SocketAddr = "127.0.0.1:6002".parse().unwrap();
-        r.observe_udp(band(1), addr, udp(8, addr).0).unwrap();
+        r.observe_udp(band(1), addr, || udp(8, addr).0).unwrap();
         assert_eq!(r.is_eligible(&band(1), &PeerKey::Udp(addr)), Some(true));
     }
 
@@ -529,7 +539,7 @@ mod tests {
         let r = Registry::new(big());
         let addr: SocketAddr = "127.0.0.1:6003".parse().unwrap();
         assert!(!r.contains(&band(1), &PeerKey::Udp(addr)));
-        r.observe_udp(band(1), addr, udp(8, addr).0).unwrap();
+        r.observe_udp(band(1), addr, || udp(8, addr).0).unwrap();
         assert!(r.contains(&band(1), &PeerKey::Udp(addr)));
     }
 
@@ -541,7 +551,7 @@ mod tests {
             ..big()
         });
         let addr: SocketAddr = "127.0.0.1:6100".parse().unwrap();
-        r.observe_udp(band(1), addr, udp(8, addr).0).unwrap();
+        r.observe_udp(band(1), addr, || udp(8, addr).0).unwrap();
         assert_eq!(r.peer_count(&band(1)), 1);
         std::thread::sleep(Duration::from_millis(20));
         let (evicted, remaining) = r.prune(Duration::from_millis(5));
@@ -559,9 +569,9 @@ mod tests {
         });
         let addr: SocketAddr = "127.0.0.1:6101".parse().unwrap();
         let key = PeerKey::Udp(addr);
-        r.observe_udp(band(1), addr, udp(8, addr).0).unwrap();
+        r.observe_udp(band(1), addr, || udp(8, addr).0).unwrap();
         std::thread::sleep(Duration::from_millis(20));
-        r.observe_udp(band(1), addr, udp(8, addr).0).unwrap(); // fresh activity
+        r.observe_udp(band(1), addr, || udp(8, addr).0).unwrap(); // fresh activity
         let (evicted, _) = r.prune(Duration::from_millis(50));
         assert_eq!(evicted, 0);
         assert!(r.contains(&band(1), &key));
@@ -592,6 +602,67 @@ mod tests {
         r.disconnect(&band(1), &k);
         assert!(!r.contains(&band(1), &k));
         assert_eq!(r.band_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn udp_peer_queues_are_independent() {
+        // D6 — one UDP peer's full queue costs other peers nothing: flood the
+        // band, A (cap 2) overflows and drops, B (cap 64) still gets every
+        // frame. (A single hub-wide UDP queue made A's backlog everyone's.)
+        let r = Registry::new(Limits {
+            udp_validation_packets: 1,
+            ..big()
+        });
+        let a: SocketAddr = "127.0.0.1:6300".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:6301".parse().unwrap();
+        let (sa, mut ra) = udp(2, a);
+        let (sb, mut rb) = udp(64, b);
+        r.observe_udp(band(1), a, || sa).unwrap();
+        r.observe_udp(band(1), b, || sb).unwrap();
+        for _ in 0..50 {
+            r.forward(&band(1), &PeerKey::Conn(99), frame(band(1)));
+        }
+        let (mut na, mut nb) = (0, 0);
+        while ra.try_recv().is_ok() {
+            na += 1;
+        }
+        while rb.try_recv().is_ok() {
+            nb += 1;
+        }
+        assert_eq!(na, 2, "A's queue is bounded");
+        assert_eq!(nb, 50, "B is unaffected by A's overflow");
+    }
+
+    #[test]
+    fn observe_udp_builds_sink_only_on_admission() {
+        // The sink factory (which spawns a writer) runs once, on first sight,
+        // and not at all for a refused peer.
+        let r = Registry::new(Limits {
+            max_peers_per_band: 1,
+            ..big()
+        });
+        let a: SocketAddr = "127.0.0.1:6400".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:6401".parse().unwrap();
+        let mut built = 0;
+        r.observe_udp(band(1), a, || {
+            built += 1;
+            udp(2, a).0
+        })
+        .unwrap();
+        r.observe_udp(band(1), a, || {
+            built += 1;
+            udp(2, a).0
+        })
+        .unwrap();
+        assert_eq!(built, 1, "refresh must not rebuild the sink");
+        assert_eq!(
+            r.observe_udp(band(1), b, || {
+                built += 1;
+                udp(2, b).0
+            }),
+            Err(RegError::PeerCap)
+        );
+        assert_eq!(built, 1, "refused peer must not build a sink");
     }
 
     #[test]

@@ -49,6 +49,11 @@ pub struct Config {
     pub prune_interval: Duration,
     /// Per-connection outbound queue depth (bounds a slow peer's memory, D3).
     pub conn_queue: usize,
+    /// Per-**UDP-peer** outbound queue depth (`HUB_UDP_PEER_QUEUE`; defaults to
+    /// `conn_queue`, so an unconfigured hub keeps `HUB_CONN_QUEUE` as its one
+    /// queue knob). Each UDP peer has its own queue, so one peer's burst can't
+    /// drop another's frames.
+    pub udp_peer_queue: usize,
     pub limits: Limits,
     /// Operator-supplied cert/key PEM paths (`HUB_TLS_CERT` / `HUB_TLS_KEY`).
     pub tls_cert_path: Option<PathBuf>,
@@ -134,6 +139,7 @@ impl Config {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| vec!["localhost".to_string()]);
 
+        let conn_queue = parse_or(env("HUB_CONN_QUEUE"), DEFAULT_CONN_QUEUE);
         Config {
             udp_bind,
             ws_bind: opt_addr("HUB_WS_BIND"),
@@ -146,7 +152,8 @@ impl Config {
                 env("HUB_PRUNE_SECS"),
                 DEFAULT_PRUNE_SECS,
             )),
-            conn_queue: parse_or(env("HUB_CONN_QUEUE"), DEFAULT_CONN_QUEUE),
+            conn_queue,
+            udp_peer_queue: parse_or(env("HUB_UDP_PEER_QUEUE"), conn_queue),
             limits: Limits {
                 max_bands: parse_or(env("HUB_MAX_BANDS"), DEFAULT_MAX_BANDS),
                 max_peers_per_band: parse_or(
@@ -202,6 +209,7 @@ impl Default for Config {
             peer_ttl: Duration::from_secs(DEFAULT_PEER_TTL_SECS),
             prune_interval: Duration::from_secs(DEFAULT_PRUNE_SECS),
             conn_queue: DEFAULT_CONN_QUEUE,
+            udp_peer_queue: DEFAULT_CONN_QUEUE,
             limits: Limits::default(),
             tls_cert_path: None,
             tls_key_path: None,

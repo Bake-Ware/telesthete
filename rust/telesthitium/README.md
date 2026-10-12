@@ -30,7 +30,7 @@ From the repo's `rust/` workspace:
 cd rust
 cargo build --release -p telesthitium
 # binary: target/release/telesthete-hub
-cargo test -p telesthitium          # 46 tests
+cargo test -p telesthitium          # 55 tests
 ```
 
 ## Run
@@ -67,7 +67,8 @@ address / directory.
 | `HUB_PRUNE_SECS` | `5` | eviction sweep interval |
 | `HUB_MAX_BANDS` | `4096` | band cap |
 | `HUB_MAX_PEERS_PER_BAND` | `256` | per-band peer cap |
-| `HUB_CONN_QUEUE` | `1024` | per-connection outbound queue depth |
+| `HUB_CONN_QUEUE` | `1024` | per-connection outbound queue depth (WSS/WT/AF_UNIX), and the UDP default below |
+| `HUB_UDP_PEER_QUEUE` | `HUB_CONN_QUEUE` | outbound queue depth **per UDP peer** (each UDP peer has its own queue) |
 | `HUB_UDP_VALIDATION_PACKETS` | `2` | UDP packets required before a source is an eligible destination (`1` disables) |
 | `RUST_LOG` | `info` | `tracing` env-filter |
 
@@ -106,8 +107,11 @@ sudo systemctl enable --now telesthete-hub
   relay cannot issue the echoed cookie that would). Connection transports
   (WSS/WebTransport/AF_UNIX) prove routability via their handshake and are bound
   to a single band per connection.
-- **Bounded memory.** Band and per-band peer caps, plus bounded per-connection
-  queues (drop-on-overflow), cap resource use under flood.
+- **Bounded memory.** Band and per-band peer caps, plus a bounded outbound
+  queue per peer (drop-on-overflow), cap resource use under flood. Every peer,
+  UDP included, has its own queue, so a burst to one peer can only drop that
+  peer's frames. Worst case is `max_peers × queue depth` frames hub-wide;
+  lower `HUB_UDP_PEER_QUEUE` on a hub with many UDP peers and little RAM.
 
 ## Protocol notes
 

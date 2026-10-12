@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let Some(bind) = cfg.udp_bind {
-        let (registry, mut rx, q) = (registry.clone(), sd_rx.clone(), cfg.conn_queue);
+        let (registry, mut rx, q) = (registry.clone(), sd_rx.clone(), cfg.udp_peer_queue);
         tasks.push(tokio::spawn(async move {
             let sd = async {
                 let _ = rx.wait_for(|v| *v).await;

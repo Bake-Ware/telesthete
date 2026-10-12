@@ -4,8 +4,8 @@ The reference hub implements **SPEC §10** in full: it matches peers by `band_id
 and bridges opaque ciphertext between them across every transport §10 names —
 UDP (§9.1), WebSocket/WSS (§9.3), WebTransport/HTTP-3 (§9.6), and AF_UNIX (§9.4).
 
-**Status: complete.** Every claim below is covered by a test — 33 unit tests
-plus 13 integration tests (46 total), all green, zero warnings. Run them with
+**Status: complete.** Every claim below is covered by a test — 39 unit tests
+plus 16 integration tests (55 total), all green. Run them with
 `cargo test -p telesthitium`.
 
 **What the hub is NOT.** The hub *cannot decrypt* (§10): it holds no PSK and
@@ -54,6 +54,7 @@ correct WebTransport carrier (§9.6). Everything from offset 27 on is opaque.
 | D3 | A slow peer's outbound queue is bounded; overflow drops (logged). | `registry::slow_peer_queue_bounded` |
 | D4 | A UDP source is not a relay destination until it has sent `udp_validation_packets` (default 2). This is a mild robustness gate, **not** a return-routability proof — see the caveat under Deviations. | `registry::udp_dest_requires_validation`, `registry::udp_validation_disabled_when_one` |
 | D5 | Connection peers (WSS/WT/AF_UNIX) are eligible destinations immediately. | `registry::conn_peer_eligible_immediately` |
+| D6 | Every UDP peer has its own bounded egress queue (`HUB_UDP_PEER_QUEUE`), so one peer's overflow never drops another peer's frames. | `registry::udp_peer_queues_are_independent`, `udp::each_udp_peer_gets_its_own_queue` |
 
 ## E. UDP transport (§9.1) — `src/udp.rs`, `tests/it_udp.rs`
 
