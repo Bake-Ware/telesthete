@@ -662,6 +662,12 @@ or `seq >= total`; ignore duplicate `seq`; and reset a buffer if a
 `fragment_id`'s `total` changes mid-message (corrupt sender). Bound
 memory: cap concurrent in-flight messages (reference: 256, evict oldest)
 and discard partial reassemblies older than a timeout (reference: 30 s).
+Receivers SHOULD also drop a chunk of a multi-chunk message whose data
+exceeds `MAX_CHUNK_PAYLOAD`, drop chunks declaring a `total` above a local
+cap (reference: 16384, ~16 MB), and MAY bound total buffered bytes across
+partial messages (evicting the oldest). A single-chunk message
+(`total = 1`) is never buffered and is exempt from the per-chunk cap; its
+size is bounded by the carrying datagram.
 
 Streams (§5) do NOT use this envelope; they fragment codec frames with
 the §5.4.1 `FRAGMENT_CONT` flag instead. This envelope is for Channel
