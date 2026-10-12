@@ -28,6 +28,10 @@ pub enum ChannelType {
     Channel = 0x02,
     Board = 0x03,
     Drop = 0x04,
+    /// Hub route declaration (SPEC §2, §10.1). A peer sends one of these with
+    /// `channel_id` = its route id; a routing hub records it and never relays
+    /// it. Peers never deliver it to an application.
+    Route = 0x05,
 }
 
 impl ChannelType {
@@ -38,9 +42,31 @@ impl ChannelType {
             0x02 => Some(Self::Channel),
             0x03 => Some(Self::Board),
             0x04 => Some(Self::Drop),
+            0x05 => Some(Self::Route),
             _ => None,
         }
     }
+}
+
+/// Domain-separation prefix for [`route_id_for`] (SPEC §10.1).
+pub const ROUTE_ID_DOMAIN: &[u8] = b"telesthete-route-v1:";
+
+/// Stable, nonzero 16-bit route id for a peer name (SPEC §10.1).
+///
+/// `SHA-256(ROUTE_ID_DOMAIN || utf8(name))`, read as big-endian u16 pairs; the
+/// first nonzero pair wins (0 is reserved for "broadcast"), falling back to 1
+/// in the astronomically unlikely all-zero case. Byte-identical with the
+/// Python `telesthete.protocol.route.route_id_for` (tests/vectors.json `route`).
+pub fn route_id_for(name: &str) -> u16 {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(ROUTE_ID_DOMAIN);
+    h.update(name.as_bytes());
+    let d = h.finalize();
+    d.chunks_exact(2)
+        .map(|p| u16::from_be_bytes([p[0], p[1]]))
+        .find(|&v| v != 0)
+        .unwrap_or(1)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +247,41 @@ mod tests {
         let mut pkt = encode_packet(&key, &band_id, ChannelType::Stream, 1, 1, b"x").unwrap();
         pkt[18] ^= 0xFF; // corrupt channel_id low byte
         assert!(decode_packet(&key, &pkt).is_err());
+    }
+
+    #[test]
+    fn route_type_round_trips() {
+        assert_eq!(ChannelType::from_u8(0x05), Some(ChannelType::Route));
+        assert_eq!(ChannelType::Route as u8, 0x05);
+        assert_eq!(ChannelType::from_u8(0x06), None);
+    }
+
+    /// Byte-identical with the Python reference: tests/vectors.json `route`
+    /// (route ids, and full ROUTE declaration frames under the base key).
+    #[test]
+    fn route_vectors_match_python() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/vectors.json");
+        let raw = std::fs::read_to_string(path).expect("read tests/vectors.json");
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let route = &v["route"];
+        for case in route["ids"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let want = case["route_id"].as_u64().unwrap() as u16;
+            assert_eq!(route_id_for(name), want, "route id diverged for {name:?}");
+        }
+        let psk = v["psk"].as_str().unwrap().as_bytes();
+        let key = derive_key(psk);
+        let band_id = derive_band_id(psk);
+        for case in route["declarations"].as_array().unwrap() {
+            assert_eq!(case["cipher"].as_str().unwrap(), "chacha20-poly1305");
+            let seq = case["seq"].as_u64().unwrap();
+            let rid = case["route_id"].as_u64().unwrap() as u16;
+            let pkt = encode_packet(&key, &band_id, ChannelType::Route, rid, seq, b"").unwrap();
+            let hex: String = pkt.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(hex, case["frame_hex"].as_str().unwrap(), "declaration diverged");
+            let (h, pt) = decode_packet(&key, &pkt).unwrap();
+            assert_eq!((h.channel_type, h.channel_id, pt.len()), (ChannelType::Route, rid, 0));
+        }
     }
 
     #[test]

@@ -25,6 +25,9 @@ class ChannelType(IntEnum):
     CHANNEL = 0x02
     BOARD = 0x03
     DROP = 0x04
+    # Hub route declaration (SPEC §2, §10.1): channel_id = the sender's route
+    # id. Consumed by a routing hub, never delivered to an application.
+    ROUTE = 0x05
 
 
 class Packet(NamedTuple):

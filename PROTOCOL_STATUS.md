@@ -42,6 +42,7 @@ Legend: ✅ done · ◑ partial · ⬜ not yet · — n/a
 | WebTransport | §9.6 | ⬜ | ⬜ |
 | WebSocket fallback | §9.3 | ⬜ | ⬜ |
 | Telesthetium hub / relay | §10 | ⬜ | ◑ (`telesthitium`) |
+| Hub addressed routing (Route 0x05) | §10.1 | ✅ `route_id_for`, `pack_route_declaration` | ✅ hub + `route_id_for` |
 
 ## Notable gaps / next steps
 
@@ -62,6 +63,7 @@ Legend: ✅ done · ◑ partial · ⬜ not yet · — n/a
 |-------|----------------|
 | `tests/test_vectors.py` / `crypto::tests::conformance_vectors_match_python` | Python ⇄ Rust crypto byte-identical (chacha + aes) |
 | `tests/test_fragment.py` / `wire::fragment::tests::conformance_vectors_match_python` | Fragmentation byte-identical; reassembly memory bounds |
+| `tests/test_route.py` / `framing::tests::route_vectors_match_python` | Route ids + Route declaration frames byte-identical; old empty-AAD receivers reject declarations |
 | `tests/test_negotiation.py` | Live two-Band AES handshake + baseline fallback |
 | `tests/test_replay.py` | Control + Stream reject replays/stale |
 | `tests/test_end_to_end.py`, `tests/test_crypto_framing.py` | Band data path, AEAD/framing integration |

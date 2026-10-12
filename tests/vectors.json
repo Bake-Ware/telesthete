@@ -254,5 +254,48 @@
       "count": 3,
       "hash": "2b43690b607f5bf427d3fc5d6ae458bd20cb76772112a10e8b2694aef0c29fa9"
     }
-  ]
+  ],
+  "route": {
+    "_comment": "SPEC \u00a710.1. route_id = first nonzero BE u16 word of SHA-256(\"telesthete-route-v1:\" || utf8(name)), else 1. Declaration = ROUTE (0x05) frame, channel_id = route_id, empty payload sealed under the base key (session=None) with AAD [0x05, id_hi, id_lo].",
+    "ids": [
+      {
+        "name": "",
+        "route_id": 62722
+      },
+      {
+        "name": "rook",
+        "route_id": 6393
+      },
+      {
+        "name": "kaiju",
+        "route_id": 38185
+      },
+      {
+        "name": "bakephone",
+        "route_id": 18922
+      },
+      {
+        "name": "worker-\u00fc",
+        "route_id": 36495
+      },
+      {
+        "name": "zero-prefix-28041",
+        "route_id": 65152
+      }
+    ],
+    "declarations": [
+      {
+        "cipher": "chacha20-poly1305",
+        "seq": 1,
+        "route_id": 6393,
+        "frame_hex": "0afe84fe0416416254215e739fc04cd90518f900000000000000013bcb9110a8f8dd9825f17862e197319a"
+      },
+      {
+        "cipher": "chacha20-poly1305",
+        "seq": 1311768467294899695,
+        "route_id": 0,
+        "frame_hex": "0afe84fe0416416254215e739fc04cd90500001234567890abcdef764c795c0a9853ccae3220538e380867"
+      }
+    ]
+  }
 }

@@ -72,9 +72,12 @@ Big-endian: "!16s B H Q"
 | 0x02  | Channel   | Reliable, ordered byte streams (TCP-over-UDP). | 1  |
 | 0x03  | Board     | Replicated LWW key-value state (§7).     | v1.2  |
 | 0x04  | Drop      | Chunked, resumable file distribution (§8). | v1.2 |
+| 0x05  | Route     | Hub route declaration (§10.1). Hub-consumed; never delivered to an application. | v1.2 |
 
 A receiver **MUST drop** a frame whose `channel_type` it does not handle (an
-undefined value, or a defined-but-unimplemented type such as Board/Drop). It MAY
+undefined value, or a defined-but-unimplemented type such as Board/Drop). Peers
+never handle Route: a Route frame that reaches a peer (e.g. relayed by a hub
+that predates §10.1) is dropped like any unhandled type. It MAY
 reject at parse time (never constructing a typed header) or at dispatch (no
 registered handler); both are conformant, since the outcome — the frame is
 discarded — is identical. This keeps `channel_type` forward-extensible.
@@ -931,7 +934,11 @@ yet implemented.
 
 Self-hosted relay/signaling server. Peers connect outbound, identify by
 `band_id`. Hub matches peers in the same Band and bridges traffic.
-Hub sees only `band_id` + opaque ciphertext. Cannot decrypt.
+Hub sees only the cleartext header (`band_id`, `channel_type`, `channel_id`)
++ opaque ciphertext. Cannot decrypt.
+
+By default a frame is delivered to every *other* peer in the band (never
+echoed to its sender). §10.1 lets a peer opt in to addressed delivery.
 
 Connection modes:
 - **LAN:** Direct UDP, no hub needed.
@@ -942,7 +949,95 @@ The hub is also the default HTTP/3 terminator for WebTransport (§9.6)
 and the WSS terminator for the legacy WebSocket fallback (§9.3): a
 browser peer reaches the band by connecting to the hub over UDP/443,
 and the hub bridges it to UDP/AF_UNIX peers in the same band. Routing
-is by `band_id` only; the hub still cannot decrypt.
+is by `band_id` (plus §10.1 route ids); the hub still cannot decrypt.
+
+### 10.1 Addressed routing (v1.2, optional)
+
+Broadcast relay makes every peer receive — and decrypt, and reassemble —
+all band traffic, including large replies meant for one peer. Addressed
+routing lets the hub deliver such traffic only to its addressee, using
+nothing but the cleartext header.
+
+**Route ids.** A route id is a nonzero `uint16`. Peers SHOULD derive it from
+a stable name so every party computes the same id without coordination:
+
+```
+digest   = SHA-256("telesthete-route-v1:" || utf8(name))
+route_id = first nonzero big-endian uint16 word of digest   (1 if none)
+```
+
+(Python `telesthete.protocol.route.route_id_for`, Rust
+`telesthete::route_id_for`; pinned by `tests/vectors.json` `route`.) Ids are
+16-bit, so distinct names can collide; a collision only widens delivery to
+every peer sharing the id. Receivers MUST still check that a message is
+meant for them, exactly as under broadcast.
+
+**Declaration.** A peer declares its route id by sending a Route (0x05)
+frame with `channel_id = route_id` and an empty payload, sealed like any
+other frame (AAD `[0x05, id_hi, id_lo]`; the minimal frame is 43 bytes).
+A routing hub:
+
+1. records `peer → route_id` (one id per peer; a later declaration replaces
+   it; `channel_id = 0` withdraws it), and
+2. does **not** relay or federate the Route frame.
+
+The record is soft state, forgotten when the peer is evicted (idle TTL),
+disconnects, or the hub restarts. Peers SHOULD re-declare periodically
+(e.g. alongside every keepalive) and on reconnect.
+
+**Delivery.** For a frame from peer *S* in band *B*:
+
+| Frame                                                        | Delivered to |
+|--------------------------------------------------------------|--------------|
+| Route (0x05)                                                 | nobody (recorded, §10.1 step 1) |
+| Channel (0x02), `channel_id ≠ 0`, declared by some peer ≠ *S* in *B* | eligible peers in *B* that declared that id, except *S* |
+| Channel (0x02), `channel_id = 0`, or an id no other peer in *B* declared | every eligible peer in *B* except *S* (broadcast) |
+| any other `channel_type`                                     | every eligible peer in *B* except *S* (broadcast) |
+
+Only Channel frames are addressed: on Stream, Board, and Drop, `channel_id`
+is a stream/board/drop id, so routing on it would misdirect existing
+traffic. "Declared" ignores eligibility (a still-validating declarer keeps
+its traffic from being sprayed band-wide while it validates) but delivery
+does not. If the sender is the only declarer of the id, the addressee must
+be a peer that never declared, so the hub falls back to broadcast. Frames
+arriving over a federation link are addressed against the receiving hub's
+local declarations; declarations never cross a link.
+
+**Sending addressed traffic.** A sender sets `channel_id` to the
+addressee's route id on every Channel frame (every fragment, §6.6) of a
+message meant for one peer, and keeps `channel_id = 0` for genuinely
+broadcast traffic (announces, open calls). Because `channel_id` is in the
+AEAD AAD (§3.2), a receiver that authenticates with the spec AAD decrypts
+with the frame's own `channel_id`. A peer that names Channel *connections*
+by `channel_id` (§6) MUST NOT rely on addressed routing for them: the hub
+treats any declared id as an address.
+
+**Compatibility.** Addressed routing is opt-in by declaration and needs no
+capability bit:
+
+- *Old peer ↔ routing hub.* A peer that never declares gets broadcast
+  delivery of everything except frames addressed to an id another peer
+  declared — which were never for it. A peer sending `channel_id = 0` (the
+  Rook transport and ESP32 firmware) sees identical behaviour.
+- *Routing peer ↔ old hub.* The old hub relays Route frames to every peer
+  and broadcasts addressed frames. Spec receivers drop Route by type (§2);
+  receivers that decrypt every frame with empty AAD (Rook's worker
+  transport, the ESP32 firmware) fail authentication on it, since it is
+  sealed with the spec AAD. Addressed data frames are ordinary Channel
+  frames: they reach everyone, as before, and the addressee still gets
+  them. Nothing breaks; there is just no saving.
+
+**Security.** Route ids and declarations ride the cleartext header and
+are not authenticated *to the hub* (the hub holds no key). An on-path or
+in-band attacker who can forge or rewrite a header could already drop,
+delay, or redirect any frame; misusing a route id gives no capability
+beyond that. Confidentiality and integrity are unchanged — the payload
+AEAD is the same, and receivers authenticate exactly as before. What a
+hub (or observer) newly learns is which peer a frame is addressed to, by
+an id derived from a peer name: treat route ids as metadata on par with
+the source address the hub already sees. Declarations are band-scoped:
+`band_id` is the routing capability, so a declaration cannot affect any
+other band.
 
 ---
 
@@ -1048,6 +1143,8 @@ WEBTRANSPORT_ALPN  = "h3"    (v1.2 §9.6)
 WEBTRANSPORT_PORT  = 443     (v1.2; QUIC/UDP)
 WT_STREAM_LEN_PREFIX = 2     (v1.2; uint16 BE per-packet length on reliable WT streams)
 MAX_DATAGRAM_SIZE  = 1200    (v1.2; conservative QUIC datagram payload budget)
+CHANNEL_TYPE_ROUTE = 0x05    (v1.2 §10.1; hub route declaration)
+ROUTE_ID_DOMAIN    = "telesthete-route-v1:"   (v1.2 §10.1; route_id derivation)
 ```
 
 v1.2 is a breaking wire revision: capability announce and cipher
@@ -1115,6 +1212,7 @@ is used with a peer only if it advertises the matching capability/cipher.
 | WebTransport transport        | `webtransport`                   |
 | `KEYFRAME_REQ` / `RATE_HINT`  | `keyframe-req` / `rate-hint`     |
 | Board (§7) / Drop (§8)        | `board-v1` / `drop-v1`           |
+| Hub addressed routing (§10.1) | none — opt-in by Route declaration; falls back to broadcast |
 
 Absent capability ⇒ the sender restricts itself to the baseline the
 feature extends. Unknown capabilities/ciphers are ignored, so the set is
@@ -1180,3 +1278,4 @@ in every libsodium binding, Go `x/crypto`, Node `crypto`,
 | 1.0     | 2026-04-07 | Initial spec from Python reference implementation.                                                                                                                                                                     |
 | 1.1     | 2026-05-11 | Added §3.4 local crypto profile, §5.4 StreamHeader + dmabuf descriptor (capability-gated), §9.4 AF_UNIX transport, §9.5 send-loop priority across transports, §12.5 capability negotiation. `PROTOCOL_VERSION` → 2. Backwards-compatible: v1.0 peers continue to interoperate. |
 | 1.2     | 2026-06-30 | **Breaking wire revision** (collapsed into 1.2 — pre-adoption, sole consumer Rook upgraded in lockstep; no version spam). **Browser/edge:** §9.6 WebTransport (Stream→datagrams, Channel/Control→reliable QUIC streams, length-prefixed), §5.5 WebCodecs decode of §5.4 codec Streams, §4.9 `KEYFRAME_REQ` + §4.10 `RATE_HINT`, §9.3 TCP head-of-line caveat. **Crypto remediation:** AEAD is now a negotiated suite — ChaCha20-Poly1305 (IETF) mandatory baseline + AES-256-GCM optional (§3.2); 12-byte nonce (was 24); per-cipher key derivation (§3.1); real AEAD AAD (the pre-v1.2 Python reference wrongly used XSalsa20/`SecretBox` with AAD prepended — non-interoperable with the spec/Rust). **Capability announce is now foundational/mandatory** with an ordered `ciphers` list and end-to-end cipher negotiation (§3.5, §4.3, §12.5). Replay protection §3.3 SHOULD→MUST. Rook's Channel fragmentation envelope promoted to §6.6. **§6 Channel:** inner per-channel `seq` field added to §6.1 — the outer packet sequence is the AEAD nonce from the one shared per-session `SequenceSource` (§3.3) and is not contiguous per channel; reliability (acks, ordering, retransmits, dedup) tracks the inner `seq`, and retransmissions re-encrypt under a fresh outer sequence. **§7 Board / §8 Drop** specified (were "Future"): Board is a last-writer-wins replicated map with Lamport-clock timestamps and digest-driven anti-entropy; Drop is receiver-driven chunked, resumable file distribution; capabilities `board-v1`/`drop-v1`. Version fields reconciled to one `PROTOCOL_VERSION` (= 3; 1.0→1, 1.1→2, 1.2→3). |
+| 1.2 (addendum) | 2026-10-12 | **Additive, wire-compatible; `PROTOCOL_VERSION` stays 3.** §10.1 optional hub addressed routing: new channel type Route (0x05) declares a peer's 16-bit route id (`route_id = first nonzero BE u16 of SHA-256("telesthete-route-v1:" ‖ name)`); a routing hub consumes it and delivers Channel frames whose nonzero `channel_id` some other peer declared only to the declarers, broadcasting everything else as before. Old peers and old hubs interoperate unchanged (§10.1 Compatibility). §6.6 reassembly hardening guidance (per-chunk cap, declared-`total` cap, optional byte budget). |
