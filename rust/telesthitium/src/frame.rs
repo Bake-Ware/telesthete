@@ -2,7 +2,7 @@
 //!
 //! The hub reads ONLY the fields §1 marks cleartext: `band_id` (routing),
 //! `channel_type` / `channel_id` (WebTransport carrier selection, §9.6, and
-//! addressed routing / ROUTE declarations, §10.1).
+//! ROUTE declarations / ADDRESSED delivery, §10.1).
 //! Everything from offset 27 on is opaque ciphertext the hub never touches —
 //! it holds no PSK and cannot decrypt (§10).
 //!
@@ -17,7 +17,7 @@ use telesthete::{BandId, ChannelType, BAND_ID_LEN, MIN_PACKET_LEN};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RouteInfo {
     pub band_id: BandId,
-    /// `None` when byte 16 is not a known channel type (0x06+). Routing still
+    /// `None` when byte 16 is not a known channel type (0x07+). Routing still
     /// works — `band_id` is valid — but WebTransport carrier selection (§9.6)
     /// has no hint and falls back to a reliable carrier.
     pub channel_type: Option<ChannelType>,
@@ -113,10 +113,10 @@ mod tests {
 
     #[test]
     fn unknown_channel_type_still_routable() {
-        // A4 — byte 16 = 0x06 is not a defined channel type, but band_id and
+        // A4 — byte 16 = 0x07 is not a defined channel type, but band_id and
         // channel_id remain usable for routing.
         let band = [9u8; BAND_ID_LEN];
-        let f = make_frame(band, 0x06, 7);
+        let f = make_frame(band, 0x07, 7);
         let info = route_info(&f).unwrap();
         assert_eq!(info.channel_type, None);
         assert_eq!(info.band_id, band);
@@ -131,6 +131,11 @@ mod tests {
         let info = route_info(&f).unwrap();
         assert_eq!(info.channel_type, Some(ChannelType::Route));
         assert_eq!(info.channel_id, 0x1234);
+        // 0x06 is ADDRESSED; its channel_id is the destination route id.
+        let f = make_frame([1u8; BAND_ID_LEN], 0x06, 0x4321);
+        let info = route_info(&f).unwrap();
+        assert_eq!(info.channel_type, Some(ChannelType::Addressed));
+        assert_eq!(info.channel_id, 0x4321);
     }
 
     #[test]
