@@ -170,3 +170,60 @@ def test_empty_file():
     sender.offer(("receiver", 1))
     _pump(sender, receiver, ts, tr)
     assert receiver.verified is True
+
+
+def test_next_window_matches_missing_ranges():
+    # The incremental window search must pick exactly what the full scan
+    # would: the first missing run, capped at MAX_RANGE_CHUNKS.
+    import random
+    rng = random.Random(3)
+    data = os.urandom(CHUNK_SIZE * 300)
+    for _ in range(50):
+        _, receiver, _, _ = _pair(data)
+        receiver.offer = {"size": len(data), "total_chunks": 300}
+        held = set(rng.sample(range(300), rng.randrange(300)))
+        receiver.have = {i: b"" for i in held}
+        expected = receiver.missing_ranges()[:1]
+        got = receiver._next_missing_range()
+        assert ([got] if got else []) == expected
+        # Filling chunks only moves the search forward; it stays exact.
+        for i in sorted(set(range(300)) - held)[:rng.randrange(1, 40)]:
+            receiver.have[i] = b""
+        expected = receiver.missing_ranges()[:1]
+        got = receiver._next_missing_range()
+        assert ([got] if got else []) == expected
+
+
+class _CountingDict(dict):
+    lookups = 0
+
+    def __contains__(self, key):
+        _CountingDict.lookups += 1
+        return super().__contains__(key)
+
+
+def test_chunk_handling_is_linear_in_file_size():
+    # Each CHUNK used to re-check every index (all(i in have ...)), so a
+    # 32 MiB pull cost ~half a billion lookups. Now completion is a count and
+    # only the <= 64-chunk outstanding window is checked per chunk.
+    data = os.urandom(CHUNK_SIZE * 2048)
+    sender, receiver, ts, tr = _pair(data)
+    sender.offer(("receiver", 1))
+    for _, pkt in ts.sent:
+        receiver.handle_packet(("sender", 1), pkt)   # OFFER
+    ts.sent.clear()
+    receiver.have = _CountingDict(receiver.have)
+    _CountingDict.lookups = 0
+    _pump(sender, receiver, ts, tr, rounds=1000)
+    assert receiver.verified is True
+    n = sender.total_chunks
+    assert _CountingDict.lookups < n * (MAX_RANGE_CHUNKS + 8), _CountingDict.lookups
+
+
+def test_resume_with_every_chunk_finishes_on_offer():
+    data = os.urandom(CHUNK_SIZE * 5 + 3)
+    chunks = {i: data[i * CHUNK_SIZE:(i + 1) * CHUNK_SIZE] for i in range(6)}
+    sender, receiver, ts, tr = _pair(data, have=chunks)
+    sender.offer(("receiver", 1))
+    _pump(sender, receiver, ts, tr)
+    assert receiver.verified is True

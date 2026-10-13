@@ -145,6 +145,10 @@ class DropReceiver(_DropBase):
         self.sender_addr: Optional[tuple] = None
         self.verified: Optional[bool] = None  # None until complete
         self._outstanding: Optional[Tuple[int, int]] = None  # one window (§8.2)
+        # Lowest chunk index that may still be missing. `have` only grows
+        # between OFFERs, so this only moves forward and the next window is
+        # found in amortized O(1) instead of a full scan per window.
+        self._low = 0
         self._last_progress = 0.0
         self._on_complete: Optional[Callable[[bytes, bool], None]] = None
 
@@ -192,16 +196,37 @@ class DropReceiver(_DropBase):
                 run_start = None
         return out
 
+    def _next_missing_range(self) -> Optional[Tuple[int, int]]:
+        """The first [start, end) run of missing chunks, at most
+        MAX_RANGE_CHUNKS long: ``missing_ranges()[0]`` without the full scan."""
+        total = self.offer["total_chunks"] if self.offer else 0
+        while self._low < total and self._low in self.have:
+            self._low += 1
+        if self._low >= total:
+            return None
+        end = self._low + 1
+        limit = min(total, self._low + MAX_RANGE_CHUNKS)
+        while end < limit and end not in self.have:
+            end += 1
+        return (self._low, end)
+
+    def _complete(self) -> bool:
+        """Every chunk of the offer is held. `have` only holds in-range
+        indices once an OFFER filtered it, so the count decides; the full
+        check runs once, when the count first reaches the total."""
+        total = self.offer["total_chunks"]
+        return len(self.have) >= total and all(i in self.have for i in range(total))
+
     def request_missing(self):
         """Ask for the next missing window (one outstanding window, §8.2).
         Call again after REREQUEST_TIMEOUT of no progress to re-pull losses."""
         if self.offer is None or self.sender_addr is None or self.verified is not None:
             return
-        ranges = self.missing_ranges()[:1]
-        if ranges:
-            self._outstanding = ranges[0]
+        window = self._next_missing_range()
+        if window is not None:
+            self._outstanding = window
             self._send_json(self.sender_addr, DropFrameType.REQUEST,
-                            {"ranges": [list(r) for r in ranges]})
+                            {"ranges": [list(window)]})
 
     def tick(self, now: Optional[float] = None):
         """Drive re-requests: if nothing arrived for REREQUEST_TIMEOUT, ask again."""
@@ -237,9 +262,10 @@ class DropReceiver(_DropBase):
                 total = offer["total_chunks"]
                 self.have = {i: c for i, c in self.have.items()
                              if 0 <= i < total and len(c) == self._chunk_len(i)}
+                self._low = 0
                 self.sender_addr = peer_addr
                 self._last_progress = time.monotonic()
-                if all(i in self.have for i in range(total)):
+                if self._complete():
                     self._finish()  # resume already had everything
                 else:
                     self.request_missing()
@@ -250,7 +276,10 @@ class DropReceiver(_DropBase):
                 if index not in self.have and len(frame[5:]) == self._chunk_len(index):
                     self.have[index] = frame[5:]
                     self._last_progress = time.monotonic()
-                if all(i in self.have for i in range(self.offer["total_chunks"])):
+                # Per chunk this must stay O(1) (plus the <= 64-chunk window
+                # check below): a full scan per chunk made a 32 MiB pull spend
+                # ~28 s of CPU on the receiving event loop.
+                if self._complete():
                     self._finish()
                 elif self._outstanding is not None and all(
                         i in self.have for i in range(*self._outstanding)):
