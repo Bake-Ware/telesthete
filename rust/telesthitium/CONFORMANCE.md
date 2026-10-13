@@ -4,8 +4,8 @@ The reference hub implements **SPEC §10** in full: it matches peers by `band_id
 and bridges opaque ciphertext between them across every transport §10 names —
 UDP (§9.1), WebSocket/WSS (§9.3), WebTransport/HTTP-3 (§9.6), and AF_UNIX (§9.4).
 
-**Status: complete.** Every claim below is covered by a test — 49 unit tests
-plus 20 integration tests (69 total), all green. Run them with
+**Status: complete.** Every claim below is covered by a test — 56 unit tests
+plus 21 integration tests (77 total), all green. Run them with
 `cargo test -p telesthitium`.
 
 **What the hub is NOT.** The hub *cannot decrypt* (§10): it holds no PSK and
@@ -24,7 +24,7 @@ from offset 27 on is opaque.
 | A1 | `band_id` = bytes 0..16 (cleartext, raw). | `frame::band_id_is_first_16` |
 | A2 | `channel_type` = byte 16; `channel_id` = bytes 17..19 (uint16 BE). | `frame::reads_channel_type_and_id_be` |
 | A3 | `MIN_PACKET_SIZE` = 43; shorter packets are malformed and dropped. | `frame::rejects_below_min_packet`, `frame::accepts_exactly_min` |
-| A4 | Unknown `channel_type` (0x06+) still yields `band_id`+`channel_id` for routing. | `frame::unknown_channel_type_still_routable` |
+| A4 | Unknown `channel_type` (0x07+) still yields `band_id`+`channel_id` for routing. | `frame::unknown_channel_type_still_routable` |
 | A5 | Routing agrees byte-for-byte with the library (`telesthete::{Header, ChannelType}`). | `frame::matches_library_header` |
 
 ## B. Band registry & relay semantics (§10) — `src/registry.rs`
@@ -55,7 +55,9 @@ from offset 27 on is opaque.
 | D3 | A slow peer's outbound queue is bounded; overflow drops (logged). | `registry::slow_peer_queue_bounded` |
 | D4 | A UDP source is not a relay destination until it has sent `udp_validation_packets` (default 2). This is a mild robustness gate, **not** a return-routability proof — see the caveat under Deviations. | `registry::udp_dest_requires_validation`, `registry::udp_validation_disabled_when_one` |
 | D5 | Connection peers (WSS/WT/AF_UNIX) are eligible destinations immediately. | `registry::conn_peer_eligible_immediately` |
-| D6 | Every UDP peer has its own bounded egress queue (`HUB_UDP_PEER_QUEUE`), so one peer's overflow never drops another peer's frames. | `registry::udp_peer_queues_are_independent`, `udp::each_udp_peer_gets_its_own_queue`, `it_route::burst_to_one_udp_peer_does_not_starve_another` |
+| D6 | Every UDP peer has its own bounded egress queue (`HUB_UDP_PEER_QUEUE`, default 256), so one peer's overflow never drops another peer's frames. | `registry::udp_peer_queues_are_independent`, `udp::each_udp_peer_gets_its_own_queue`, `it_route::burst_to_one_udp_peer_does_not_starve_another` |
+| D7 | Bytes queued across **all** UDP peers are capped hub-wide (`HUB_UDP_QUEUE_BYTES`, default 32 MiB); a frame that would exceed it is dropped like a full queue, and bytes are refunded as writers dequeue. Connection queues are bounded per connection (D3) and not budgeted. | `registry::udp_byte_budget_is_hub_wide`, `registry::byte_budget_refunds_refused_frames`, `udp::writer_refunds_budget_as_frames_leave`, `config::defaults_are_sane` |
+| D8 | A UDP peer's queue and writer task are created only once it is validated (D4): a one-packet (possibly spoofed) source costs a registry entry, not a queue. | `registry::observe_udp_builds_sink_only_on_validation` |
 
 ## E. UDP transport (§9.1) — `src/udp.rs`, `tests/it_udp.rs`
 
@@ -104,17 +106,19 @@ from offset 27 on is opaque.
 
 | ID | Claim | Test |
 |----|-------|------|
-| K0 | `channel_type` 0x05 parses as Route; its `channel_id` is the declared id. | `frame::route_type_is_parsed` |
+| K0 | `channel_type` 0x05 parses as Route and 0x06 as Addressed; `channel_id` is the declared / destination route id. | `frame::route_type_is_parsed` |
 | K1 | A Route frame records the sender's route id and is never relayed or federated. | `registry::route_frame_is_consumed_and_recorded`, `registry::route_frame_is_not_federated` |
-| K2 | A Channel frame with a nonzero `channel_id` another peer declared reaches only the declarer(s) — all of them on a collision. | `registry::addressed_channel_reaches_only_declarers` |
-| K3 | `channel_id` 0, an undeclared id, and every non-Channel type are broadcast unchanged. | `registry::undeclared_or_zero_or_non_channel_broadcasts` |
+| K2 | An Addressed (0x06) frame with a nonzero `channel_id` that an eligible peer other than the sender declared reaches only the declarer(s) — all of them on a collision. | `registry::addressed_frame_reaches_only_declarers` |
+| K3 | Addressed with `channel_id` 0 or an id with no eligible declarer, and **every other type — Channel (0x02) included** — are broadcast unchanged; library Channel connection ids are never treated as addresses. | `registry::undeclared_or_zero_or_non_addressed_broadcasts`, `registry::library_channel_ids_are_never_addressed` |
 | K4 | Addressed frames are never echoed; if the sender is the only declarer, the frame is broadcast. | `registry::addressed_never_echoes_and_sole_self_declarer_falls_back` |
-| K5 | Eligibility (D4) still gates delivery; a validating declarer's id still suppresses broadcast. | `registry::addressed_honours_eligibility` |
+| K5 | Only eligible declarers count: a still-validating declarer neither narrows delivery nor receives; its declaration takes effect once it validates. | `registry::unvalidated_declarer_is_inert` |
 | K6 | A re-declaration replaces the id; declaring 0 withdraws it. | `registry::redeclare_replaces_and_zero_clears` |
 | K7 | Route ids are forgotten on disconnect and on idle eviction. | `registry::route_forgotten_on_disconnect_and_prune` |
 | K8 | Declarations are band-scoped. | `registry::routes_are_band_scoped` |
-| K9 | Link-injected frames are addressed against local declarations; a Route frame from a link is dropped. | `registry::link_injection_honours_local_routes` |
-| K10 | End to end over UDP sockets: addressed, broadcast, and undeclared frames reach the right peers. | `it_route::addressed_frames_reach_only_the_declarer` |
+| K9 | Link-injected frames are addressed against local declarations (Channel still broadcast); a Route frame from a link is dropped. | `registry::link_injection_honours_local_routes` |
+| K10 | End to end over UDP sockets: addressed, broadcast, undeclared, and Channel frames reach the right peers. | `it_route::addressed_frames_reach_only_the_declarer` |
+| K11 | Route squatting: a spoofed or unvalidated declaration of a victim's id can neither divert nor black-hole the victim's traffic; a validated squatter only becomes a co-declarer. | `registry::spoofed_declaration_cannot_black_hole_an_id`, `it_route::one_packet_spoofed_declaration_cannot_divert_traffic` |
+| K12 | NAT rebinding: when an eligible UDP peer holds an id, a same-IP entry holding that id and silent since the new entry appeared loses it; live same-IP peers and other IPs keep theirs. | `registry::nat_rebind_moves_the_route_to_the_new_mapping`, `registry::live_peers_behind_one_nat_keep_sharing_an_id` |
 
 ## J. Operability
 
@@ -153,9 +157,26 @@ from offset 27 on is opaque.
   (removed on disconnect, plus a WS ping/idle-timeout for dead-but-unclosed
   sockets), so a legitimate receive-only listener is never silently dropped.
 - **Addressed routing (§10.1)** reads `channel_type`/`channel_id`, which are
-  not authenticated to the hub (it has no key). A header forger could already
-  drop or redirect frames, so this adds no capability; payload AEAD is
-  unchanged. See SPEC §10.1 Security.
+  not authenticated to the hub (it has no key). Anyone who knows a band's
+  `band_id` can forge a Route frame: forging one from a victim's address can
+  withdraw or change the victim's id until its next re-declaration (targeted
+  delivery denial, bounded by the re-declaration interval). Spoofed or
+  unvalidated declarations are inert (K11), and a declaration can never route
+  a frame to nobody. Payload AEAD is unchanged. See SPEC §10.1 Security.
+- **UDP egress memory.** Worst case is bounded by `HUB_UDP_QUEUE_BYTES`
+  (D7) regardless of how many UDP sources an attacker mints; per-peer depth
+  (`HUB_UDP_PEER_QUEUE`) only shapes fairness below that. The budget charges
+  a broadcast frame once per destination queue although the bytes are
+  `Arc`-shared, so it over-counts (conservative). Validated peers only (D8).
+- **Writer overlap after re-admission.** An evicted UDP peer's writer drains
+  frames already queued before it exits; if the same address is re-admitted
+  meanwhile, two writers briefly send to it. Only frames queued before the
+  eviction can be reordered against new ones — harmless for UDP, whose
+  receivers already tolerate reordering.
+- **NAT rebind window.** Without a same-IP declaration from the new mapping
+  (e.g. a peer that never re-declares, or one behind a NAT that also changes
+  its IP), the old entry keeps its id until idle eviction (`HUB_PEER_TTL_SECS`,
+  15 s); the addressee misses addressed frames for that window.
 - **Connections are pinned to one band.** Although §10 routes purely by
   `band_id`, each WSS/WebTransport/AF_UNIX connection is bound to the band of its
   first frame (or, for WebTransport, its `?band=` query); frames naming a
