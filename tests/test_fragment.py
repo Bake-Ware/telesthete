@@ -129,10 +129,10 @@ def test_byte_budget_evicts_oldest_partial():
     assert r.feed(_chunk(c, 0, 2, b"cccc")) is None
     assert r.pending == 2 and r.buffered_bytes == 8
     assert r.feed(_chunk(a, 1, 2, b"A")) is None, "a was evicted; its tail can't complete it"
+    assert r.pending == 2, "an evicted message's late chunk is not re-buffered"
     assert r.feed(_chunk(b, 1, 2, b"B")) == b"bbbbB"
     assert r.feed(_chunk(c, 1, 2, b"C")) == b"ccccC"
-    # Only a's orphan tail (1 B) remains buffered, until it times out.
-    assert r.pending == 1 and r.buffered_bytes == 1
+    assert r.pending == 0 and r.buffered_bytes == 0
 
 
 def test_byte_budget_drops_message_that_cannot_fit():
@@ -174,6 +174,115 @@ def test_invalid_budget_args_rejected():
         fragment.Reassembler(max_buffered_bytes=-1)
     with pytest.raises(ValueError):
         fragment.Reassembler(max_chunk_payload=0)
+
+
+# -- evicted-message memory (zombie partials) --------------------------------
+
+def test_evicted_message_chunks_are_dropped_not_rebuffered():
+    # Without memory of evicted ids, a's late chunks would start a fresh
+    # partial that can never complete, and evict b in turn.
+    r = fragment.Reassembler(max_buffered_bytes=9)  # room for b, c + one tail byte
+    a, b, c = b"\x20" * 16, b"\x21" * 16, b"\x26" * 16
+    assert r.feed(_chunk(a, 0, 3, b"aaaa")) is None
+    assert r.feed(_chunk(b, 0, 2, b"bbbb")) is None
+    assert r.feed(_chunk(c, 0, 2, b"cccc")) is None  # evicts a (oldest)
+    assert r.pending == 2 and r.buffered_bytes == 8
+    assert r.feed(_chunk(a, 1, 3, b"aaaa")) is None
+    assert r.feed(_chunk(a, 2, 3, b"aaaa")) is None
+    assert r.pending == 2 and r.buffered_bytes == 8, "zombie must not displace b or c"
+    assert r.feed(_chunk(b, 1, 2, b"B")) == b"bbbbB"
+    assert r.feed(_chunk(c, 1, 2, b"C")) == b"ccccC"
+
+
+def test_message_too_big_for_budget_is_remembered():
+    r = fragment.Reassembler(max_buffered_bytes=6)
+    a = b"\x27" * 16
+    assert r.feed(_chunk(a, 0, 3, b"1234")) is None
+    assert r.feed(_chunk(a, 1, 3, b"5678")) is None  # can't fit: dropped
+    assert r.feed(_chunk(a, 2, 3, b"9")) is None
+    assert r.pending == 0 and r.buffered_bytes == 0, "its tail is not re-buffered"
+
+
+def test_buffer_limit_eviction_is_remembered_too():
+    r = fragment.Reassembler(buffer_limit=1)
+    a, b = b"\x22" * 16, b"\x23" * 16
+    r.feed(_chunk(a, 0, 2, b"a"))
+    r.feed(_chunk(b, 0, 2, b"b"))       # evicts a
+    assert r.feed(_chunk(a, 1, 2, b"A")) is None
+    assert r.feed(_chunk(b, 1, 2, b"B")) == b"bB", "a's tail must not evict b"
+
+
+def test_evicted_memory_expires_with_timeout():
+    import time as _t
+    r = fragment.Reassembler(timeout=0.05, buffer_limit=1)
+    a, b = b"\x24" * 16, b"\x25" * 16
+    r.feed(_chunk(a, 0, 2, b"a"))
+    r.feed(_chunk(b, 0, 2, b"b"))       # evicts a
+    _t.sleep(0.08)
+    # Long after: a's id is forgotten (and b timed out), so a new message
+    # that happens to reuse it is accepted normally.
+    r.feed(_chunk(a, 0, 2, b"x"))
+    assert r.feed(_chunk(a, 1, 2, b"y")) == b"xy"
+
+
+def test_evicted_memory_is_bounded():
+    r = fragment.Reassembler(buffer_limit=1)
+    for i in range(fragment.DEFAULT_EVICTED_MEMORY + 50):
+        r.feed(_chunk(i.to_bytes(16, "big"), 0, 2, b"z"))
+    assert len(r._evicted) <= fragment.DEFAULT_EVICTED_MEMORY
+
+
+def test_three_interleaved_30mb_messages_under_64mib_two_complete():
+    # 3 x 30 MB interleaved chunk-by-chunk under a 64 MiB budget: one must be
+    # sacrificed, and with evicted-id memory the other two complete. (Before:
+    # the sacrificed message's later chunks kept restarting it and evicting
+    # the others, so nothing completed.)
+    size = 30 * 1000 * 1000
+    cs = fragment.MAX_CHUNK_PAYLOAD
+    total = -(-size // cs)
+    r = fragment.Reassembler(max_fragments=fragment.WIRE_MAX_FRAGMENTS,
+                             max_buffered_bytes=64 * 1024 * 1024)
+    msgs = {bytes([0x30 + k]) * 16: bytes([0x41 + k]) * size for k in range(3)}
+    done = {}
+    for seq in range(total):
+        for fid, payload in msgs.items():
+            out = r.feed(fragment.pack_chunk(fid, seq, total,
+                                             payload[seq * cs:(seq + 1) * cs]))
+            if out is not None:
+                done[fid] = out
+    assert len(done) == 2
+    for fid, out in done.items():
+        assert out == msgs[fid]
+    assert r.buffered_bytes <= 64 * 1024 * 1024
+    assert r.pending == 0
+
+
+# -- library Channel/Board reassembly limits ---------------------------------
+
+def test_fragmenter_reassembler_accepts_what_the_fragmenter_emits():
+    big = fragment.Fragmenter(chunk_size=2000)
+    r = big.reassembler()
+    payload = bytes(range(256)) * 20  # 5120 B -> 2000 B chunks
+    assert _reassemble_with(r, big.split(payload)) == payload
+    # The plain default would drop those 2000 B chunks.
+    assert _reassemble_with(fragment.Reassembler(), big.split(payload)) is None
+    # More chunks than the receiver-side default cap (16384) is fine too.
+    tiny = fragment.Fragmenter(chunk_size=1)
+    payload = b"t" * (fragment.DEFAULT_MAX_FRAGMENTS + 10)
+    assert _reassemble_with(tiny.reassembler(), tiny.split(payload)) == payload
+    # Memory stays bounded, and overrides pass through.
+    assert r._max_bytes >= fragment.LIBRARY_MAX_BUFFERED_BYTES
+    assert big.reassembler(max_buffered_bytes=10)._max_bytes == 10
+
+
+def test_library_channel_and_board_use_matched_reassemblers():
+    from telesthete.protocol.channel import Channel
+    from telesthete.protocol.crypto import BandCrypto
+    crypto = BandCrypto("frag-limits")
+    ch = Channel(crypto.band_id, 1, ("127.0.0.1", 9), transport=None, crypto=crypto)
+    assert ch._reassembler._max_chunk == ch._fragmenter.chunk_size
+    assert ch._reassembler._max_fragments == fragment.WIRE_MAX_FRAGMENTS
+    assert ch._reassembler._max_bytes is not None
 
 
 if __name__ == "__main__":

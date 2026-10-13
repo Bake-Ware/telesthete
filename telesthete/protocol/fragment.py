@@ -42,6 +42,17 @@ DEFAULT_MAX_FRAGMENTS = 16384
 # Bytes buffered across all partial messages. None = unbounded (the historical
 # behaviour); the per-message cap above still applies.
 DEFAULT_MAX_BUFFERED_BYTES: Optional[int] = None
+# The most chunks the envelope can describe (uint16 `total`). `fragment()`
+# refuses to produce more, so a receiver accepting this many accepts anything
+# a conformant sender can send.
+WIRE_MAX_FRAGMENTS = 0xFFFF
+# Byte budget for the library's own Channel/Board reassemblers
+# (`Fragmenter.reassembler()`): 64 MiB holds one largest-possible message
+# (65535 x 1003 B ~= 62.7 MiB) while bounding what a peer can make us buffer.
+LIBRARY_MAX_BUFFERED_BYTES = 64 * 1024 * 1024
+# How many evicted fragment_ids a Reassembler remembers (each for `timeout`
+# seconds) so their late chunks are dropped instead of re-buffered.
+DEFAULT_EVICTED_MEMORY = 1024
 
 
 def pack_chunk(fragment_id: bytes, seq: int, total: int, data: bytes) -> bytes:
@@ -86,6 +97,25 @@ class Fragmenter:
     def split(self, payload: bytes) -> list[bytes]:
         return fragment(payload, self.chunk_size)
 
+    def reassembler(self, **overrides) -> "Reassembler":
+        """A Reassembler that accepts everything this Fragmenter can emit.
+
+        ``max_chunk_payload`` is this Fragmenter's ``chunk_size`` (so a larger
+        configured chunk size is not silently dropped by the receiver) and
+        ``max_fragments`` is the wire maximum (``fragment()`` never produces
+        more), while ``max_buffered_bytes`` (``LIBRARY_MAX_BUFFERED_BYTES``)
+        bounds total memory instead. The library's Channel and Board use this
+        for their peers, which run the same Fragmenter. Keyword ``overrides``
+        are passed through to :class:`Reassembler`.
+        """
+        kw = dict(max_chunk_payload=self.chunk_size,
+                  max_fragments=WIRE_MAX_FRAGMENTS,
+                  # Room for one largest message from this Fragmenter.
+                  max_buffered_bytes=max(LIBRARY_MAX_BUFFERED_BYTES,
+                                         self.chunk_size * WIRE_MAX_FRAGMENTS))
+        kw.update(overrides)
+        return Reassembler(**kw)
+
 
 @dataclass
 class _Partial:
@@ -122,6 +152,17 @@ class Reassembler:
       budget beyond the two caps above.
 
     ``timeout`` discards partials older than that many seconds.
+
+    A message evicted to make room (by ``buffer_limit`` or the byte budget,
+    or dropped because it can't fit) can never complete — its evicted chunks
+    are gone — so its ``fragment_id`` is remembered for ``timeout`` seconds
+    (up to ``DEFAULT_EVICTED_MEMORY`` ids) and its later chunks are dropped.
+    Otherwise each late chunk would start a fresh partial that can't finish
+    either, and evict live messages in turn.
+
+    The defaults suit an endpoint fed by senders that use
+    ``MAX_CHUNK_PAYLOAD`` chunks (e.g. Rook's transport). To receive from a
+    specific :class:`Fragmenter`, build with ``Fragmenter.reassembler()``.
     """
 
     def __init__(self,
@@ -143,6 +184,9 @@ class Reassembler:
         self._max_bytes = max_buffered_bytes
         self._max_chunk = max_chunk_payload
         self._bytes = 0  # sum of _Partial.size over _buffers
+        # fragment_id -> monotonic time it was evicted (insertion-ordered, so
+        # the first key is the oldest).
+        self._evicted: dict = {}
 
     @property
     def buffered_bytes(self) -> int:
@@ -168,6 +212,8 @@ class Reassembler:
             return None
 
         self._gc_stale()
+        if fid in self._evicted:
+            return None  # remainder of a message we already gave up on
 
         buf = self._buffers.get(fid)
         if buf is not None and buf.total != total:
@@ -198,16 +244,16 @@ class Reassembler:
                     # Only this message's own parts are left: it can't fit.
                     log.warning("fragment %s exceeds the reassembly byte budget, dropping it",
                                 fid.hex()[:8])
-                    self._drop(fid)
+                    self._evict(fid)
                     return None
                 log.warning("reassembly byte budget full; evicting %s", victim.hex()[:8])
-                self._drop(victim)
+                self._evict(victim)
 
         if buf is None:
             if len(self._buffers) >= self._limit:
                 oldest = self._oldest()
                 log.warning("reassembly buffer full; evicting %s", oldest.hex()[:8])
-                self._drop(oldest)
+                self._evict(oldest)
             buf = _Partial(total=total, first_seen=time.monotonic())
             self._buffers[fid] = buf
 
@@ -231,10 +277,23 @@ class Reassembler:
         if buf is not None:
             self._bytes -= buf.size
 
+    def _evict(self, fid: bytes) -> None:
+        """Drop a partial that can no longer complete and remember its id."""
+        self._drop(fid)
+        self._evicted.pop(fid, None)
+        self._evicted[fid] = time.monotonic()
+        while len(self._evicted) > DEFAULT_EVICTED_MEMORY:
+            del self._evicted[next(iter(self._evicted))]
+
     def _gc_stale(self) -> None:
+        cutoff = time.monotonic() - self._timeout
+        while self._evicted:
+            k = next(iter(self._evicted))
+            if self._evicted[k] >= cutoff:
+                break
+            del self._evicted[k]
         if not self._buffers:
             return
-        cutoff = time.monotonic() - self._timeout
         stale = [k for k, v in self._buffers.items() if v.first_seen < cutoff]
         for k in stale:
             log.warning("dropping incomplete reassembly %s", k.hex()[:8])
