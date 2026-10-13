@@ -31,5 +31,5 @@ pub mod wt;
 
 pub use config::Config;
 pub use frame::{route_info, RouteInfo};
-pub use registry::{Limits, PeerKey, RegError, Registry, Sink};
+pub use registry::{ByteBudget, Limits, PeerKey, RegError, Registry, Sink};
 pub use tls::HubCert;

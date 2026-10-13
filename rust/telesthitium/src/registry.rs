@@ -11,7 +11,10 @@
 //! collects sinks under the lock, releases it, then `try_send`s. Bounded
 //! channels give backpressure-by-drop so one slow peer can't grow memory
 //! without limit (conformance D3). Every peer — UDP included — has its own
-//! queue, so a burst to one peer can never crowd out another's traffic.
+//! queue, so a burst to one peer can never crowd out another's traffic. UDP
+//! queues are additionally capped hub-wide in bytes ([`ByteBudget`], D7) and
+//! only exist for validated peers (D8), because a UDP source costs an
+//! attacker nothing.
 //!
 //! **Addressed routing (SPEC §10.1).** The only cleartext the registry acts on
 //! beyond `band_id` is the header's `channel_type`/`channel_id`: a ROUTE
@@ -24,7 +27,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -64,6 +67,56 @@ impl Default for Limits {
     }
 }
 
+/// A hub-wide cap on bytes sitting in UDP egress queues (`HUB_UDP_QUEUE_BYTES`,
+/// conformance D7). Per-peer depth alone bounds memory only at
+/// `peers × depth × frame size`, and UDP peers (and bands) cost an attacker
+/// nothing to create, so the sum needs its own ceiling. A frame is charged
+/// when queued and refunded when its writer dequeues it; a frame that would
+/// overflow the budget is dropped like a full queue.
+///
+/// Frames are `Arc`-shared, so one broadcast frame queued to many peers is
+/// charged once per queue: the count is a conservative upper bound on the
+/// memory actually held. `limit == 0` disables the budget.
+#[derive(Debug, Default)]
+pub struct ByteBudget {
+    used: AtomicUsize,
+    limit: usize,
+}
+
+impl ByteBudget {
+    pub fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            used: AtomicUsize::new(0),
+            limit,
+        })
+    }
+
+    /// An unlimited budget (still counts, never refuses).
+    pub fn unlimited() -> Arc<Self> {
+        Self::new(0)
+    }
+
+    /// Charge `n` bytes, or refuse if that would exceed the limit.
+    pub(crate) fn try_reserve(&self, n: usize) -> bool {
+        let limit = self.limit;
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |u| {
+                u.checked_add(n).filter(|&t| limit == 0 || t <= limit)
+            })
+            .is_ok()
+    }
+
+    /// Refund `n` bytes previously charged (the frame left the queue).
+    pub fn release(&self, n: usize) {
+        self.used.fetch_sub(n, Ordering::AcqRel);
+    }
+
+    /// Bytes currently charged.
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
+}
+
 /// How to hand one whole frame to a peer. Both variants are non-blocking sends
 /// into a bounded channel that the owning transport drains.
 #[derive(Clone)]
@@ -71,10 +124,12 @@ pub enum Sink {
     /// A UDP peer: frames go to that peer's own bounded queue, drained by a
     /// per-peer writer task onto the shared socket. Per-peer (not one shared
     /// queue) so a large burst to one peer can't fill the queue and drop
-    /// unrelated peers' frames. `addr` is kept for logging.
+    /// unrelated peers' frames; every UDP queue also draws on one hub-wide
+    /// [`ByteBudget`]. `addr` is kept for logging.
     Udp {
         tx: mpsc::Sender<Arc<[u8]>>,
         addr: SocketAddr,
+        budget: Arc<ByteBudget>,
     },
     /// A connection-oriented peer (WSS / WebTransport / AF_UNIX): frames go to
     /// that connection's own writer task, which applies transport framing.
@@ -84,10 +139,19 @@ pub enum Sink {
 impl Sink {
     fn try_send(&self, frame: Arc<[u8]>) -> Result<(), SendDrop> {
         match self {
-            Sink::Udp { tx, .. } => tx.try_send(frame).map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => SendDrop::Full,
-                mpsc::error::TrySendError::Closed(_) => SendDrop::Closed,
-            }),
+            Sink::Udp { tx, budget, .. } => {
+                let n = frame.len();
+                if !budget.try_reserve(n) {
+                    return Err(SendDrop::Budget);
+                }
+                tx.try_send(frame).map_err(|e| {
+                    budget.release(n); // never queued: refund
+                    match e {
+                        mpsc::error::TrySendError::Full(_) => SendDrop::Full,
+                        mpsc::error::TrySendError::Closed(_) => SendDrop::Closed,
+                    }
+                })
+            }
             Sink::Conn(tx) => tx.try_send(frame).map_err(|e| match e {
                 mpsc::error::TrySendError::Full(_) => SendDrop::Full,
                 mpsc::error::TrySendError::Closed(_) => SendDrop::Closed,
@@ -98,6 +162,7 @@ impl Sink {
 
 enum SendDrop {
     Full,
+    Budget,
     Closed,
 }
 
@@ -110,7 +175,10 @@ pub enum PeerKey {
 }
 
 struct Peer {
-    sink: Sink,
+    /// Egress. Connection peers bring theirs at registration; a UDP peer's is
+    /// built only once it becomes eligible (D8), so a spoofed or one-off
+    /// source never costs a queue and a writer task. `Some` iff `eligible`.
+    sink: Option<Sink>,
     last_seen: Instant,
     /// Eligible as a relay destination. Connection peers are eligible at
     /// registration (the handshake proves routability, D5); UDP peers become
@@ -212,9 +280,10 @@ impl Registry {
 
     /// Register-or-refresh a UDP peer from an inbound datagram. Tracks
     /// validation and flips the peer eligible once it has proven routability
-    /// (D4). `make_sink` is called only on first sight, and only once the peer
-    /// is admitted, so the transport can allocate the peer's own queue (and
-    /// writer) lazily; refreshes keep the original sink.
+    /// (D4). `make_sink` is called at most once per admission, when the peer
+    /// becomes eligible (D8): the transport allocates the peer's own queue and
+    /// writer only for sources that have passed validation, never for a
+    /// refused or still-validating one. Refreshes keep the original sink.
     pub fn observe_udp(
         &self,
         band: BandId,
@@ -228,6 +297,7 @@ impl Registry {
             peer.seen = peer.seen.saturating_add(1);
             if !peer.eligible && peer.seen >= self.limits.udp_validation_packets {
                 peer.eligible = true;
+                peer.sink = Some(make_sink());
             }
             return Ok(());
         }
@@ -267,7 +337,7 @@ impl Registry {
         peers.insert(
             key,
             Peer {
-                sink: make_sink(),
+                sink: eligible.then(make_sink),
                 last_seen: Instant::now(),
                 eligible,
                 seen: 1,
@@ -307,7 +377,7 @@ impl Registry {
             .iter()
             .filter(|(k, p)| Some(*k) != from && p.eligible)
             .filter(|(k, p)| !addressed || declared(k, p))
-            .map(|(_, p)| p.sink.clone())
+            .filter_map(|(_, p)| p.sink.clone())
             .collect()
     }
 
@@ -351,6 +421,9 @@ impl Registry {
                 Ok(()) => {}
                 Err(SendDrop::Full) => {
                     tracing::warn!(band = %crate::frame::band_hex(band), "peer queue full; dropping frame");
+                }
+                Err(SendDrop::Budget) => {
+                    tracing::warn!(band = %crate::frame::band_hex(band), "udp queue byte budget full; dropping frame");
                 }
                 Err(SendDrop::Closed) => {}
             }
@@ -472,16 +545,24 @@ mod tests {
     type UdpRx = mpsc::Receiver<Arc<[u8]>>;
 
     fn udp(cap: usize, addr: SocketAddr) -> (Sink, UdpRx) {
+        udp_budget(cap, addr, ByteBudget::unlimited())
+    }
+
+    fn udp_budget(cap: usize, addr: SocketAddr, budget: Arc<ByteBudget>) -> (Sink, UdpRx) {
         let (tx, rx) = mpsc::channel(cap);
-        (Sink::Udp { tx, addr }, rx)
+        (Sink::Udp { tx, addr, budget }, rx)
     }
 
     /// Admit + validate a UDP peer (two packets under the default gate) and
-    /// return the receiver of its sink.
+    /// return the receiver of the sink built when it became eligible.
     fn validated_udp(r: &Registry, b: BandId, addr: SocketAddr) -> UdpRx {
         let (s, rx) = udp(64, addr);
-        r.observe_udp(b, addr, || s).unwrap();
-        r.observe_udp(b, addr, || unreachable!("sink is built once")).unwrap();
+        let mut s = Some(s);
+        r.observe_udp(b, addr, || s.take().unwrap()).unwrap();
+        if s.is_some() {
+            r.observe_udp(b, addr, || s.take().unwrap()).unwrap();
+        }
+        assert!(s.is_none(), "sink must be built on validation");
         rx
     }
 
@@ -987,9 +1068,10 @@ mod tests {
     }
 
     #[test]
-    fn observe_udp_builds_sink_only_on_admission() {
-        // The sink factory (which spawns a writer) runs once, on first sight,
-        // and not at all for a refused peer.
+    fn observe_udp_builds_sink_only_on_validation() {
+        // D8 — the sink factory (which spawns a queue + writer) runs once,
+        // when the peer becomes eligible: never for a one-packet (possibly
+        // spoofed) source, never on refresh, never for a refused peer.
         let r = Registry::new(Limits {
             max_peers_per_band: 1,
             ..big()
@@ -997,17 +1079,17 @@ mod tests {
         let a: SocketAddr = "127.0.0.1:6400".parse().unwrap();
         let b: SocketAddr = "127.0.0.1:6401".parse().unwrap();
         let mut built = 0;
-        r.observe_udp(band(1), a, || {
-            built += 1;
-            udp(2, a).0
-        })
-        .unwrap();
-        r.observe_udp(band(1), a, || {
-            built += 1;
-            udp(2, a).0
-        })
-        .unwrap();
-        assert_eq!(built, 1, "refresh must not rebuild the sink");
+        for _ in 0..3 {
+            r.observe_udp(band(1), a, || {
+                built += 1;
+                udp(2, a).0
+            })
+            .unwrap();
+            if r.is_eligible(&band(1), &PeerKey::Udp(a)) == Some(false) {
+                assert_eq!(built, 0, "no sink before validation");
+            }
+        }
+        assert_eq!(built, 1, "built exactly once, on validation");
         assert_eq!(
             r.observe_udp(band(1), b, || {
                 built += 1;
@@ -1016,6 +1098,50 @@ mod tests {
             Err(RegError::PeerCap)
         );
         assert_eq!(built, 1, "refused peer must not build a sink");
+    }
+
+    #[tokio::test]
+    async fn udp_byte_budget_is_hub_wide() {
+        // D7 — all UDP queues share one byte budget: once it is spent, further
+        // frames drop for every UDP peer (even with queue room), and draining
+        // a queue frees budget again. Connection queues are unaffected.
+        let r = Registry::new(Limits {
+            udp_validation_packets: 1,
+            ..big()
+        });
+        let budget = ByteBudget::new(43 * 3);
+        let a: SocketAddr = "127.0.0.1:6500".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:6501".parse().unwrap();
+        let (sa, mut ra) = udp_budget(64, a, budget.clone());
+        let (sb, mut rb) = udp_budget(64, b, budget.clone());
+        let (sc, mut rc) = conn(64);
+        r.observe_udp(band(1), a, || sa).unwrap();
+        r.observe_udp(band(1), b, || sb).unwrap();
+        r.connect(band(1), PeerKey::Conn(1), sc).unwrap();
+        for _ in 0..4 {
+            r.forward(&band(1), &PeerKey::Conn(99), frame(band(1)));
+        }
+        let (na, nb) = (drain(&mut ra), drain(&mut rb));
+        assert_eq!(na + nb, 3, "3 frames fit the budget across both peers");
+        assert_eq!(drain(&mut rc), 4, "connection queues are not budgeted");
+        // drain() bypasses the writer, so refund by hand as it would.
+        budget.release(43 * 3);
+        r.forward(&band(1), &PeerKey::Conn(99), frame(band(1)));
+        assert_eq!(drain(&mut ra) + drain(&mut rb), 2, "budget freed");
+        assert_eq!(budget.used(), 86);
+    }
+
+    #[test]
+    fn byte_budget_refunds_refused_frames() {
+        let budget = ByteBudget::new(100);
+        let a: SocketAddr = "127.0.0.1:6502".parse().unwrap();
+        let (s, _rx) = udp_budget(1, a, budget.clone());
+        let f = || Arc::<[u8]>::from(vec![0u8; 43].as_slice());
+        assert!(s.try_send(f()).is_ok());
+        assert!(matches!(s.try_send(f()), Err(SendDrop::Full)));
+        assert_eq!(budget.used(), 43, "a frame the queue refused is refunded");
+        assert!(budget.try_reserve(57) && !budget.try_reserve(1));
+        assert!(ByteBudget::unlimited().try_reserve(usize::MAX / 2));
     }
 
     #[test]

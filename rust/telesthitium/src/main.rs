@@ -81,11 +81,12 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(bind) = cfg.udp_bind {
         let (registry, mut rx, q) = (registry.clone(), sd_rx.clone(), cfg.udp_peer_queue);
+        let budget = telesthitium::registry::ByteBudget::new(cfg.udp_queue_bytes);
         tasks.push(tokio::spawn(async move {
             let sd = async {
                 let _ = rx.wait_for(|v| *v).await;
             };
-            if let Err(e) = telesthitium::udp::serve(bind, registry, q, sd).await {
+            if let Err(e) = telesthitium::udp::serve_with_budget(bind, registry, q, budget, sd).await {
                 tracing::error!(error = %e, "udp transport failed");
             }
         }));

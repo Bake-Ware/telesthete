@@ -26,6 +26,14 @@ pub const DEFAULT_PRUNE_SECS: u64 = 5;
 pub const DEFAULT_MAX_BANDS: usize = 4096;
 pub const DEFAULT_MAX_PEERS_PER_BAND: usize = 256;
 pub const DEFAULT_CONN_QUEUE: usize = 1024;
+/// Per-UDP-peer egress queue depth. Lower than `DEFAULT_CONN_QUEUE`: there is
+/// one such queue per UDP source, and sources (unlike connections) are free
+/// for an attacker to mint, so the depth multiplies by the peer count.
+pub const DEFAULT_UDP_PEER_QUEUE: usize = 256;
+/// Hub-wide cap on bytes queued across every UDP peer's egress queue (D7).
+/// 32 MiB holds ~256 full queues of 1024-byte Channel frames; beyond it,
+/// frames drop as if the destination's queue were full. `0` disables.
+pub const DEFAULT_UDP_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 pub const DEFAULT_UDP_VALIDATION_PACKETS: u32 = 2;
 
 /// Resolved hub configuration.
@@ -49,11 +57,13 @@ pub struct Config {
     pub prune_interval: Duration,
     /// Per-connection outbound queue depth (bounds a slow peer's memory, D3).
     pub conn_queue: usize,
-    /// Per-**UDP-peer** outbound queue depth (`HUB_UDP_PEER_QUEUE`; defaults to
-    /// `conn_queue`, so an unconfigured hub keeps `HUB_CONN_QUEUE` as its one
-    /// queue knob). Each UDP peer has its own queue, so one peer's burst can't
-    /// drop another's frames.
+    /// Per-**UDP-peer** outbound queue depth (`HUB_UDP_PEER_QUEUE`, default
+    /// `DEFAULT_UDP_PEER_QUEUE`). Each UDP peer has its own queue, so one
+    /// peer's burst can't drop another's frames.
     pub udp_peer_queue: usize,
+    /// Hub-wide byte cap across all UDP egress queues (`HUB_UDP_QUEUE_BYTES`,
+    /// default `DEFAULT_UDP_QUEUE_BYTES`; `0` = unlimited).
+    pub udp_queue_bytes: usize,
     pub limits: Limits,
     /// Operator-supplied cert/key PEM paths (`HUB_TLS_CERT` / `HUB_TLS_KEY`).
     pub tls_cert_path: Option<PathBuf>,
@@ -139,7 +149,6 @@ impl Config {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| vec!["localhost".to_string()]);
 
-        let conn_queue = parse_or(env("HUB_CONN_QUEUE"), DEFAULT_CONN_QUEUE);
         Config {
             udp_bind,
             ws_bind: opt_addr("HUB_WS_BIND"),
@@ -152,8 +161,9 @@ impl Config {
                 env("HUB_PRUNE_SECS"),
                 DEFAULT_PRUNE_SECS,
             )),
-            conn_queue,
-            udp_peer_queue: parse_or(env("HUB_UDP_PEER_QUEUE"), conn_queue),
+            conn_queue: parse_or(env("HUB_CONN_QUEUE"), DEFAULT_CONN_QUEUE),
+            udp_peer_queue: parse_or(env("HUB_UDP_PEER_QUEUE"), DEFAULT_UDP_PEER_QUEUE),
+            udp_queue_bytes: parse_or(env("HUB_UDP_QUEUE_BYTES"), DEFAULT_UDP_QUEUE_BYTES),
             limits: Limits {
                 max_bands: parse_or(env("HUB_MAX_BANDS"), DEFAULT_MAX_BANDS),
                 max_peers_per_band: parse_or(
@@ -209,7 +219,8 @@ impl Default for Config {
             peer_ttl: Duration::from_secs(DEFAULT_PEER_TTL_SECS),
             prune_interval: Duration::from_secs(DEFAULT_PRUNE_SECS),
             conn_queue: DEFAULT_CONN_QUEUE,
-            udp_peer_queue: DEFAULT_CONN_QUEUE,
+            udp_peer_queue: DEFAULT_UDP_PEER_QUEUE,
+            udp_queue_bytes: DEFAULT_UDP_QUEUE_BYTES,
             limits: Limits::default(),
             tls_cert_path: None,
             tls_key_path: None,
@@ -257,6 +268,11 @@ mod tests {
         assert!(c.ws_bind.is_none() && c.wt_bind.is_none() && c.unix_dir.is_none());
         assert!(!c.needs_tls());
         assert!(c.limits.max_bands > 0 && c.limits.max_peers_per_band > 0);
+        // D7 — UDP queues are shallower than connection queues and capped
+        // hub-wide in bytes by default.
+        assert_eq!(c.udp_peer_queue, 256);
+        assert!(c.udp_peer_queue < c.conn_queue);
+        assert_eq!(c.udp_queue_bytes, 32 * 1024 * 1024);
     }
 
     #[test]
