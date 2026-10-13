@@ -179,6 +179,8 @@ struct Peer {
     /// built only once it becomes eligible (D8), so a spoofed or one-off
     /// source never costs a queue and a writer task. `Some` iff `eligible`.
     sink: Option<Sink>,
+    /// When this entry was created (drives NAT-rebind takeover, K12).
+    first_seen: Instant,
     last_seen: Instant,
     /// Eligible as a relay destination. Connection peers are eligible at
     /// registration (the handshake proves routability, D5); UDP peers become
@@ -298,6 +300,8 @@ impl Registry {
             if !peer.eligible && peer.seen >= self.limits.udp_validation_packets {
                 peer.eligible = true;
                 peer.sink = Some(make_sink());
+                // A declaration sent before validation takes effect now.
+                Self::supersede_rebound(bands.get_mut(&band).unwrap(), &key);
             }
             return Ok(());
         }
@@ -338,6 +342,7 @@ impl Registry {
             key,
             Peer {
                 sink: eligible.then(make_sink),
+                first_seen: Instant::now(),
                 last_seen: Instant::now(),
                 eligible,
                 seen: 1,
@@ -345,6 +350,40 @@ impl Registry {
             },
         );
         Ok(())
+    }
+
+    /// NAT rebinding (K12). When a peer's NAT mapping changes, its frames
+    /// arrive from a new port and the hub sees a new UDP peer, while the old
+    /// entry keeps its declared id until idle eviction (up to the TTL) and
+    /// keeps attracting that id's addressed traffic to a dead mapping. So when
+    /// an eligible UDP peer holds id X, any *other* UDP entry with the same IP
+    /// that also holds X and has been silent since this entry first appeared
+    /// loses X: that silence-at-the-moment-of-appearance is the rebind
+    /// signature. Two live peers behind one NAT sharing an id both keep
+    /// sending, so neither looks stale and both keep it (collision semantics).
+    ///
+    /// Squatting: a source able to forge the victim's IP could use this to
+    /// strip the victim's id until its next re-declaration — no more than it
+    /// could already do by forging a ROUTE 0 from the victim's exact address
+    /// (SPEC §10.1 Security).
+    fn supersede_rebound(peers: &mut HashMap<PeerKey, Peer>, key: &PeerKey) {
+        let PeerKey::Udp(addr) = key else {
+            return;
+        };
+        let Some(p) = peers.get(key) else {
+            return;
+        };
+        let (Some(id), true) = (p.route, p.eligible) else {
+            return;
+        };
+        let born = p.first_seen;
+        for (k, q) in peers.iter_mut() {
+            if let PeerKey::Udp(a) = k {
+                if a != addr && a.ip() == addr.ip() && q.route == Some(id) && q.last_seen < born {
+                    q.route = None;
+                }
+            }
+        }
     }
 
     /// The sinks a frame should reach: eligible peers other than `from`,
@@ -412,6 +451,7 @@ impl Registry {
                 if let Some(p) = peers.get_mut(from) {
                     p.route = (info.channel_id != 0).then_some(info.channel_id);
                 }
+                Self::supersede_rebound(peers, from);
                 return;
             }
             Self::targets(peers, Some(from), &info)
@@ -1098,6 +1138,61 @@ mod tests {
             Err(RegError::PeerCap)
         );
         assert_eq!(built, 1, "refused peer must not build a sink");
+    }
+
+    #[tokio::test]
+    async fn nat_rebind_moves_the_route_to_the_new_mapping() {
+        // K12 — A's mapping moves from :7000 to :7001 (same IP). Once the new
+        // entry is validated and has declared, the silent old entry loses the
+        // id at once instead of attracting A's traffic until TTL eviction.
+        let r = Registry::new(big());
+        let old: SocketAddr = "203.0.113.5:7000".parse().unwrap();
+        let new: SocketAddr = "203.0.113.5:7001".parse().unwrap();
+        let mut orx = validated_udp(&r, band(1), old);
+        r.forward(&band(1), &PeerKey::Udp(old), typed(band(1), ROUTE, 7));
+        let mut rx = band_of(&r, 1);
+        std::thread::sleep(Duration::from_millis(5)); // old goes silent (rebind)
+        // The new mapping declares before it validates; it takes over on
+        // validation.
+        let (ns, mut nrx) = udp(64, new);
+        let mut ns = Some(ns);
+        r.observe_udp(band(1), new, || ns.take().unwrap()).unwrap();
+        r.forward(&band(1), &PeerKey::Udp(new), typed(band(1), ROUTE, 7));
+        assert_eq!(r.route_of(&band(1), &PeerKey::Udp(old)), Some(7), "not before validation");
+        r.observe_udp(band(1), new, || ns.take().unwrap()).unwrap();
+        assert_eq!(r.route_of(&band(1), &PeerKey::Udp(old)), None);
+        r.forward(&band(1), &PeerKey::Conn(1), typed(band(1), ADDRESSED, 7));
+        assert_eq!((drain(&mut orx), drain(&mut nrx), drain(&mut rx[0])), (0, 1, 0));
+    }
+
+    #[tokio::test]
+    async fn live_peers_behind_one_nat_keep_sharing_an_id() {
+        // K12 — not a rebind: the first peer keeps talking after the second
+        // appears, so both keep the (colliding) id and both receive.
+        let r = Registry::new(big());
+        let a: SocketAddr = "203.0.113.6:7000".parse().unwrap();
+        let b: SocketAddr = "203.0.113.6:7001".parse().unwrap();
+        let c: SocketAddr = "203.0.113.7:7001".parse().unwrap(); // other IP
+        let mut arx = validated_udp(&r, band(1), a);
+        r.forward(&band(1), &PeerKey::Udp(a), typed(band(1), ROUTE, 7));
+        std::thread::sleep(Duration::from_millis(5));
+        let (bs, mut brx) = udp(64, b);
+        let mut bs = Some(bs);
+        r.observe_udp(band(1), b, || bs.take().unwrap()).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        r.observe_udp(band(1), a, || unreachable!()).unwrap(); // a still alive
+        r.observe_udp(band(1), b, || bs.take().unwrap()).unwrap();
+        r.forward(&band(1), &PeerKey::Udp(b), typed(band(1), ROUTE, 7));
+        assert_eq!(r.route_of(&band(1), &PeerKey::Udp(a)), Some(7));
+        // A different IP never supersedes, however silent the holder is.
+        std::thread::sleep(Duration::from_millis(5));
+        let mut crx = validated_udp(&r, band(1), c);
+        r.forward(&band(1), &PeerKey::Udp(c), typed(band(1), ROUTE, 7));
+        assert_eq!(r.route_of(&band(1), &PeerKey::Udp(a)), Some(7));
+        let mut rx = band_of(&r, 1);
+        r.forward(&band(1), &PeerKey::Conn(1), typed(band(1), ADDRESSED, 7));
+        assert_eq!((drain(&mut arx), drain(&mut brx), drain(&mut crx)), (1, 1, 1));
+        assert_eq!(drain(&mut rx[0]), 0);
     }
 
     #[tokio::test]
