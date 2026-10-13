@@ -495,7 +495,10 @@ async fn run_board_task(
 
         let payload = if pkt.payload.first() == Some(&0x01) {
             // §6.6 chunk of a SNAPSHOT (§7.4).
-            let r = reassemblers.entry(pkt.from).or_default();
+            // Accept anything our own SNAPSHOT fragmenter can send.
+            let r = reassemblers
+                .entry(pkt.from)
+                .or_insert_with(|| Reassembler::for_chunk_size(MAX_CHUNK_PAYLOAD));
             match r.feed(&pkt.payload) {
                 Some(full) => full,
                 None => continue,

@@ -179,7 +179,9 @@ impl ChannelCore {
             closing: false,
             rcv_next: 0,
             recv_buffer: BTreeMap::new(),
-            reassembler: Reassembler::new(),
+            // Accept whatever the peer's fragmenter (this library, at
+            // MAX_CHUNK_PAYLOAD) can emit; memory is bounded by a byte budget.
+            reassembler: Reassembler::for_chunk_size(MAX_CHUNK_PAYLOAD),
             window,
             rto,
             retries: 0,
