@@ -26,9 +26,36 @@ def _vectors():
 
 
 def test_channel_type_value():
-    # 0x05 is the next free value after DROP (SPEC §2); must never move.
+    # 0x05/0x06 are the next free values after DROP (SPEC §2); must never move.
     assert ChannelType.ROUTE == 0x05
+    assert ChannelType.ADDRESSED == 0x06
     assert len({int(t) for t in ChannelType}) == len(list(ChannelType))
+
+
+def test_addressed_frame_shape_and_aad():
+    crypto = BandCrypto("route-test")
+    rid = route.route_id_for("kaiju")
+    frame = route.pack_addressed(crypto, 9, rid, b"chunk")
+    pkt = unpack_packet(frame)
+    assert (pkt.channel_type, pkt.channel_id, pkt.sequence) == (ChannelType.ADDRESSED, rid, 9)
+    # Default: spec AAD, so a rewritten destination fails authentication.
+    assert crypto.decrypt(9, pkt.ciphertext, associated_data=build_aad(0x06, rid)) == b"chunk"
+    with pytest.raises(Exception):
+        crypto.decrypt(9, pkt.ciphertext, associated_data=build_aad(0x06, rid ^ 1))
+    with pytest.raises(ValueError):
+        route.pack_addressed(crypto, 1, 0x10000, b"")
+
+
+def test_addressed_empty_aad_profile_reaches_old_rook_receivers():
+    # Compat (SPEC §10.1): Rook's master transport and the ESP32 firmware
+    # decrypt every frame with EMPTY AAD and never look at channel_type. An
+    # ADDRESSED frame sealed for that profile (associated_data=b"") is
+    # therefore accepted by them when an old, broadcasting hub relays it.
+    crypto = BandCrypto("route-test")
+    frame = route.pack_addressed(crypto, 11, 1234, b"hello", associated_data=b"")
+    pkt = unpack_packet(frame)
+    assert pkt.channel_type == ChannelType.ADDRESSED
+    assert crypto.decrypt(pkt.sequence, pkt.ciphertext) == b"hello"
 
 
 def test_route_id_vectors():
@@ -99,5 +126,8 @@ async def test_spec_band_drops_declaration_at_dispatch():
         handlers = b.transport._handlers
         assert ChannelType.CHANNEL in handlers
         assert not handlers.get(ChannelType.ROUTE), "nothing may consume ROUTE"
+        # Band has no ADDRESSED consumer either: it is an application-level
+        # type (Rook's transport), dropped at dispatch by a plain Band.
+        assert not handlers.get(ChannelType.ADDRESSED)
     finally:
         await b.stop()

@@ -32,6 +32,11 @@ pub enum ChannelType {
     /// `channel_id` = its route id; a routing hub records it and never relays
     /// it. Peers never deliver it to an application.
     Route = 0x05,
+    /// Addressed application datagram (SPEC §2, §10.1). `channel_id` is the
+    /// *destination* route id (0 = broadcast); a routing hub delivers it only
+    /// to the peer(s) that declared that id, else broadcasts. Unreliable, no
+    /// §6.1 header; the plaintext is application-defined (Rook: a §6.6 chunk).
+    Addressed = 0x06,
 }
 
 impl ChannelType {
@@ -43,6 +48,7 @@ impl ChannelType {
             0x03 => Some(Self::Board),
             0x04 => Some(Self::Drop),
             0x05 => Some(Self::Route),
+            0x06 => Some(Self::Addressed),
             _ => None,
         }
     }
@@ -253,7 +259,9 @@ mod tests {
     fn route_type_round_trips() {
         assert_eq!(ChannelType::from_u8(0x05), Some(ChannelType::Route));
         assert_eq!(ChannelType::Route as u8, 0x05);
-        assert_eq!(ChannelType::from_u8(0x06), None);
+        assert_eq!(ChannelType::from_u8(0x06), Some(ChannelType::Addressed));
+        assert_eq!(ChannelType::Addressed as u8, 0x06);
+        assert_eq!(ChannelType::from_u8(0x07), None);
     }
 
     /// Byte-identical with the Python reference: tests/vectors.json `route`
@@ -281,6 +289,41 @@ mod tests {
             assert_eq!(hex, case["frame_hex"].as_str().unwrap(), "declaration diverged");
             let (h, pt) = decode_packet(&key, &pkt).unwrap();
             assert_eq!((h.channel_type, h.channel_id, pt.len()), (ChannelType::Route, rid, 0));
+        }
+        // ADDRESSED (0x06) frames: spec AAD via the library, and the Rook
+        // empty-AAD profile via the raw AEAD (the library always binds AAD).
+        let from_hex = |s: &str| -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        for case in route["addressed"].as_array().unwrap() {
+            let seq = case["seq"].as_u64().unwrap();
+            let rid = case["route_id"].as_u64().unwrap() as u16;
+            let pt = from_hex(case["plaintext_hex"].as_str().unwrap());
+            let want = from_hex(case["frame_hex"].as_str().unwrap());
+            let h = Header::parse(&want).unwrap();
+            assert_eq!((h.channel_type, h.channel_id, h.sequence), (ChannelType::Addressed, rid, seq));
+            match case["aad"].as_str().unwrap() {
+                "spec" => {
+                    let pkt =
+                        encode_packet(&key, &band_id, ChannelType::Addressed, rid, seq, &pt).unwrap();
+                    assert_eq!(pkt, want, "addressed frame diverged");
+                }
+                "empty" => {
+                    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+                    use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+                    let mut n = [0u8; 12];
+                    n[4..].copy_from_slice(&seq.to_be_bytes());
+                    let got = ChaCha20Poly1305::new_from_slice(&key)
+                        .unwrap()
+                        .decrypt(Nonce::from_slice(&n), Payload { msg: &want[HEADER_LEN..], aad: b"" })
+                        .expect("empty-AAD profile must open");
+                    assert_eq!(got, pt);
+                }
+                other => panic!("unknown aad profile {other}"),
+            }
         }
     }
 
