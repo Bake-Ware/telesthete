@@ -24,11 +24,10 @@ setup(
         "Topic :: System :: Networking",
         "License :: OSI Approved :: MIT License",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
     ],
-    python_requires=">=3.10",
+    python_requires=">=3.11",  # asyncio loop.sock_sendto/sock_recvfrom (transport/udp.py)
     install_requires=[
         "PyNaCl>=1.5.0",  # baseline ChaCha20-Poly1305 (IETF)
     ],
