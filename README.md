@@ -66,7 +66,9 @@ toolchain needed:
 | `armv7l` (32-bit Raspberry Pi OS; best effort) | `telesthete-hub-armv7-linux.tar.gz` |
 
 Each archive has a `.sha256` beside it (plus one `SHA256SUMS` per release) and
-holds `telesthete-hub`, `LICENSE` and a `VERSION` file.
+holds `telesthete-hub`, `LICENSE` and a `VERSION` file. Each archive also has a
+build provenance attestation: `gh attestation verify <archive> -R Bake-Ware/telesthete`
+checks it was built by this repository's release workflow.
 
 ```bash
 arch=$(uname -m); [ "$arch" = armv7l ] && arch=armv7

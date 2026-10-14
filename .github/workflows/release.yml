@@ -41,6 +41,12 @@ jobs:
     # armv7 is a best-effort extra: a failure there must not hold back the
     # x86_64/aarch64 assets every installer depends on.
     continue-on-error: ${{ matrix.optional }}
+    # Expressions reach run: scripts only through env, never spliced into
+    # the script text (inputs.tag is user-supplied).
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCH: ${{ matrix.arch }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     strategy:
       fail-fast: false
       matrix:
@@ -60,7 +66,7 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
       - name: Install Rust (stable) with the ${{ matrix.target }} std
         run: |
-          rustup toolchain install stable --profile minimal --target "${{ matrix.target }}"
+          rustup toolchain install stable --profile minimal --target "$TARGET"
           rustup default stable
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -75,10 +81,10 @@ jobs:
           key: ${{ matrix.target }}
       - name: Build
         working-directory: rust
-        run: cargo zigbuild --locked --release -p telesthitium --bin telesthete-hub --target "${{ matrix.target }}"
+        run: cargo zigbuild --locked --release -p telesthitium --bin telesthete-hub --target "$TARGET"
       - name: Check the binary is static
         run: |
-          bin="rust/target/${{ matrix.target }}/release/telesthete-hub"
+          bin="rust/target/$TARGET/release/telesthete-hub"
           file "$bin"
           file "$bin" | grep -Eq 'statically linked|static-pie linked'
       - name: Smoke test (x86_64 runs natively)
@@ -87,14 +93,14 @@ jobs:
           # Starts the UDP relay on an ephemeral loopback port; SIGTERM after 2s
           # must shut it down cleanly (exit 0).
           HUB_BIND=127.0.0.1:0 timeout --preserve-status -s TERM 2 \
-            "rust/target/${{ matrix.target }}/release/telesthete-hub"
+            "rust/target/$TARGET/release/telesthete-hub"
       - name: Package
         id: pkg
         run: |
-          name="telesthete-hub-${{ matrix.arch }}-linux"
-          version="${{ inputs.tag || github.ref_name }}"
+          name="telesthete-hub-$ARCH-linux"
+          version="$RELEASE_TAG"
           mkdir -p stage dist
-          cp "rust/target/${{ matrix.target }}/release/telesthete-hub" stage/
+          cp "rust/target/$TARGET/release/telesthete-hub" stage/
           cp LICENSE stage/
           printf '%s\n' "$version" > stage/VERSION
           # Flat archive (no top-level dir) with stable ownership and mtimes,
@@ -118,6 +124,8 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      id-token: write       # build provenance attestation
+      attestations: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -139,6 +147,11 @@ jobs:
           ls -l
           test -f telesthete-hub-x86_64-linux.tar.gz
           test -f telesthete-hub-aarch64-linux.tar.gz
+      # `gh attestation verify <asset> -R Bake-Ware/telesthete` proves an
+      # archive was built by this workflow from this repository.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
       - name: Warn when the tag and the crate version disagree
         run: |
           crate="$(sed -n 's/^version = "\(.*\)"/\1/p' rust/Cargo.toml | head -n1)"
@@ -147,6 +160,7 @@ jobs:
           fi
       - name: Create or update the release
         run: |
+          [[ "$TAG" =~ ^v[0-9]+(\.[0-9]+)*(-[0-9A-Za-z.]+)?$ ]] || { echo "::error::not a release tag: $TAG"; exit 1; }
           flags=()
           case "$TAG" in *-*) flags+=(--prerelease) ;; esac
           if gh release view "$TAG" >/dev/null 2>&1; then
