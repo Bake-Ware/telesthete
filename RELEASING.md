@@ -20,6 +20,23 @@ python tests/test_vectors.py && python tests/test_negotiation.py \
 cd rust && cargo test && cargo build --release && cd ..
 ```
 
+## Relay binaries (GitHub Release) — automated
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`: it cross-builds
+static `telesthete-hub` for x86_64, aarch64 and (best effort) armv7 musl with
+cargo-zigbuild and attaches `telesthete-hub-<arch>-linux.tar.gz`, its
+`.sha256` and `SHA256SUMS` to the tag's GitHub Release. A tag with a `-`
+(`v0.3.0-rc1`) becomes a prerelease, which `releases/latest` skips.
+
+```bash
+git tag -a v0.3.0 -m "telesthete 0.3.0" && git push origin v0.3.0
+```
+
+Re-run for an existing tag from the Actions tab (workflow_dispatch, `tag`
+input); it replaces that release's assets. The asset names are an install
+contract (Rook's installer and Docker image download them), so don't rename
+them.
+
 ## PyPI (Python package `telesthete`)
 
 ```bash

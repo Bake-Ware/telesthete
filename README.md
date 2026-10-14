@@ -53,6 +53,45 @@ To prefer hardware-accelerated AES where both peers support it:
 band = Band(psk="...", ciphers=["aes256-gcm", "chacha20-poly1305"])
 ```
 
+## Installing a prebuilt relay
+
+Every `v*` tag publishes static (musl) `telesthete-hub` binaries for Linux on
+the [Releases](https://github.com/Bake-Ware/telesthete/releases) page. No Rust
+toolchain needed:
+
+| `uname -m` | Asset |
+|------------|-------|
+| `x86_64` | `telesthete-hub-x86_64-linux.tar.gz` |
+| `aarch64` (Raspberry Pi 4/5 on a 64-bit OS, ARM servers) | `telesthete-hub-aarch64-linux.tar.gz` |
+| `armv7l` (32-bit Raspberry Pi OS; best effort) | `telesthete-hub-armv7-linux.tar.gz` |
+
+Each archive has a `.sha256` beside it (plus one `SHA256SUMS` per release) and
+holds `telesthete-hub`, `LICENSE` and a `VERSION` file. Each archive also has a
+build provenance attestation: `gh attestation verify <archive> -R Bake-Ware/telesthete`
+checks it was built by this repository's release workflow.
+
+```bash
+arch=$(uname -m); [ "$arch" = armv7l ] && arch=armv7
+base=https://github.com/Bake-Ware/telesthete/releases/latest/download   # or .../download/v0.3.0
+curl -fsSLO "$base/telesthete-hub-$arch-linux.tar.gz"
+curl -fsSLO "$base/telesthete-hub-$arch-linux.tar.gz.sha256"
+sha256sum -c "telesthete-hub-$arch-linux.tar.gz.sha256"
+sudo tar -xzf "telesthete-hub-$arch-linux.tar.gz" -C /usr/local/bin telesthete-hub
+
+HUB_BIND=0.0.0.0:7474 telesthete-hub     # UDP relay on 7474 (the default)
+```
+
+The relay is configured entirely by environment variables: `HUB_BIND`
+(UDP, default `0.0.0.0:7474`, `off` to disable), `HUB_PEER_TTL_SECS` (default
+15; raise it to 60 for Rook, whose peers keep alive every 20 s),
+`HUB_PRUNE_SECS`, `HUB_WS_BIND`/`HUB_WS_TLS`, `HUB_WT_BIND`, `HUB_UNIX_DIR`,
+`HUB_TLS_CERT`/`HUB_TLS_KEY`, and `RUST_LOG`. It holds no keys and cannot
+decrypt what it relays. [Rook](https://github.com/Bake-Ware/rook)'s hub
+installer and Docker image use these same assets.
+
+To build it yourself instead: `cd rust && cargo build --release -p telesthitium`
+(Rust 1.88+); the binary lands in `rust/target/release/telesthete-hub`.
+
 ## Protocol at a glance
 
 - **Encryption** — PSK-derived keys; AEAD is a **negotiated suite**:

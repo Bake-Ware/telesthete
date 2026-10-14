@@ -1,0 +1,171 @@
+name: Release relay
+
+# Builds static telesthete-hub binaries and attaches them to the GitHub Release
+# for the tag. Asset names are part of the install contract: Rook's installer
+# and Docker image fetch
+#   https://github.com/Bake-Ware/telesthete/releases/latest/download/telesthete-hub-<arch>-linux.tar.gz
+# (and .../download/<tag>/...) with <arch> as `uname -m` spells it, then check
+# the matching .sha256. Renaming an asset breaks every installer in the field.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Existing tag to (re)build and publish, e.g. v0.3.0. Leave empty to
+          build the selected branch and keep the binaries as workflow artifacts only.
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Pinned so a release is reproducible from its tag.
+  CARGO_ZIGBUILD_VERSION: "0.23.4"
+  ZIG_VERSION: "0.15.2"
+
+jobs:
+  build:
+    name: telesthete-hub ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # armv7 is a best-effort extra: a failure there must not hold back the
+    # x86_64/aarch64 assets every installer depends on.
+    continue-on-error: ${{ matrix.optional }}
+    # Expressions reach run: scripts only through env, never spliced into
+    # the script text (inputs.tag is user-supplied).
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCH: ${{ matrix.arch }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+            optional: false
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+            optional: false
+          - arch: armv7
+            target: armv7-unknown-linux-musleabihf
+            optional: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Install Rust (stable) with the ${{ matrix.target }} std
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET"
+          rustup default stable
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      # cargo-zigbuild links with zig's bundled musl/clang, so one Ubuntu runner
+      # cross-builds every target without Docker images or a C cross toolchain.
+      - name: Install cargo-zigbuild and zig
+        run: python -m pip install "cargo-zigbuild==${CARGO_ZIGBUILD_VERSION}" "ziglang==${ZIG_VERSION}"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: rust -> target
+          key: ${{ matrix.target }}
+      - name: Build
+        working-directory: rust
+        run: cargo zigbuild --locked --release -p telesthitium --bin telesthete-hub --target "$TARGET"
+      - name: Check the binary is static
+        run: |
+          bin="rust/target/$TARGET/release/telesthete-hub"
+          file "$bin"
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
+      - name: Smoke test (x86_64 runs natively)
+        if: matrix.arch == 'x86_64'
+        run: |
+          # Starts the UDP relay on an ephemeral loopback port; SIGTERM after 2s
+          # must shut it down cleanly (exit 0).
+          HUB_BIND=127.0.0.1:0 timeout --preserve-status -s TERM 2 \
+            "rust/target/$TARGET/release/telesthete-hub"
+      - name: Package
+        id: pkg
+        run: |
+          name="telesthete-hub-$ARCH-linux"
+          version="$RELEASE_TAG"
+          mkdir -p stage dist
+          cp "rust/target/$TARGET/release/telesthete-hub" stage/
+          cp LICENSE stage/
+          printf '%s\n' "$version" > stage/VERSION
+          # Flat archive (no top-level dir) with stable ownership and mtimes,
+          # so `tar -xzf <asset> telesthete-hub` works everywhere.
+          tar --owner=0 --group=0 --numeric-owner \
+              --mtime="@$(git log -1 --format=%ct)" --sort=name \
+              -czf "dist/${name}.tar.gz" -C stage telesthete-hub LICENSE VERSION
+          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          cat "dist/${name}.tar.gz.sha256"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: relay-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write       # build provenance attestation
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: relay-*
+          path: dist
+          merge-multiple: true
+      - name: Verify checksums and write SHA256SUMS
+        run: |
+          cd dist
+          sha256sum -c ./*.sha256
+          cat ./*.sha256 > SHA256SUMS
+          ls -l
+          test -f telesthete-hub-x86_64-linux.tar.gz
+          test -f telesthete-hub-aarch64-linux.tar.gz
+      # `gh attestation verify <asset> -R Bake-Ware/telesthete` proves an
+      # archive was built by this workflow from this repository.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Warn when the tag and the crate version disagree
+        run: |
+          crate="$(sed -n 's/^version = "\(.*\)"/\1/p' rust/Cargo.toml | head -n1)"
+          if [ "v${crate}" != "${TAG%%-*}" ]; then
+            echo "::warning::tag ${TAG} but rust/Cargo.toml workspace version is ${crate}"
+          fi
+      - name: Create or update the release
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+(\.[0-9]+)*(-[0-9A-Za-z.]+)?$ ]] || { echo "::error::not a release tag: $TAG"; exit 1; }
+          flags=()
+          case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --verify-tag --title "$TAG" \
+              --generate-notes "${flags[@]}"
+          fi
