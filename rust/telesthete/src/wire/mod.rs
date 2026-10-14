@@ -14,6 +14,8 @@ pub use dmabuf::{
     MAX_FDS_PER_PACKET, MAX_PLANES,
 };
 pub use fragment::{
-    fragment, pack_chunk, parse_chunk, Reassembler, Chunk, FRAG_HEADER_LEN, MAX_CHUNK_PAYLOAD,
+    fragment, pack_chunk, parse_chunk, Chunk, Reassembler, DEFAULT_BUFFER_LIMIT,
+    DEFAULT_EVICTED_MEMORY, DEFAULT_MAX_FRAGMENTS, DEFAULT_REASSEMBLY_TIMEOUT, FRAG_HEADER_LEN,
+    LIBRARY_MAX_BUFFERED_BYTES, MAX_CHUNK_PAYLOAD, WIRE_MAX_FRAGMENTS,
 };
 pub use stream::{StreamFlags, StreamHeader, StreamHeaderError, STREAM_HEADER_LEN};

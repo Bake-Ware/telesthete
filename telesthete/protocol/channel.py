@@ -172,8 +172,11 @@ class Channel:
 
         # §6.6 message path: every logical message uses the fragmentation
         # envelope (even <= 1 chunk) so the parser stays stateless.
+        # The reassembler accepts whatever the peer's Fragmenter (the same
+        # library) can emit — chunk size and count — and bounds memory with a
+        # byte budget instead (fragment.LIBRARY_MAX_BUFFERED_BYTES).
         self._fragmenter = Fragmenter()
-        self._reassembler = Reassembler()
+        self._reassembler = self._fragmenter.reassembler()
         self._on_message: Optional[Callable[[bytes], None]] = None
         self._msg_queue: deque = deque()
         self._msg_ready = asyncio.Event()

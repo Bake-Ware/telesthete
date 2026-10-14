@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from .framing import pack_packet, unpack_packet, ChannelType
 from .sequence import SequenceSource
-from .fragment import fragment, Reassembler, MAX_CHUNK_PAYLOAD
+from .fragment import fragment, Fragmenter, Reassembler, MAX_CHUNK_PAYLOAD
 
 logger = logging.getLogger(__name__)
 
@@ -199,7 +199,11 @@ class Board:
 
             if plaintext[:1] == b"\x01":
                 # §6.6 chunk of a SNAPSHOT (§7.4).
-                r = self._reassemblers.setdefault(peer_addr, Reassembler())
+                r = self._reassemblers.get(peer_addr)
+                if r is None:
+                    # Accept anything our own SNAPSHOT fragmenter can send.
+                    r = self._reassemblers[peer_addr] = \
+                        Fragmenter(MAX_CHUNK_PAYLOAD).reassembler()
                 full = r.feed(plaintext)
                 if full is None:
                     return

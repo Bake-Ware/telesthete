@@ -45,7 +45,7 @@ async fn wt_connect(
 ) -> Result<Connection, wtransport::error::ConnectingError> {
     let digest = wtransport::tls::Sha256Digest::from(cert.sha256);
     let config = ClientConfig::builder()
-        .with_bind_default()
+        .with_bind_address("127.0.0.1:0".parse().unwrap())
         .with_server_certificate_hashes([digest])
         .build();
     Endpoint::client(config)
@@ -91,7 +91,7 @@ async fn session_accept_and_band_from_query() {
     // Wrong route -> hub replies not_found -> client connect fails.
     let digest = wtransport::tls::Sha256Digest::from(cert.sha256);
     let config = ClientConfig::builder()
-        .with_bind_default()
+        .with_bind_address("127.0.0.1:0".parse().unwrap())
         .with_server_certificate_hashes([digest])
         .build();
     let bad = Endpoint::client(config)

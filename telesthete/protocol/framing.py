@@ -25,6 +25,14 @@ class ChannelType(IntEnum):
     CHANNEL = 0x02
     BOARD = 0x03
     DROP = 0x04
+    # Hub route declaration (SPEC §2, §10.1): channel_id = the sender's route
+    # id. Consumed by a routing hub, never delivered to an application.
+    ROUTE = 0x05
+    # Addressed application datagram (SPEC §2, §10.1): channel_id = the
+    # DESTINATION route id (0 = broadcast). A routing hub delivers it only to
+    # the peer(s) that declared that id; otherwise it is broadcast. No §6.1
+    # header — the plaintext is application-defined (Rook: a §6.6 chunk).
+    ADDRESSED = 0x06
 
 
 class Packet(NamedTuple):

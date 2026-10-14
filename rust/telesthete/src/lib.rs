@@ -30,7 +30,8 @@ pub use control::{capability, ControlChannel, ControlError, ControlEvent, LOCAL_
 pub use discovery::{pack_announce, parse_announce, DiscoveredPeer, Discovery, DISCOVERY_PORT};
 pub use crypto::{build_aad, derive_band_id, derive_key, BandId, CryptoError, Key, BAND_ID_LEN};
 pub use framing::{
-    decode_packet, encode_packet, ChannelType, FramingError, Header, HEADER_LEN, MIN_PACKET_LEN,
+    decode_packet, encode_packet, route_id_for, ChannelType, FramingError, Header, HEADER_LEN,
+    MIN_PACKET_LEN, ROUTE_ID_DOMAIN,
 };
 pub use stream::{StreamEndpoint, StreamError, StreamHub, StreamMessage};
 pub use transport::{Inbound, Outbound, Transport, TransportError};

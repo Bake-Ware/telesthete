@@ -15,7 +15,7 @@
 //! | Stream  (0x01) | datagram                                 | one datagram/frame |
 //! | Channel (0x02) | one bidi stream per `channel_id`         | 2-byte BE length   |
 //! | Control (0x00) | one dedicated bidi stream                | 2-byte BE length   |
-//! | Board/Drop/unk | the dedicated reliable stream (no loss)  | 2-byte BE length   |
+//! | Board/Drop/Addressed/unk | the dedicated reliable stream (no loss) | 2-byte BE length |
 //!
 //! QUIC streams are byte streams, not message streams, so every frame on a
 //! reliable carrier is preceded by a 2-byte big-endian length
@@ -208,7 +208,9 @@ async fn egress_writer(
                 }
             }
             // Control, or any type without a defined WT carrier (Board/Drop/
-            // unknown): the single dedicated reliable stream — no loss (G4).
+            // Addressed/unknown): the single dedicated reliable stream — no
+            // loss (G4). Addressed (0x06) frames carry §6.6 chunks of large
+            // messages, which a lossy datagram would make un-reassemblable.
             _ => {
                 if control.is_none() {
                     control = open_egress_stream(&conn, &registry, band, key).await;

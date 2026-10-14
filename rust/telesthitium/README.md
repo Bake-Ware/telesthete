@@ -6,8 +6,8 @@ The **reference relay hub** for the Telesthete wire protocol — SPEC §10
 The hub matches peers by the cleartext 16-byte `band_id` prefix of each frame
 and bridges opaque ciphertext between every peer in the same band. It holds no
 PSK and **cannot decrypt** — it reads only the cleartext header (`band_id`, and
-`channel_type`/`channel_id` for WebTransport carrier selection); everything from
-offset 27 on is opaque.
+`channel_type`/`channel_id` for addressed routing and WebTransport carrier
+selection); everything from offset 27 on is opaque.
 
 It terminates all four transports §10 names and bridges freely between them:
 
@@ -30,7 +30,7 @@ From the repo's `rust/` workspace:
 cd rust
 cargo build --release -p telesthitium
 # binary: target/release/telesthete-hub
-cargo test -p telesthitium          # 46 tests
+cargo test -p telesthitium          # 77 tests
 ```
 
 ## Run
@@ -67,7 +67,9 @@ address / directory.
 | `HUB_PRUNE_SECS` | `5` | eviction sweep interval |
 | `HUB_MAX_BANDS` | `4096` | band cap |
 | `HUB_MAX_PEERS_PER_BAND` | `256` | per-band peer cap |
-| `HUB_CONN_QUEUE` | `1024` | per-connection outbound queue depth |
+| `HUB_CONN_QUEUE` | `1024` | per-connection outbound queue depth (WSS/WT/AF_UNIX) |
+| `HUB_UDP_PEER_QUEUE` | `256` | outbound queue depth **per UDP peer** (each validated UDP peer has its own queue) |
+| `HUB_UDP_QUEUE_BYTES` | `33554432` (32 MiB) | hub-wide cap on bytes queued across all UDP peers; frames beyond it are dropped (`0` = unlimited) |
 | `HUB_UDP_VALIDATION_PACKETS` | `2` | UDP packets required before a source is an eligible destination (`1` disables) |
 | `RUST_LOG` | `info` | `tracing` env-filter |
 
@@ -106,8 +108,14 @@ sudo systemctl enable --now telesthete-hub
   relay cannot issue the echoed cookie that would). Connection transports
   (WSS/WebTransport/AF_UNIX) prove routability via their handshake and are bound
   to a single band per connection.
-- **Bounded memory.** Band and per-band peer caps, plus bounded per-connection
-  queues (drop-on-overflow), cap resource use under flood.
+- **Bounded memory.** Band and per-band peer caps, plus a bounded outbound
+  queue per peer (drop-on-overflow), cap resource use under flood. Every peer,
+  UDP included, has its own queue, so a burst to one peer can only drop that
+  peer's frames. UDP sources cost an attacker nothing, so UDP queues are also
+  capped hub-wide in bytes (`HUB_UDP_QUEUE_BYTES`) and a UDP peer only gets a
+  queue (and writer task) once it has passed validation; an unvalidated
+  source costs one registry entry (~100 B). Connection queues are bounded by
+  `connections × HUB_CONN_QUEUE` frames, and connections cost a handshake.
 
 ## Protocol notes
 
@@ -118,5 +126,17 @@ sudo systemctl enable --now telesthete-hub
   shorter packets are dropped.
 - Discovery is implicit: sending a frame for a `band_id` registers the peer for
   that band. The hub never originates frames of its own.
+- **Addressed routing (SPEC §10.1).** A peer may declare a 16-bit route id by
+  sending a Route (`channel_type` 0x05) frame whose `channel_id` is the id; the
+  hub records it and does not relay the frame. Addressed (0x06) frames whose
+  nonzero `channel_id` another *validated* peer in the band declared then go
+  only to the declaring peer(s). Everything else — `channel_id` 0, ids no
+  validated peer declared, and every other channel type, **Channel (0x02)
+  included** — is broadcast as before, so library Channels and bands without
+  a declaring peer behave exactly as they always have. Declarations are
+  forgotten when the peer is evicted or disconnects (or moved to its new
+  mapping after a NAT rebind); peers re-declare with their keepalives.
+  Declarations are not authenticated to the hub: see SPEC §10.1 Security for
+  the targeted-denial exposure and its mitigations.
 - Eviction: peers unseen for `HUB_PEER_TTL_SECS` are dropped; empty bands are
   reaped.

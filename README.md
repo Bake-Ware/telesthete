@@ -67,6 +67,33 @@ band = Band(psk="...", ciphers=["aes256-gcm", "chacha20-poly1305"])
   WebTransport (preferred for browsers), WebSocket (legacy fallback).
 - **Replay protection** — Control and Stream reject sequences at or below a
   per-peer high-water mark (SPEC §3.3).
+- **Addressed hub routing (optional)** — a peer declares a 16-bit route id
+  (`Route`, 0x05) and others send it `Addressed` (0x06) frames that the hub
+  delivers only to the declarer; everything else is broadcast (SPEC §10.1).
+
+## Changelog
+
+### 0.3.0 (unreleased)
+
+- **Addressed hub routing (SPEC §10.1).** New channel types `ROUTE` (0x05)
+  and `ADDRESSED` (0x06); `telesthete.protocol.route.route_id_for`,
+  `pack_route_declaration`, `pack_addressed`; Rust `route_id_for`,
+  `ChannelType::{Route, Addressed}`. The hub routes only `ADDRESSED` frames
+  by `channel_id`, only to validated declarers; `CHANNEL` frames are always
+  broadcast, so library Channel connection ids are never treated as
+  addresses.
+- **Hub memory.** `HUB_UDP_PEER_QUEUE` defaults to 256 (was
+  `HUB_CONN_QUEUE`, 1024); new hub-wide `HUB_UDP_QUEUE_BYTES` (32 MiB); UDP
+  queues are created only for validated peers.
+- **Behaviour change — `Reassembler` defaults.** `Reassembler()` now drops
+  chunks declaring more than 16,384 chunks and non-final chunks over 1,003 B
+  (`MAX_CHUNK_PAYLOAD`), and remembers evicted messages so their late chunks
+  are dropped. Callers receiving from a `Fragmenter` with a larger
+  `chunk_size`, or messages over ~16 MB, should build their reassembler with
+  `Fragmenter.reassembler()` (Rust: `Reassembler::for_chunk_size`), which
+  accepts everything that fragmenter can emit and bounds memory with a
+  64 MiB byte budget. The library's own `Channel` and `Board` do this. The
+  Rust `Reassembler` gains the same caps.
 
 ## Testing
 
@@ -76,6 +103,7 @@ python tests/test_vectors.py        # crypto vectors (chacha + aes)
 python tests/test_negotiation.py    # live cipher handshake
 python tests/test_replay.py
 python tests/test_fragment.py
+python -m pytest -q tests/test_route.py   # addressed routing (§10.1)
 
 # Rust (includes the same cross-impl vectors)
 cd rust && cargo test
