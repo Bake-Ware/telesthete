@@ -19,6 +19,7 @@ pub mod discovery;
 pub mod framing;
 pub mod stream;
 pub mod transport;
+#[cfg(unix)]
 pub mod unix_transport;
 pub mod wire;
 pub mod board;
@@ -35,6 +36,7 @@ pub use framing::{
 };
 pub use stream::{StreamEndpoint, StreamError, StreamHub, StreamMessage};
 pub use transport::{Inbound, Outbound, Transport, TransportError};
+#[cfg(unix)]
 pub use unix_transport::{
     UnixInbound, UnixOutbound, UnixSeqClient, UnixTransport, UnixTransportError,
     MAX_FDS_PER_PACKET, SOCKET_DIR_ENV, SOCKET_DIR_FALLBACK,
