@@ -15,6 +15,9 @@
 //!
 //! See `examples/c-producer/` for a runnable single-file example.
 
+// The C ABI sends dmabuf fds over the AF_UNIX transport, which exists only
+// on Unix. Elsewhere this crate builds empty so the workspace still compiles.
+#![cfg(unix)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::ffi::CStr;
