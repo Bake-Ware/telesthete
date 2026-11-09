@@ -35,7 +35,7 @@ pub use framing::{
     MIN_PACKET_LEN, ROUTE_ID_DOMAIN,
 };
 pub use stream::{StreamEndpoint, StreamError, StreamHub, StreamMessage};
-pub use transport::{Inbound, Outbound, Transport, TransportError};
+pub use transport::{Inbound, Outbound, ReceiveTime, ReceiveTimeSource, Transport, TransportError};
 #[cfg(unix)]
 pub use unix_transport::{
     UnixInbound, UnixOutbound, UnixSeqClient, UnixTransport, UnixTransportError,

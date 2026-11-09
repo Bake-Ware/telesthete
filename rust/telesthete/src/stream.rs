@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 use tracing::debug;
 
 use crate::framing::ChannelType;
-use crate::transport::{Inbound, Outbound, Transport, TransportError};
+use crate::transport::{Inbound, Outbound, ReceiveTime, Transport, TransportError};
 
 #[derive(Debug, Error)]
 pub enum StreamError {
@@ -32,6 +32,11 @@ pub struct StreamMessage {
     pub stream_id: u16,
     pub priority: u8,
     pub data: Vec<u8>,
+    /// When its datagram arrived at this host: the kernel's receive time
+    /// where the platform gives one, else when Telesthete read it from the
+    /// socket (see [`ReceiveTime`]). Earlier than the time the application
+    /// gets the message by however long the hops in between took.
+    pub received: ReceiveTime,
 }
 
 /// Stream sender + receiver. One handle per `stream_id` per peer.
@@ -171,5 +176,6 @@ async fn handle_stream_inbound(
         stream_id: in_pkt.header.channel_id,
         priority,
         data,
+        received: in_pkt.received,
     })
 }
