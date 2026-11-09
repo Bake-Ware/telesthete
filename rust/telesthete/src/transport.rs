@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
 use thiserror::Error;
 use tokio::net::UdpSocket;
@@ -26,6 +27,78 @@ pub struct Inbound {
     pub from: SocketAddr,
     pub header: Header,
     pub payload: Vec<u8>,
+    /// When the datagram arrived (see [`ReceiveTime`]).
+    pub received: ReceiveTime,
+}
+
+/// When a datagram arrived at this host. Local information only: nothing of
+/// it is on the wire.
+///
+/// A packet is handed to the application through several tasks (the receive
+/// loop, a hub, the endpoint's queue), each of which a busy host can delay;
+/// an application that times arrivals (a delay-based congestion controller,
+/// a jitter buffer) needs the time the packet actually arrived, not the time
+/// it got to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiveTime {
+    /// The arrival, on the monotonic clock.
+    pub at: Instant,
+    /// Where `at` comes from.
+    pub source: ReceiveTimeSource,
+}
+
+/// How a [`ReceiveTime`] was taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiveTimeSource {
+    /// The kernel's software receive timestamp (`SO_TIMESTAMPNS`, Linux and
+    /// Android): when the network stack received the datagram, however late
+    /// this process read it.
+    Kernel,
+    /// The time the receive loop read the datagram from the socket: the
+    /// fallback where the kernel gives no timestamp (other platforms, a
+    /// kernel that refuses `SO_TIMESTAMPNS`, a datagram without one, or a
+    /// wall clock stepped between arrival and read). Time the datagram
+    /// waited in the socket buffer counts as arrival delay.
+    Read,
+}
+
+/// Longest a kernel timestamp may precede the read before it is distrusted
+/// (the wall clock it is taken on was stepped forward in between).
+const MAX_SOCKET_WAIT: Duration = Duration::from_secs(10);
+
+impl ReceiveTime {
+    /// The time a datagram was read, now.
+    pub fn read_now() -> Self {
+        Self {
+            at: Instant::now(),
+            source: ReceiveTimeSource::Read,
+        }
+    }
+
+    /// Map a kernel timestamp, taken on the wall clock (`CLOCK_REALTIME`),
+    /// onto the monotonic clock: `read` minus how long before `wall` (the
+    /// wall clock read together with `read`) the datagram arrived. A
+    /// timestamp after `wall` or more than [`MAX_SOCKET_WAIT`] before it
+    /// means the wall clock was stepped in between; the read time is used
+    /// instead.
+    pub fn from_kernel(stamp: SystemTime, wall: SystemTime, read: Instant) -> Self {
+        match wall.duration_since(stamp) {
+            Ok(waited) if waited <= MAX_SOCKET_WAIT => match read.checked_sub(waited) {
+                Some(at) => Self {
+                    at,
+                    source: ReceiveTimeSource::Kernel,
+                },
+                None => Self {
+                    at: read,
+                    source: ReceiveTimeSource::Read,
+                },
+            },
+            _ => Self {
+                at: read,
+                source: ReceiveTimeSource::Read,
+            },
+        }
+    }
 }
 
 /// Outbound packet to be encrypted + sent.
@@ -104,13 +177,22 @@ pub struct Transport {
     seq: Arc<SequenceCounter>,
     /// Per-channel-type inbound dispatch (control, stream, channel).
     routes: Arc<Mutex<HashMap<ChannelType, mpsc::UnboundedSender<Inbound>>>>,
+    /// The socket delivers kernel receive timestamps (see [`ReceiveTime`]).
+    kernel_receive_times: bool,
 }
 
 impl Transport {
     pub async fn bind(addr: SocketAddr, key: Key, band_id: [u8; 16]) -> io::Result<Self> {
-        let socket = Arc::new(UdpSocket::bind(addr).await?);
-        debug!("telesthete transport bound on {}", socket.local_addr()?);
+        let socket = UdpSocket::bind(addr).await?;
+        let kernel_receive_times = rx_time::enable(&socket);
+        debug!(
+            kernel_receive_times,
+            "telesthete transport bound on {}",
+            socket.local_addr()?
+        );
+        let socket = Arc::new(socket);
         Ok(Self {
+            kernel_receive_times,
             socket,
             base_key: key,
             session_key: key, // no session configured yet -> data uses base key
@@ -164,6 +246,15 @@ impl Transport {
         self.band_id
     }
 
+    /// Whether inbound packets carry the kernel's receive time
+    /// ([`ReceiveTimeSource::Kernel`]): Linux and Android, when the kernel
+    /// accepted `SO_TIMESTAMPNS`. Otherwise every packet carries its read
+    /// time. Even with kernel times, a single packet can fall back to its
+    /// read time (see [`ReceiveTimeSource::Read`]).
+    pub fn kernel_receive_times(&self) -> bool {
+        self.kernel_receive_times
+    }
+
     /// Subscribe to inbound packets for a channel type. Drops any existing
     /// subscription for that type.
     pub async fn route(&self, ty: ChannelType) -> mpsc::UnboundedReceiver<Inbound> {
@@ -214,7 +305,7 @@ impl Transport {
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65_535];
             loop {
-                let (n, from) = match socket.recv_from(&mut buf).await {
+                let (n, from, received) = match rx_time::recv_from(&socket, &mut buf).await {
                     Ok(v) => v,
                     Err(e) => {
                         warn!("recv_from error: {e}");
@@ -250,6 +341,7 @@ impl Transport {
                     from,
                     header,
                     payload,
+                    received,
                 };
                 tracing::trace!(
                     ?header.channel_type,
@@ -268,6 +360,121 @@ impl Transport {
                 }
             }
         })
+    }
+}
+
+/// Receiving with the kernel's receive timestamp where there is one.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod rx_time {
+    use std::io::{self, IoSliceMut};
+    use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+    use std::os::fd::AsRawFd;
+    use std::time::{Duration, Instant, SystemTime};
+
+    use nix::cmsg_space;
+    use nix::sys::socket::{
+        recvmsg, setsockopt, sockopt, ControlMessageOwned, MsgFlags, SockaddrStorage,
+    };
+    use nix::sys::time::TimeSpec;
+    use tokio::io::Interest;
+    use tokio::net::UdpSocket;
+
+    use super::ReceiveTime;
+
+    /// Ask the kernel to timestamp every datagram (`SO_TIMESTAMPNS`).
+    pub(super) fn enable(socket: &UdpSocket) -> bool {
+        match setsockopt(socket, sockopt::ReceiveTimestampns, &true) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::debug!("SO_TIMESTAMPNS refused ({e}); receive times are read times");
+                false
+            }
+        }
+    }
+
+    /// `recv_from`, plus the datagram's receive time.
+    pub(super) async fn recv_from(
+        socket: &UdpSocket,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr, ReceiveTime)> {
+        socket
+            .async_io(Interest::READABLE, || recv_once(socket, buf))
+            .await
+    }
+
+    fn recv_once(
+        socket: &UdpSocket,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr, ReceiveTime)> {
+        let mut cmsg = cmsg_space!(TimeSpec);
+        let mut iov = [IoSliceMut::new(buf)];
+        let msg = recvmsg::<SockaddrStorage>(
+            socket.as_raw_fd(),
+            &mut iov,
+            Some(&mut cmsg),
+            MsgFlags::MSG_DONTWAIT,
+        )
+        .map_err(io::Error::from)?;
+        let read = Instant::now();
+        let wall = SystemTime::now();
+        let from = msg
+            .address
+            .as_ref()
+            .and_then(to_socket_addr)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "datagram without an IP source")
+            })?;
+        let stamp = msg.cmsgs().ok().and_then(|mut cmsgs| {
+            cmsgs.find_map(|c| match c {
+                ControlMessageOwned::ScmTimestampns(ts) => Some(ts),
+                _ => None,
+            })
+        });
+        let received = match stamp.and_then(to_system_time) {
+            Some(stamp) => ReceiveTime::from_kernel(stamp, wall, read),
+            None => ReceiveTime {
+                at: read,
+                source: super::ReceiveTimeSource::Read,
+            },
+        };
+        Ok((msg.bytes, from, received))
+    }
+
+    fn to_socket_addr(addr: &SockaddrStorage) -> Option<SocketAddr> {
+        if let Some(v4) = addr.as_sockaddr_in() {
+            return Some(SocketAddr::V4(SocketAddrV4::from(*v4)));
+        }
+        let v6 = addr.as_sockaddr_in6()?;
+        Some(SocketAddr::V6(SocketAddrV6::from(*v6)))
+    }
+
+    fn to_system_time(ts: TimeSpec) -> Option<SystemTime> {
+        let secs = u64::try_from(ts.tv_sec()).ok()?;
+        let nanos = u32::try_from(ts.tv_nsec()).ok()?;
+        SystemTime::UNIX_EPOCH.checked_add(Duration::new(secs, nanos))
+    }
+}
+
+/// Elsewhere: the time the receive loop read the datagram.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+mod rx_time {
+    use std::io;
+    use std::net::SocketAddr;
+
+    use tokio::net::UdpSocket;
+
+    use super::ReceiveTime;
+
+    pub(super) fn enable(_socket: &UdpSocket) -> bool {
+        false
+    }
+
+    pub(super) async fn recv_from(
+        socket: &UdpSocket,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr, ReceiveTime)> {
+        let (n, from) = socket.recv_from(buf).await?;
+        Ok((n, from, ReceiveTime::read_now()))
     }
 }
 
@@ -312,6 +519,134 @@ mod tests {
         assert_eq!(got.payload, b"hello bob");
         assert_eq!(got.header.channel_id, 1);
         assert_eq!(got.header.channel_type, ChannelType::Stream);
+    }
+
+    #[test]
+    fn kernel_time_maps_onto_the_monotonic_clock() {
+        let read = Instant::now() + Duration::from_secs(60);
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let waited = Duration::from_micros(2_345);
+        let t = ReceiveTime::from_kernel(wall - waited, wall, read);
+        assert_eq!(t.source, ReceiveTimeSource::Kernel);
+        assert_eq!(read - t.at, waited);
+        // Same instant as the read.
+        let t = ReceiveTime::from_kernel(wall, wall, read);
+        assert_eq!((t.at, t.source), (read, ReceiveTimeSource::Kernel));
+    }
+
+    #[test]
+    fn a_stepped_wall_clock_falls_back_to_the_read_time() {
+        let read = Instant::now() + Duration::from_secs(60);
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        // Stamped "after" the read: the clock was stepped back in between.
+        let t = ReceiveTime::from_kernel(wall + Duration::from_millis(5), wall, read);
+        assert_eq!((t.at, t.source), (read, ReceiveTimeSource::Read));
+        // Stamped implausibly long before: stepped forward.
+        let t = ReceiveTime::from_kernel(wall - Duration::from_secs(3_600), wall, read);
+        assert_eq!((t.at, t.source), (read, ReceiveTimeSource::Read));
+    }
+
+    /// A datagram that waits in the socket because the receiving runtime is
+    /// busy carries the time it arrived, not the time it was read (Linux and
+    /// Android); elsewhere it carries its read time, after the wait.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_time_is_the_arrival_not_the_read() {
+        let psk = b"rx-time-test";
+        let key = derive_key(psk);
+        let band_id = derive_band_id(psk);
+        let alice = Transport::bind("127.0.0.1:0".parse().unwrap(), key, band_id)
+            .await
+            .unwrap();
+        let bob = Transport::bind("127.0.0.1:0".parse().unwrap(), key, band_id)
+            .await
+            .unwrap();
+        let kernel = cfg!(any(target_os = "linux", target_os = "android"));
+        assert_eq!(bob.kernel_receive_times(), kernel);
+        let bob_addr = bob.local_addr().unwrap();
+        let mut bob_in = bob.route(ChannelType::Stream).await;
+        bob.spawn_recv_loop();
+
+        let sent = Instant::now();
+        alice
+            .send(Outbound {
+                to: bob_addr,
+                channel_type: ChannelType::Stream,
+                channel_id: 7,
+                plaintext: b"late read".to_vec(),
+                priority: 0,
+                use_base_key: false,
+            })
+            .await
+            .unwrap();
+        // Block the only runtime thread: bob's receive loop cannot run, so
+        // the datagram waits in its socket.
+        let wait = Duration::from_millis(80);
+        std::thread::sleep(wait);
+        let blocked_until = Instant::now();
+
+        let got = tokio::time::timeout(Duration::from_secs(1), bob_in.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.payload, b"late read");
+        if kernel {
+            assert_eq!(got.received.source, ReceiveTimeSource::Kernel);
+            assert!(got.received.at >= sent, "{:?}", got.received);
+            assert!(
+                blocked_until - got.received.at >= wait - Duration::from_millis(5),
+                "stamped {:?} after the send, read {:?} after it",
+                got.received.at - sent,
+                blocked_until - sent
+            );
+        } else {
+            assert_eq!(got.received.source, ReceiveTimeSource::Read);
+            assert!(got.received.at >= blocked_until);
+        }
+    }
+
+    /// Stream messages carry their packet's receive time.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_messages_carry_the_receive_time() {
+        let psk = b"rx-time-stream";
+        let key = derive_key(psk);
+        let band_id = derive_band_id(psk);
+        let alice = Arc::new(
+            Transport::bind("127.0.0.1:0".parse().unwrap(), key, band_id)
+                .await
+                .unwrap(),
+        );
+        let bob = Arc::new(
+            Transport::bind("127.0.0.1:0".parse().unwrap(), key, band_id)
+                .await
+                .unwrap(),
+        );
+        let (_rebase_tx, rebase_rx) = tokio::sync::broadcast::channel(4);
+        let hub = crate::stream::StreamHub::new(Arc::clone(&bob), rebase_rx).await;
+        bob.spawn_recv_loop();
+        let mut bob_ep = hub.open(alice.local_addr().unwrap(), 9).await;
+        let (_alice_rebase_tx, alice_rebase_rx) = tokio::sync::broadcast::channel(4);
+        let alice_hub = crate::stream::StreamHub::new(Arc::clone(&alice), alice_rebase_rx).await;
+        let alice_ep = alice_hub.open(bob.local_addr().unwrap(), 9).await;
+
+        let before = Instant::now();
+        alice_ep.send(3, b"frame").await.unwrap();
+        std::thread::sleep(Duration::from_millis(40));
+        let msg = tokio::time::timeout(Duration::from_secs(1), bob_ep.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let after = Instant::now();
+        assert_eq!((msg.priority, msg.data.as_slice()), (3, &b"frame"[..]));
+        assert!(msg.received.at >= before && msg.received.at <= after);
+        let expected = if bob.kernel_receive_times() {
+            ReceiveTimeSource::Kernel
+        } else {
+            ReceiveTimeSource::Read
+        };
+        assert_eq!(msg.received.source, expected);
+        if expected == ReceiveTimeSource::Kernel {
+            assert!(after - msg.received.at >= Duration::from_millis(35));
+        }
     }
 
     #[tokio::test]
