@@ -37,6 +37,19 @@ revision:
 - carries the result through the conformance list, the compatibility matrix,
   what is lost against a relay, and what I could not verify.
 
+**Revision 3, 13 November 2026.** The decisions are taken. Bake delegated the
+sign-off to the reviewer, who took decisions 1 to 8, 10 and 11. Decision 9
+stays open for Bake (section 11). The document now describes exactly what is
+to be built:
+
+- The epoch floor is not adopted (decision 10). It is removed from the spec
+  text and the build plan: the §10.2 "Epoch floor" text, §4.11 step 5, its
+  §13 row, T16 and the changelog mention. Section 7.6 keeps the analysis,
+  headed as examined and not adopted.
+- The §3.3 note now says the protocol has no protection across a receiver's
+  restart.
+- Section 12 lists, per PR, what is built.
+
 ## Contents
 
 1. [Summary](#1-summary)
@@ -49,7 +62,7 @@ revision:
 8. [A minimal client that can answer requests](#8-a-minimal-client-that-can-answer-requests)
 9. [Stale text](#9-stale-text)
 10. [Addendum to SPEC.md (exact text)](#10-addendum-to-specmd-exact-text)
-11. [Decisions needed](#11-decisions-needed)
+11. [Decisions](#11-decisions)
 12. [Implementation plan](#12-implementation-plan)
 13. [What I could not verify](#13-what-i-could-not-verify)
 
@@ -90,15 +103,15 @@ revision:
   directions. Neither library prevents it today, and nothing this addendum
   requires does either. The spec text now says so. An application whose
   messages cause actions must use a fresh PSK for each session, or carry
-  its own freshness. An optional epoch floor protects an endpoint across its
-  own restarts. Only a change to key derivation protects both sides, and that
-  is left for a later decision.
+  its own freshness. An epoch floor that would protect an endpoint across its
+  own restarts was examined and not adopted. Only a change to key derivation
+  protects both sides, and whether to make it is left open (decision 9).
 
 ## 2. Ground rules
 
 - **Additive only.** Existing behaviour, wire, vectors and public APIs keep
   working exactly as now. Where a fix would change something that exists, it is
-  either opt-in or listed under [Decisions needed](#11-decisions-needed).
+  either opt-in or recorded under [Decisions](#11-decisions).
 - **Application-agnostic.** This document and the spec text in section 10 say
   "application", "hub" and "peer". Telesthete authenticates frames with the key
   the application supplies; the application decides who gets a key and how.
@@ -606,17 +619,15 @@ Proposed list for a terminating endpoint, tested in both libraries against the
 | T13 | Keys and plaintext do not appear in logs at default levels. |
 | T14 | `stop` returns promptly with peers connected. |
 | T15 | While the endpoint holds a key, a recorded session of that key replayed on any path is not delivered and does not move the path, including after the peer sent GOODBYE or was evicted. |
-| T16 | *Only if the epoch floor (§10.2, section 7.6) is adopted and enabled:* after the endpoint restarts, a recorded peer session replayed on any path is not delivered, and a peer that implements §4.11 step 5 is back within `PEER_TIMEOUT` plus its backoff. |
 
-**Stated non-claim.** Without the epoch floor, a terminating endpoint does
-*not* protect itself against a replay after its own restart. With or without
-it, it does nothing for a peer that restarts: that peer accepts a replay of
-what the endpoint sent it before. The list says so, so that no one reads T15
-as more than it is.
+**Stated non-claim.** A terminating endpoint does *not* protect itself
+against a replay after its own restart. It also does nothing for a peer that
+restarts: that peer accepts a replay of what the endpoint sent it before. The
+list says so, so that no one reads T15 as more than it is.
 
-These go in a new `spec/terminating-endpoint-conformance.md`, or as a section
-of each library's tests; I suggest the former, so an application that writes
-its own endpoint has the list.
+These go in a new `spec/terminating-endpoint-conformance.md` (decision 8),
+together with the non-claim, so that an application that writes its own
+endpoint has the list.
 
 ### 5.7 What is lost against a relay in front
 
@@ -657,8 +668,8 @@ that, the terminating endpoint loses:
   state too, so its restarts had the same gap. A relay holds no session state
   and cannot close it. It is listed here because this design makes a restart
   the ordinary way the hub recovers. The spec text now says so (§3.3, §10.2).
-  The optional epoch floor closes the gap for the endpoint's side. Nothing in
-  this addendum closes it for the peer's side.
+  Nothing in this addendum closes the gap, on either side (decisions 9 and
+  10).
 
 What is gained: one service instead of two, no local socket protocol to
 specify and keep, no relay change, no eligibility delay on a client's first
@@ -670,10 +681,10 @@ reply, and nothing for the endpoint to forward.
   every client like a relay with one other peer in the band.
 - **Versioning.** No wire version. The seam is library API, versioned with the
   libraries (section 4.6).
-- **Tests.** T1 to T15 above (T16 if the floor is adopted), plus section 6's
+- **Tests.** T1 to T15 above, plus section 6's
   WebSocket tests run against a path-mode Endpoint as well as against the
   relay. The replay probe of section 3 becomes a test: as a regression test
-  for T15 and T16, and as a test that documents the non-claim (the restarted
+  for T15, and as a test that documents the non-claim (the restarted
   peer accepts the replay) so a later change in behaviour is noticed.
 
 ---
@@ -854,7 +865,7 @@ With `reconnect` on (exact spec text in section 10, §4.11 and §6.7):
   remembered address. Either way the peer sees a newer epoch in the endpoint's
   HELLO or HELLO_ACK → resets → reopens → the accept hook creates the channel
   in the new process. The new process would accept a replayed old session in
-  the same way, unless the epoch floor is enabled (section 7.6).
+  the same way. Nothing in this addendum prevents that (section 7.6).
 - **Relay restarts** (peers using the stock relay). Peers' WebSocket clients
   reconnect and send HELLO; UDP peers re-HELLO after silence. Sessions survive
   (no epoch changed), so Channels continue after retransmission or, past give-up,
@@ -927,7 +938,7 @@ results are in section 3.
 |---|---|
 | A peer restarts; what the other side sent it is replayed | Accepted (Python, Channel and Stream; Rust, Stream). |
 | The passive side restarts (an endpoint, in this design); what the peer sent it is replayed | Accepted (Python, Channel and Stream). The restarted side had sent nothing at all. |
-| No restart; the sender left with GOODBYE; replayed from its address | Python rejected (it keeps the epoch and watermark). **Rust accepted** (it forgets them on GOODBYE). |
+| No restart; the sender left with GOODBYE; replayed from its address | Python rejected (it keeps the epoch and watermark). **Rust accepted** (it forgets them on GOODBYE; fixed in PR 1b, decision 11). |
 | No restart; replayed to a plain `Band` from a new address | Channel rejected (bound to its address). **Stream accepted**: a new address is a new peer with fresh watermarks. Rust is the same by reading. |
 | No restart; replayed to an `Endpoint` (one peer per key) on any path | By reading: rejected. The epoch and watermarks belong to the key, so the replay fails §4.3 or §3.3, and the path does not move. This holds only if the Endpoint keeps a key's state across GOODBYE and eviction (T15). |
 | The `Endpoint` restarts, or `remove_key` then `add_key` with the same PSK | By reading: accepted, on any path, and the path follows the replay, so the endpoint's answers go to the replayer. The replayer does not even need the peer's source address. |
@@ -947,10 +958,15 @@ things for every message whose repetition matters:
 
 Messages whose repetition is harmless need neither.
 
-**A mitigation that changes nothing on the wire: the epoch floor.** I
-examined the candidate in the review brief. It is sound for the endpoint's
-side, under the conditions below, and it is small. It is proposed as optional
-text (§10.2 and §4.11 step 5 in section 10). The rules:
+**Examined and not adopted: the epoch floor.** This would change nothing on
+the wire. I examined the candidate in the review brief. It is sound for the
+endpoint's side, under the conditions below, and it is small. Revision 2
+proposed it as optional text. Decision 10 does not adopt it now: it is not
+prototyped, it protects one side only, and it brings a lock-out mode and
+slower recovery. The first application will use a fresh key per session. It
+is to be revisited together with decision 9. Nothing below is built or goes
+into SPEC.md. The analysis is kept so the reasoning is not lost. The rules
+were:
 
 - *F1.* For each `band_id`, the endpoint keeps the highest session epoch it
   has accepted from that band's peer in durable storage. This is the *floor*.
@@ -963,9 +979,9 @@ text (§10.2 and §4.11 step 5 in section 10). The rules:
 - *F3.* A floor outlives `remove_key`.
 - *F4.* While it holds no accepted session for a band, the endpoint sends no
   HELLO for it. So `Endpoint.connect` at start is not used with floors.
-- *Peer side (§4.11 step 5).* When a peer with reconnection declares a target
-  lost, it starts a new session before it sends HELLO again. That means a new,
-  larger epoch and every Channel reset.
+- *Peer side (proposed as §4.11 step 5).* When a peer with reconnection
+  declares a target lost, it starts a new session before it sends HELLO
+  again. That means a new, larger epoch and every Channel reset.
 
 Why it works. A replayed HELLO carries an epoch the endpoint has already
 accepted, so it is at or below the floor and is ignored. With no accepted
@@ -1035,8 +1051,8 @@ in the link profile. It also means an initiator cannot send data until it has
 the responder's contribution. It would not give forward secrecy, which needs
 ephemeral key agreement.
 
-It is outside this additive addendum. Decision 9 asks whether Telesthete
-should take it on later.
+It is outside this additive addendum. Decision 9 leaves open, for Bake,
+whether Telesthete takes it on later. Nothing in this design waits on it.
 
 ---
 
@@ -1224,10 +1240,10 @@ holds its PSK.
   actions must therefore do one of two things. It uses a fresh PSK for each
   session, one that no receiver accepts after it restarts. Or it carries its
   own freshness, for example unique message ids with an expiry, remembered by
-  the receiver across restarts. §10.2 describes an optional epoch floor that
-  protects a terminating endpoint across its own restarts. Protecting both
-  sides needs a key derivation to which the receiver contributes, which this
-  version does not have.
+  the receiver across restarts. This version of the protocol has no
+  protection across a receiver's restart. Closing the gap needs a key
+  derivation to which the receiver contributes, which this version does not
+  have.
 
 ### §3.6 Many keys on one endpoint
 
@@ -1260,11 +1276,6 @@ A peer that implements reconnection:
    `PEER_TIMEOUT`; evicts it as §4.5 says and resumes step 2.
 4. On receiving, from any peer, a HELLO or HELLO_ACK with a newer session epoch
    (§4.3), or a GOODBYE, resets every Channel it has with that peer (§6.7).
-5. *(Optional, and required of every peer of an endpoint that uses an epoch
-   floor, §10.2.)* On declaring a target lost (step 3), starts a new session
-   before it resumes step 2. It takes a session epoch greater than its current
-   one and resets every Channel (§6.7). Its data key changes with its epoch
-   (§3.1), so every other peer of the band sees a new session.
 
 Every peer, with or without reconnection, MUST answer a HELLO with a HELLO_ACK,
 including a repeated HELLO with an epoch equal to the last one seen (the
@@ -1419,25 +1430,6 @@ over the path. A peer that restarts likewise accepts a replay of what the
 endpoint sent it. An application that acts on messages uses a fresh PSK for
 each session, or carries its own freshness (§3.3).
 
-**Epoch floor (optional).** An endpoint MAY protect itself against replay
-across its own restarts:
-
-1. For each `band_id` it keeps the highest session epoch it has accepted from
-   that band's peer (the *floor*), in storage that survives a restart. It
-   records a newer floor before it processes any other frame of that session.
-2. It accepts a HELLO or HELLO_ACK for the band only if the epoch is greater
-   than the floor, or equal to it while the endpoint holds that session.
-   Otherwise it ignores the frame: no session, no answer, no change of path.
-3. It keeps a floor when the key is removed, and applies it if the key
-   returns.
-4. It sends no HELLO for a band whose peer session it has not accepted.
-
-Every peer of such an endpoint MUST implement §4.11 step 5. A peer that does
-not is locked out until it restarts. After the endpoint restarts, peers return
-within `PEER_TIMEOUT` plus their reconnection backoff. The floor protects
-nothing if its storage is lost, and it is undone if the storage is rolled
-back, for example to a snapshot. It does not protect a peer that restarts.
-
 A relay and a terminating endpoint may run side by side on one host, on
 different ports or paths.
 
@@ -1447,8 +1439,7 @@ The smallest peer that can exchange requests and replies reliably. A *link
 client* implements: §1; §3.1; the §3.2 baseline suite only; §3.3; §4.3, §4.4,
 §4.5 and §4.8 with `capabilities: []` and `ciphers: ["chacha20-poly1305"]`, and
 a session epoch that increases across restarts (persisted when the device has
-no reliable clock); §4.2's rule to ignore unknown types; §4.11 (step 5 when
-its endpoint uses an epoch floor, §10.2); §6 for at least
+no reliable clock); §4.2's rule to ignore unknown types; §4.11; §6 for at least
 one `channel_id` as initiator, with any advertised window from 1 up (it may drop
 every frame outside its window); §6.6 for every message, with a local cap on
 reassembled size that the application must respect; §6.7 (c) to (g); and one
@@ -1464,81 +1455,97 @@ lines of C.
 | Reconnection (§4.11) | none — answering a repeated HELLO is already required |
 | Channel lifecycle (§6.7) | none — local reactions; RST is the existing §6.2 flag |
 | Terminating endpoint (§10.2) | none — clients reach it as they reach a relay; recovery after its restart needs §4.11 and §6.7 in the client |
-| Epoch floor (§10.2) | §4.11 step 5 in every peer of that endpoint — a peer without it is locked out until it restarts |
 | Receiver-restart note (§3.3) | none — it states a limit; nothing is sent differently |
 
 ### §16 Changelog — row added
 
-| 1.2 (addendum 2) | 2026-11-?? | **Additive, wire-compatible; `PROTOCOL_VERSION` stays 3.** §3.6 many keys on one endpoint (choose the key by `band_id`). §4.11 optional reconnection (HELLO retry, re-HELLO after silence, channel reset on a peer's new session or GOODBYE). §6.7 Channel lifecycle: identity, accepting, reset, reopening, new incarnation, when to send RST, giving up. §9.3 WebSocket specified for servers and clients. §10 relay no longer "Future"; relays hide the sender; §10.2 optional terminating endpoints. §3.3 receiver restart: replay protection is lost with the receiver's memory, and what applications must do. §4.11 optional step 5 and §10.2 optional epoch floor. §12.6 link profile. §2 Control is not "always reliable". §11.1 rewritten for any application. |
+| 1.2 (addendum 2) | 2026-11-?? | **Additive, wire-compatible; `PROTOCOL_VERSION` stays 3.** §3.6 many keys on one endpoint (choose the key by `band_id`). §4.11 optional reconnection (HELLO retry, re-HELLO after silence, channel reset on a peer's new session or GOODBYE). §6.7 Channel lifecycle: identity, accepting, reset, reopening, new incarnation, when to send RST, giving up. §9.3 WebSocket specified for servers and clients. §10 relay no longer "Future"; relays hide the sender; §10.2 optional terminating endpoints. §3.3 receiver restart: replay protection is lost with the receiver's memory, and what applications must do. §12.6 link profile. §2 Control is not "always reliable". §11.1 rewritten for any application. |
 ````
 
 ---
 
-## 11. Decisions needed
+## 11. Decisions
 
-One line each, with my recommendation first.
+Bake delegated the sign-off to the reviewer on 13 November 2026 ("Review and
+approve it your self"). The reviewer took decisions 1 to 8, 10 and 11 that day.
+Decision 9 is open, for Bake. Each entry gives the decision as taken, then the
+alternative that was not chosen.
 
-1. **Peers per key at an `Endpoint`.** One remote peer per key, following the
-   latest accepted path (recommended; reconnects and NAT changes keep their
-   Channels); or one peer per path, as a `Band` on a socket does today.
-2. **Lifecycle behaviour on by default?** Opt-in per Band, on by default only in
-   the new `Endpoint` (recommended, strictly additive); or on everywhere, since
-   it only changes cases that today wedge.
-3. **Python condition 1** (`Band.channel(id, other_peer)` returns the channel
-   bound to the first peer). Leave it and state the rule in §6.7 (a)
-   (recommended; `Endpoint` bands never hit it); or fix it, which changes what an
-   existing call returns.
-4. **Python WebSocket dependency.** `websockets` as an optional extra
-   (recommended); or a hand-written RFC 6455 client in the package.
-5. **§2 "Control: Always reliable".** Correct the sentence (recommended); or
-   make Control reliable, a large change nothing here needs.
-6. **WebSocket close codes.** Carry no meaning (recommended; a "no such key"
-   code would tell an unauthenticated prober which `band_id`s a server holds);
-   or define codes so a client can stop retrying a revoked key.
-7. **WebSocket path for servers.** SHOULD be `/band`, as the relay serves
-   (recommended; one URL form fits every server); or leave it free.
-8. **Where the terminating-endpoint conformance list lives.** A new
-   `spec/terminating-endpoint-conformance.md` (recommended; an application that
-   writes its own endpoint can use it); or only in the libraries' tests.
-9. **Should Telesthete later make the data key depend on the receiver too?**
-   This is the real fix for replay after a restart (section 7.6): both epochs,
-   or a nonce from each side, mixed into key derivation. It would be
-   negotiated, with new vectors. It is outside this addendum either way.
-   Recommendation: yes, as its own negotiated addendum once a second
-   application needs it. Until then, applications use a fresh PSK per session
-   or their own freshness. The alternative is never: the §3.3 note stays as
-   the permanent statement of the limit.
-10. **The epoch floor (§10.2, §4.11 step 5).** Keep it as optional text, off by
-    default in `Endpoint` (recommended). It is the only protection the
-    protocol can give an endpoint across its restarts today, and it costs
-    nothing when unused. Or leave it out: it covers one side only, it slows
-    recovery to `PEER_TIMEOUT`, and an application with fresh keys per session
-    does not need it.
-11. **Rust forgets a peer's epoch and control watermark on GOODBYE**
-    (`control.rs:413-419`), so a replay from the same address is accepted
-    after a peer leaves cleanly, with no restart (section 3). Fix it in PR 1b
-    to keep them as Python does (recommended). Only a replay changes outcome,
-    because a conformant returning peer's real frames carry higher sequences
-    or a newer epoch (§4.3). Or leave it, and the §3.3 SHOULD stays unmet by Rust.
+1. **Peers per key at an `Endpoint`: one remote peer per key, following the
+   latest accepted path** (section 5.4). Reconnects and NAT changes keep
+   their Channels. Taken by the reviewer, 13 Nov 2026.
+   *Not chosen:* one peer per path, as a `Band` on a socket does today.
+2. **Lifecycle behaviour is opt-in per Band and on by default only in
+   `Endpoint`** (section 7.2). Taken by the reviewer, 13 Nov 2026.
+   *Not chosen:* on everywhere.
+3. **Python condition 1 is left as is, and the rule is stated in §6.7 (a)**
+   (`Band.channel(id, other_peer)` keeps returning the channel bound to the
+   first peer). Taken by the reviewer, 13 Nov 2026.
+   *Not chosen:* fix it, which changes what an existing call returns.
+4. **`websockets` as an optional extra, `telesthete[ws]`** (section 6.2).
+   Taken by the reviewer, 13 Nov 2026.
+   *Not chosen:* a hand-written RFC 6455 client in the package.
+5. **Correct the SPEC §2 sentence "Control: Always reliable"** (section 9.2).
+   Taken by the reviewer, 13 Nov 2026.
+   *Not chosen:* make Control reliable.
+6. **WebSocket close codes carry no meaning** (§9.3). Taken by the reviewer,
+   13 Nov 2026.
+   *Not chosen:* define codes, for example "no such key", which would tell an
+   unauthenticated prober which `band_id`s a server holds.
+7. **Servers SHOULD serve the WebSocket path `/band`** (§9.3). Taken by the
+   reviewer, 13 Nov 2026.
+   *Not chosen:* leave the path free.
+8. **The terminating-endpoint conformance list goes in a new
+   `spec/terminating-endpoint-conformance.md`** (T1 to T15 and the stated
+   non-claim, section 5.6). Taken by the reviewer, 13 Nov 2026.
+   *Not chosen:* only in the libraries' tests.
+9. **Open, for Bake, and outside this addendum: whether Telesthete later makes
+   the data key depend on the receiver too.** This is the real fix for replay
+   after a restart (section 7.6): both epochs, or a nonce from each side,
+   mixed into key derivation, negotiated, with new vectors. Nothing in this
+   design waits on it. Until it is decided and built, applications use a fresh
+   PSK per session or their own freshness (§3.3).
+   *Alternatives on the table:* take it on later as its own negotiated
+   addendum, or never, in which case the §3.3 note is the permanent statement
+   of the limit.
+10. **The epoch floor is not adopted now.** It is not prototyped, it protects
+    one side only, it brings a lock-out mode and slower recovery, and the first
+    application will use a fresh key per session. Revisit it together with
+    decision 9. The analysis stays in section 7.6. Taken by the reviewer,
+    13 Nov 2026.
+    *Not chosen:* optional §10.2 text and §4.11 step 5, off by default in
+    `Endpoint`.
+11. **Fix Rust to keep a peer's epoch and control watermark after GOODBYE, in
+    PR 1b.** Today it forgets both (`control.rs:413-419`), so a replay from
+    the same address is accepted after a peer leaves cleanly (section 3).
+    Python already keeps them. Only a replay changes outcome, because a
+    conformant returning peer's real frames carry higher sequences or a newer
+    epoch (§4.3). Taken by the reviewer, 13 Nov 2026.
+    *Not chosen:* leave it, and Rust does not meet the §3.3 SHOULD.
 
 ---
 
 ## 12. Implementation plan
 
-Each PR carries its own SPEC.md section from section 10, its tests and a
-CHANGELOG line. Sizes are new or changed lines including tests: S < 300, M
-300-800, L 800-1,500.
+Each PR carries the SPEC.md text from section 10 that it implements, its tests
+and a CHANGELOG line. Sizes are new or changed lines including tests: S < 300,
+M 300-800, L 800-1,500. Where a Python PR and a Rust PR implement the same
+section, the Python PR carries the SPEC.md text and the Rust PR refers to it.
 
-| PR | Delivers | Tests | Depends on | Size |
-|---|---|---|---|---|
-| 0 | Stale text (section 9): PROTOCOL_STATUS.md, SPEC.md §2/§9.6/§10.1/§11/§11.1/§12/§12.2/§12.4/§12.5/§16, README, LIBRARY_COMPLETION | none (docs) | — | S |
-| 1a | Python link lifecycle (§4.11, §6.7): `reconnect`, `on_channel`, `on_reset`, `Channel.state`, reopen fixes, RST, give-up reset | mock-transport tests per condition; live UDP restart/loss/partition | — | L |
-| 1b | Rust link lifecycle: `set_reconnect`, `take_incoming_channels`, `resets()`, `ResetReason`, connection task survives give-up | as 1a | — | L |
-| 2 | Python `Band(transport=)` and `WebSocketTransport`, `[ws]` extra, §9.3 text | against the built relay: WS↔UDP, reconnect, WSS self-signed | — | M |
-| 3a | Python `Endpoint`: UDP mode and path seam, one peer per key, path following, `connect` (§3.6, §10.2); conformance list T1-T14 | T1-T14; WS and UDP peers against a test server on the seam; restart | 1a, 2 | M-L |
-| 3b | Rust `Endpoint` (same), internal I/O backend in `Transport`, `Path` | as 3a | 1b | L |
-| 4 | Rust `Band::connect_ws`, feature `ws` | as 2, plus against a path-mode Endpoint | 3b | M |
-| 5 | Cross-language interop and link-profile configuration tests; Python↔Rust restart test; version bumps (Python 0.4.0, crates 0.3.0), SPEC changelog row, release | interop matrix | all above | M |
+| PR | Builds | SPEC.md text it carries | Tests | Depends on | Size |
+|---|---|---|---|---|---|
+| 0 | Stale text (section 9): PROTOCOL_STATUS.md, README, LIBRARY_COMPLETION; SPEC.md §2 Control row corrected (decision 5), §9.6, §10.1, §11, §11.1 (application's name removed), §12, §12.2, §12.4, §12.5, §16 | Section 9's SPEC.md edits; the §3.3 "Receiver restart" note and its §13 row (the limit exists on `main` today) | none (docs) | — | S |
+| 1a | Python link lifecycle, §4.11 steps 1 to 4 and §6.7 (a) to (g): `Band(..., reconnect=False)` (off by default, decision 2), `on_channel`, `Channel.on_reset`, `Channel.state`, reopen fixes (always on), RST, give-up reset. Condition 1 unchanged (decision 3) | §4.11, §6.7, their §13 rows | mock-transport test per condition, failing first; live UDP restart, loss, partition | — | L |
+| 1b | Rust link lifecycle: `set_reconnect`, `take_incoming_channels`, `resets()`, `ResetReason`, connection task survives give-up. Also keep a peer's epoch and control watermark after GOODBYE (decision 11) | refers to 1a's | as 1a; plus a replay from the same address after GOODBYE is rejected, and a conformant peer that returns after GOODBYE is accepted | — | L |
+| 2 | Python `Band(transport=)` and `WebSocketTransport`, with `websockets` as the optional `[ws]` extra (decision 4) | §9.3 (servers SHOULD serve `/band`, decision 7; close codes carry no meaning, decision 6), §9.6 sentence | against the built relay: WS↔UDP, reconnect, WSS self-signed | — | M |
+| 3a | Python `Endpoint`: UDP mode and path seam (`receive`, `close_path`, `send` callback), `add_key`, `remove_key`, one remote peer per key with path following (decision 1), `connect`, lifecycle on by default (decision 2). A key's epoch and watermarks are kept across GOODBYE and eviction while the key is held. New `spec/terminating-endpoint-conformance.md` with T1 to T15 and the stated non-claim (decision 8) | §1 row, §3.1 sentence, §3.6, §10 heading, paragraph and Terminating mode, §10.2, their §13 rows | T1 to T15; WS and UDP peers against a test server on the seam; restart; the replay probe as a test for T15 and for the non-claim | 1a, 2 | M-L |
+| 3b | Rust `Endpoint` (same as 3a), internal I/O backend in `Transport`, `Path` | refers to 3a's | as 3a | 1b | L |
+| 4 | Rust `Band::connect_ws`, feature `ws` | refers to 2's | as 2, plus against a path-mode Endpoint | 3b | M |
+| 5 | Cross-language interop and link-profile configuration tests; Python↔Rust restart test; version bumps (Python 0.4.0, crates 0.3.0); release | §12.6, §16 changelog row | interop matrix | all above | M |
+
+Not built, by decision: the epoch floor, §4.11 step 5 and the T16 claim
+(decision 10); any change to key derivation (decision 9, open). None of them
+appears in SPEC.md.
 
 Eight PRs, against twelve in revision 0: the pairwise key PR and the two
 attachment PRs are gone, and the relay is untouched.
@@ -1551,13 +1558,6 @@ Order and parallelism:
 - **Then 5.**
 
 A Python-only user needs 1a, 2 and 3a; the Rust PRs run alongside.
-
-Revision 2 adds no PR. The §3.3 note goes in with PR 0, as the limit exists on
-`main` today. T15, and keeping a key's state across GOODBYE and eviction, go in
-3a and 3b. If decision 10 keeps the epoch floor, it goes in 3a and 3b (the
-endpoint rules, with a pluggable store) and §4.11 step 5 goes in 1a and 1b,
-each about S. If decision 11 is accepted, the Rust GOODBYE change goes in 1b.
-The replay probe becomes a test in 3a and 3b.
 
 ---
 
@@ -1590,7 +1590,8 @@ The replay probe becomes a test in 3a and 3b.
     expect the same results.
   - The Rust map-cap path (`PEER_MAP_SOFT_CAP`) was not exercised.
   - All runs were on loopback.
-- **Epoch floor** (section 7.6) is reasoned, not prototyped. I did not model
+- **Epoch floor** (section 7.6) is reasoned, not prototyped, and not adopted
+  (decision 10). I did not model
   it formally. The cases I checked are a crash between the write and the first
   frame, a retried HELLO, a peer without step 5, and an endpoint that sends
   HELLO first (hence F4).
