@@ -128,6 +128,15 @@ To build it yourself instead: `cd rust && cargo build --release -p telesthitium`
   SPEC §2 no longer calls Control "always reliable". Stale implementation
   status corrected in SPEC.md, PROTOCOL_STATUS.md, LIBRARY_COMPLETION.md and
   this README. No code or wire change.
+- **Link lifecycle (SPEC §4.11, §6.7).** `Band(..., reconnect=False)`: when
+  on, HELLO is resent until answered and after `PEER_TIMEOUT` of silence,
+  and Channels are reset when a peer starts a new session, says GOODBYE,
+  sends RST or stops answering; a reset Channel can be opened again, and
+  data for a closed or unknown channel is answered with RST.
+  `Band.on_channel(cb)` accepts Channels the peer opens. `Channel.on_reset(cb)`
+  (reason: `telesthete.protocol.channel.ResetReason`) and read-only
+  `Channel.state`. Always on: a CLOSED Channel accepts a SYN at any inner
+  sequence. With `reconnect` off nothing else changes.
 
 ### 0.3.0 (unreleased)
 
