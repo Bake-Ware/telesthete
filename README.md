@@ -117,6 +117,14 @@ To build it yourself instead: `cd rust && cargo build --release -p telesthitium`
 
 ### Unreleased
 
+- **Endpoint (SPEC §3.6, §10.2).** `telesthete.Endpoint` holds many keys on
+  one set of transports and picks each frame's key by its `band_id` before
+  decrypting. It runs on its own UDP socket or on the application's
+  transports: `receive(path, frame)`, `close_path(path)` and a
+  `send(path, frame)` callback. Each key's `Band` has one remote peer, at
+  `Endpoint.PEER`, reached on the path of its latest accepted frame, and runs
+  with `reconnect=True`. Conformance list:
+  `spec/terminating-endpoint-conformance.md`.
 - **WebSocket client (SPEC §9.3).** `Band(..., transport=)` runs a Band over
   a transport other than its own UDP socket.
   `telesthete.transport.websocket.WebSocketTransport(url)` connects to a relay

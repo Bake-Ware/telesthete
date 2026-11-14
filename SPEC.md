@@ -41,7 +41,7 @@ Every Telesthete packet on the wire has the same outer frame:
 
 | Offset | Size    | Field          | Encoding       | Description                          |
 |--------|---------|----------------|----------------|--------------------------------------|
-| 0      | 16 B    | `band_id`      | raw bytes      | Cleartext. Relay routing identifier. |
+| 0      | 16 B    | `band_id`      | raw bytes      | Cleartext. Relay routing identifier, and the key selector at an endpoint that holds many keys (§3.6). |
 | 16     | 1 B     | `channel_type` | uint8          | Cleartext. Multiplexing selector.    |
 | 17     | 2 B     | `channel_id`   | uint16 BE      | Cleartext. Sub-channel identifier.   |
 | 19     | 8 B     | `sequence`     | uint64 BE      | Cleartext. Monotonic per-sender. Also used as AEAD nonce. |
@@ -123,6 +123,9 @@ HELLO (epoch unknown) is dropped.
 Both peers with the same PSK and the same negotiated cipher derive
 identical `key`. The relay (Telesthetium) sees `band_id` for routing but
 never possesses the PSK and cannot decrypt traffic.
+
+A terminating endpoint (§10.2) is not a relay: it is a member of the band and
+holds its PSK.
 
 ### 3.2 AEAD Construction
 
@@ -267,6 +270,24 @@ Rules:
 
 A minimal client MAY implement only the baseline: it advertises
 `["chacha20-poly1305"]` and interoperates with everyone.
+
+### 3.6 Many keys on one endpoint
+
+A PSK determines its `band_id` (§3.1), and every frame carries its `band_id` in
+cleartext. An implementation MAY therefore hold many PSKs on one set of
+transports and choose the key for a frame by its `band_id` before decrypting
+it. Such an *endpoint*:
+
+1. MUST drop a frame whose `band_id` it holds no key for, without attempting
+   decryption.
+2. MUST, once a key has been removed, neither decrypt nor deliver any further
+   frame bearing that key's `band_id`.
+3. Treats each key as an independent band: its own peers, session state, replay
+   watermarks and sequence source (§3.3). It keeps a key's session epochs and
+   watermarks for as long as it holds the key, also after a GOODBYE or an
+   eviction.
+
+Peers see nothing different: each sees an ordinary band.
 
 ---
 
@@ -1052,12 +1073,18 @@ reference relay serves WebTransport; neither reference library has a client.
 
 ---
 
-## 10. Telesthetium Hub — Future
+## 10. Telesthetium Hub (relay)
 
 Self-hosted relay/signaling server. Peers connect outbound, identify by
 `band_id`. Hub matches peers in the same Band and bridges traffic.
 Hub sees only the cleartext header (`band_id`, `channel_type`, `channel_id`)
 + opaque ciphertext. Cannot decrypt.
+
+The reference relay is `rust/telesthitium` (binary `telesthete-hub`); its
+conformance inventory is `rust/telesthitium/CONFORMANCE.md`. A relay forwards
+frames without saying which peer sent them: a peer reached through a relay sees
+the other peers of the band at the relay's address. Peers that must tell each
+other apart through a relay should use one band per pair (§3.6).
 
 By default a frame is delivered to every *other* peer in the band (never
 echoed to its sender). §10.1 lets a peer opt in to addressed delivery.
@@ -1066,6 +1093,8 @@ Connection modes:
 - **LAN:** Direct UDP, no hub needed.
 - **Tunnel:** Both peers connect to hub, traffic relayed.
 - **Hybrid:** Try LAN first, fall back to hub, prefer direct.
+- **Terminating:** the peer connects to a server that is itself the band's
+  other member (§10.2). Nothing is relayed.
 
 The hub is also the default HTTP/3 terminator for WebTransport (§9.6)
 and the WSS terminator for the legacy WebSocket fallback (§9.3): a
@@ -1221,6 +1250,48 @@ observer newly learns is which peer a frame is addressed to, by an id
 derived from a peer name: treat route ids as metadata on par with the
 source address the hub already sees. Declarations are band-scoped, so one
 band's declarations never affect another band.
+
+### 10.2 Terminating endpoints (optional)
+
+A *terminating endpoint* is a server that is a member of every band it serves.
+It holds those bands' keys (§3.6), accepts frames over §9.1 UDP, §9.3
+WebSocket or both, and answers them as a peer. It never forwards a frame to
+anyone else. A client reaches it exactly as it reaches a relay, with the same
+addresses, URLs, frames and handshake, and cannot tell the two apart. In a band
+served this way the endpoint is normally the client's only other member.
+
+A terminating endpoint:
+
+1. chooses the key by `band_id` and drops frames for bands it holds no key for,
+   without decrypting (§3.6). It sends nothing in answer to a frame that does
+   not authenticate, so it needs no source validation of the kind a relay may
+   apply;
+2. is a peer in each band: §3, §4 and §6 apply to it as to any peer. It drops
+   Route frames (§2); §10.1 does not apply to it;
+3. answers on the path a peer's frames arrive on: over UDP from the local
+   address and port the peer sent to, over WebSocket on the same connection;
+4. MAY treat each band as having one remote peer, reachable over whichever path
+   most recently carried a frame that the band accepted (authenticated, not a
+   replay under §3.3, and not ignored under §4.3). Then a peer that reconnects,
+   or whose NAT mapping changes, keeps its session and its Channels. Only such
+   frames move the path;
+5. over WebSocket, behaves as a §9.3 server;
+6. detects a lost peer by §4.5, not by the state of a connection.
+
+When a terminating endpoint restarts, its sessions and connections are lost and
+its session epoch increases (§4.3). Peers that implement §4.11 and §6.7
+recover: over WebSocket when they reconnect, over UDP when they declare the
+endpoint lost, or sooner if the endpoint sends HELLO to addresses it remembers.
+
+For a terminating endpoint a restart is the ordinary case, and the limit in
+§3.3 applies in full. The restarted endpoint accepts a replay of any session
+recorded before the restart, on any path. Under rule 4 the replay also takes
+over the path. A peer that restarts likewise accepts a replay of what the
+endpoint sent it. An application that acts on messages uses a fresh PSK for
+each session, or carries its own freshness (§3.3).
+
+A relay and a terminating endpoint may run side by side on one host, on
+different ports or paths.
 
 ---
 
@@ -1396,8 +1467,10 @@ is used with a peer only if it advertises the matching capability/cipher.
 | `KEYFRAME_REQ` / `RATE_HINT`  | `keyframe-req` / `rate-hint`     |
 | Board (§7) / Drop (§8)        | `board-v1` / `drop-v1`           |
 | Hub addressed routing (§10.1) | none — opt-in by Route declaration + Addressed (0x06) frames; falls back to broadcast. Address only peers that declare (see §10.1 Compatibility). |
+| Many keys on one endpoint (§3.6) | none — local to the endpoint; peers see ordinary bands |
 | Reconnection (§4.11) | none — answering a repeated HELLO is already required |
 | Channel lifecycle (§6.7) | none — local reactions; RST is the existing §6.2 flag |
+| Terminating endpoint (§10.2) | none — clients reach it as they reach a relay; recovery after its restart needs §4.11 and §6.7 in the client |
 | Receiver-restart note (§3.3) | none — it states a limit; nothing is sent differently |
 
 Absent capability ⇒ the sender restricts itself to the baseline the
