@@ -816,22 +816,54 @@ parser needs no scan and embedded-NUL hostnames cannot desynchronize the
 port field. Trailing bytes after the port MUST be ignored
 (forward-extensible).
 
-### 9.3 WebSocket (Legacy fallback) — Future
+### 9.3 WebSocket (fallback)
 
-For hostile networks (corporate firewalls, symmetric NAT) and browsers
-that lack WebTransport (§9.6). Connect outbound to Telesthetium hub over
-WSS (port 443). Same frame format as UDP, carried as WebSocket binary
-frames — boundaries are preserved by the WS frame, so no extra length
-prefix is needed. Not yet implemented.
+For networks that block UDP and for clients without WebTransport (§9.6). A
+client connects outbound over WSS, normally on TCP 443, to a *server*: a relay
+(§10) or a terminating endpoint (§10.2). The client takes the whole URL from
+its configuration. The reference relay serves the path `/band` (configurable);
+other servers SHOULD use it too.
 
-**Caveat (the reason §9.6 exists):** WebSocket runs over TCP. A lossy
-Stream (§5) carried over TCP is silently turned reliable and
-in-order — a single lost segment head-of-line-blocks every Channel and
-Stream multiplexed on that socket, and "drop the late frame" (§5.2)
-becomes "retransmit the frame you wanted dropped." Acceptable on a LAN
-with near-zero loss; pathological for real-time video over a lossy
-path. Prefer §9.6 WebTransport whenever the client supports it; fall
-back to §9.3 only when it does not.
+Both directions:
+
+- Each Telesthete frame is one **binary** WebSocket message. No length prefix:
+  the message preserves the boundary. Receivers ignore text messages and binary
+  messages shorter than `MIN_PACKET_SIZE`.
+- A connection carries one band. A client in several bands opens one connection
+  per band.
+
+A server:
+
+- accepts the upgrade on its path whatever the query string, and requires no
+  subprotocol, extension or particular `Origin`; it answers other paths with an
+  HTTP error (the reference relay: 404);
+- learns the connection's band from its first frame and sends nothing to the
+  connection before that frame. It MAY drop later frames naming another band
+  (the reference relay does);
+- answers pings. It SHOULD close a connection that has sent nothing, pongs
+  included, for 60 s, and MAY ping a quiet one (the reference relay pings every
+  20 s);
+- may close a connection at any time. Close status codes carry no meaning in
+  this protocol; the reference relay sends none.
+
+A client:
+
+- sends a frame, normally HELLO, as soon as the connection opens;
+- answers pings;
+- on any close or error, reconnects with exponential backoff and jitter, and
+  sends HELLO on each new connection. Frames sent while disconnected are lost,
+  as on UDP; Channels retransmit;
+- treats every frame on the connection as coming from one peer, the server's
+  address. Through a relay that address stands for every other member of the
+  band (§10); at a terminating endpoint it is the endpoint.
+
+**Caveat (the reason §9.6 exists):** WebSocket runs over TCP. A lossy Stream
+(§5) carried over TCP is silently turned reliable and in-order — a single lost
+segment head-of-line-blocks every Channel and Stream multiplexed on that socket,
+and "drop the late frame" (§5.2) becomes "retransmit the frame you wanted
+dropped." Acceptable on a LAN with near-zero loss; pathological for real-time
+video over a lossy path. Prefer §9.6 WebTransport whenever the client supports
+it; fall back to §9.3 only when it does not.
 
 ### 9.4 AF_UNIX (v1.1)
 
@@ -897,6 +929,9 @@ authenticates the *transport* with TLS (public CA cert), or, for direct
 host-terminated WebTransport with a self-signed cert, via the browser
 `serverCertificateHashes` mechanism (ECDSA P-256, validity ≤ 14 days —
 a browser constraint, not ours).
+
+A terminating endpoint (§10.2) may serve WebTransport with the same carrier
+mapping; this addendum does not specify it further.
 
 **Channel-type → WebTransport mapping:**
 

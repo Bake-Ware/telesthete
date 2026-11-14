@@ -42,7 +42,8 @@ class Band:
         bind_port: int = 9999,
         capabilities: Optional[List[str]] = None,
         ciphers: Optional[List[str]] = None,
-        session_epoch: Optional[int] = None
+        session_epoch: Optional[int] = None,
+        transport=None
     ):
         """
         Initialize a Band
@@ -55,6 +56,11 @@ class Band:
             capabilities: capability strings to advertise (SPEC §12.5)
             ciphers: ordered AEAD preference list (SPEC §3.5); baseline is
                 always included
+            transport: an object to use instead of building a UDPTransport
+                (bind_address and bind_port are then ignored). It provides
+                start(), async run(), async stop(), register_handler(),
+                send() and local_address, as UDPTransport does; for example
+                telesthete.transport.websocket.WebSocketTransport (§9.3)
         """
         self.psk = psk
         self.hostname = hostname or socket.gethostname()
@@ -94,7 +100,14 @@ class Band:
             else int(time.time() * 1000))
 
         # Transport
-        self.transport = UDPTransport(bind_address, bind_port)
+        if transport is None:
+            self.transport = UDPTransport(bind_address, bind_port)
+        else:
+            self.transport = transport
+            # A connection-oriented transport (WebSocket, §9.3) calls this
+            # after each (re)connect so HELLO is the connection's first frame.
+            if hasattr(transport, "on_connected"):
+                transport.on_connected = self._on_transport_connected
 
         # Control channel (per-peer negotiated cipher resolver). Restart of a
         # peer (new session epoch) rebases that peer's Stream watermarks too.
@@ -512,6 +525,11 @@ class Band:
                                 capabilities=self.capabilities, ciphers=self.ciphers,
                                 session=self.session_epoch)
         logger.info(f"Connecting to peer at {peer_addr}")
+
+    def _on_transport_connected(self):
+        """The transport (re)connected to its server: send HELLO to it at
+        once, so the server learns the band from this frame (SPEC §9.3)."""
+        self.connect_peer(*self.transport.peer_address)
 
     def get_peers(self) -> List[Peer]:
         """Get list of connected peers"""

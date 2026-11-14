@@ -112,6 +112,15 @@ To build it yourself instead: `cd rust && cargo build --release -p telesthitium`
 
 ## Changelog
 
+### Unreleased
+
+- **WebSocket client (SPEC §9.3).** `Band(..., transport=)` runs a Band over
+  a transport other than its own UDP socket.
+  `telesthete.transport.websocket.WebSocketTransport(url)` connects to a relay
+  or terminating endpoint: one frame per binary message, HELLO on every
+  (re)connect, reconnection with backoff and jitter. Needs the optional
+  extra, `pip install telesthete[ws]`.
+
 ### 0.3.0 (unreleased)
 
 - **Addressed hub routing (SPEC §10.1).** New channel types `ROUTE` (0x05)
