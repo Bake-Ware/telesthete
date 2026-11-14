@@ -302,6 +302,25 @@ async def test_target_lost_after_silence_is_hello_again(net, bands, monkeypatch)
     assert await until(lambda: B in a.peers, 3.0)
 
 
+async def test_target_sending_only_unauthenticated_frames_is_lost(net, bands, monkeypatch):
+    # §4.11 step 3 counts authenticated arrivals only. Frames from the
+    # target's address that fail authentication (for example a restarted
+    # peer's, under an epoch we do not know) do not keep it alive.
+    monkeypatch.setattr(band_mod, "_PEER_TIMEOUT", 0.6)
+    a = make(bands, A, 1000, reconnect=True)
+    b = make(bands, B, 2000)
+    await a.start(); await b.start()
+    await connected(a, A, b, B)
+    net.partitioned = True
+    junk = pack_packet(a.band_id, ChannelType.CHANNEL, 0, 1, os.urandom(40))
+    mark = time.monotonic()
+    while B in a.peers and time.monotonic() - mark < 2.0:
+        net._deliver(B, A, junk)
+        await asyncio.sleep(0.05)
+    assert B not in a.peers
+    assert any(is_hello(p) for p in net.sent(A, B, since=mark))
+
+
 # ------------------------------------- condition 4: restarted peer reopens
 
 @pytest.mark.parametrize("reconnect", [False, True])

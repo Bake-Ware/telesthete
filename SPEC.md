@@ -397,6 +397,25 @@ deliberate, minimal substitute — the application closes the loop the
 transport intentionally leaves open. Honored only with the `rate-hint`
 capability (§12.5).
 
+### 4.11 Reconnection (optional)
+
+A peer that implements reconnection:
+
+1. Treats every address it was asked to connect to as a *target* for as long as
+   the band runs.
+2. Until it has received a HELLO or HELLO_ACK from a target, resends HELLO to it
+   after 0.5 s, 1 s, 2 s, 4 s and then every `KEEPALIVE_INTERVAL`. Each resend
+   is a new packet under a fresh sequence, carrying the same session epoch.
+3. Considers a target lost when nothing authenticated has arrived from it for
+   `PEER_TIMEOUT`; evicts it as §4.5 says and resumes step 2.
+4. On receiving, from any peer, a HELLO or HELLO_ACK with a newer session epoch
+   (§4.3), or a GOODBYE, resets every Channel it has with that peer (§6.7).
+
+Every peer, with or without reconnection, MUST answer a HELLO with a HELLO_ACK,
+including a repeated HELLO with an epoch equal to the last one seen (the
+reference libraries already do). A HELLO with an older epoch is still ignored
+(§4.3).
+
 ---
 
 ## 5. Stream Channel (type 0x01)
@@ -684,6 +703,46 @@ emit is accepted (reference: `Fragmenter.reassembler()` /
 Streams (§5) do NOT use this envelope; they fragment codec frames with
 the §5.4.1 `FRAGMENT_CONT` flag instead. This envelope is for Channel
 messages only.
+
+### 6.7 Channel lifecycle
+
+(a) **Identity.** A Channel is identified by the pair (peer, `channel_id`). An
+implementation MAY allow a `channel_id` to be used with only one peer at a time
+in a band.
+
+(b) **Accepting.** On receiving a SYN for a `channel_id` it has no Channel for,
+from a peer whose session it knows, a peer MAY create the Channel in CLOSED,
+hand it to the application, and process the SYN (§6.5). A peer that does not
+accept drops the frame.
+
+(c) **Reset.** Resetting a Channel sets it to CLOSED, sets both inner sequences
+to 0, discards queued, unacknowledged, out-of-order and partially reassembled
+data, and stops retransmission. It leaves the §3.3 outer watermark alone. The
+Channel can be opened again (d). A peer resets a Channel when the peer at the
+other end starts a new session or says GOODBYE (§4.11 step 4), when it receives
+RST, and when it gives up retransmitting (g). The application should be told.
+
+(d) **Reopening.** A CLOSED Channel may be opened again. Its SYN uses inner
+sequence 0. A Channel in CLOSED that receives a SYN takes the SYN's sequence as
+the start of the peer's sequence space (expects `seq + 1` next).
+
+(e) **New incarnation.** A Channel in ESTABLISHED or FIN_SENT that receives a
+SYN without ACK, after the peer has acknowledged this side's SYN or SYN+ACK,
+resets (c) and then processes the SYN as in CLOSED. Before that acknowledgement
+the SYN is a retransmission and is answered as before.
+
+(f) **RST.** A peer that receives an authenticated frame carrying data or FIN
+for a Channel it holds in CLOSED, or holds no Channel for, SHOULD answer with
+RST: flags `0x08`, `ack_num` 0, `window` 0, `seq` 0, no data. RST consumes no
+sequence and is never retransmitted. A peer MUST NOT send RST in answer to a
+SYN, a pure ACK, or an RST.
+
+(g) **Giving up.** A sender that stops retransmitting after a bounded number of
+attempts resets the Channel (c) instead of leaving it unusable.
+
+A peer that implements none of (b) to (g) interoperates as before. A peer that
+implements them interoperates with one that does not; the old peer simply does
+not recover where it did not recover before.
 
 ---
 
@@ -1285,6 +1344,8 @@ is used with a peer only if it advertises the matching capability/cipher.
 | `KEYFRAME_REQ` / `RATE_HINT`  | `keyframe-req` / `rate-hint`     |
 | Board (§7) / Drop (§8)        | `board-v1` / `drop-v1`           |
 | Hub addressed routing (§10.1) | none — opt-in by Route declaration + Addressed (0x06) frames; falls back to broadcast. Address only peers that declare (see §10.1 Compatibility). |
+| Reconnection (§4.11) | none — answering a repeated HELLO is already required |
+| Channel lifecycle (§6.7) | none — local reactions; RST is the existing §6.2 flag |
 
 Absent capability ⇒ the sender restricts itself to the baseline the
 feature extends. Unknown capabilities/ciphers are ignored, so the set is
