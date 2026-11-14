@@ -4,7 +4,9 @@ A Band over WebSocketTransport and a Band over UDP join one band through
 `telesthete-hub` (rust/telesthitium) and exchange a 100 KB Channel message
 and a Stream frame both ways. The relay is then killed and restarted on the
 same ports: the WebSocket Band reconnects, sends HELLO, and both exchanges
-work again. Last, the same over native WSS with a self-signed certificate
+work again. With `reconnect=True` (section 6.2's example), the relay is
+killed while Channel messages are in flight, and they arrive once it is
+back. Last, the same over native WSS with a self-signed certificate
 trusted through an explicit ssl.SSLContext.
 
 The relay is built with cargo; the tests skip when cargo is unavailable.
@@ -86,6 +88,12 @@ class Relay:
                     raise RuntimeError("relay did not start")
                 await asyncio.sleep(0.05)
         await asyncio.sleep(0.2)   # the UDP task binds alongside the WS one
+
+    def kill(self):
+        """SIGKILL: no orderly close of connections."""
+        self.proc.kill()
+        self.proc.wait()
+        self.proc = None
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
@@ -172,11 +180,12 @@ async def _exchange(ws_side, udp_side, tag):
     assert await ws_side.channel.recv_message(timeout=15) == udp_msg
 
 
-async def _setup(relay, url, ssl_ctx=None):
+async def _setup(relay, url, ssl_ctx=None, reconnect=False):
     ws = WebSocketTransport(url, ssl=ssl_ctx)
-    ws_band = Band(psk=PSK, hostname="ws-peer", transport=ws)
+    ws_band = Band(psk=PSK, hostname="ws-peer", transport=ws,
+                   reconnect=reconnect)
     udp_band = Band(psk=PSK, hostname="udp-peer", bind_address="127.0.0.1",
-                    bind_port=0)
+                    bind_port=0, reconnect=reconnect)
     ws_side = Side(ws_band, ws.peer_address)
     udp_side = Side(udp_band, ("127.0.0.1", relay.udp_port))
     await ws_band.start()
@@ -224,6 +233,47 @@ async def test_ws_client_reconnects_after_relay_restart():
         assert ws.local_address != first_local, "a new connection"
 
         await _linked(ws_side, udp_side)
+        await _exchange(ws_side, udp_side, "after")
+    finally:
+        for side in (ws_side, udp_side):
+            if side is not None:
+                await side.band.stop()
+        relay.stop()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_band_channel_recovers_after_relay_killed():
+    # Section 6.2's example and section 6.5: Band(psk, transport=ws,
+    # reconnect=True). The relay is killed (SIGKILL) while a 100 KB Channel
+    # message is in flight each way, and restarted on the same ports. The
+    # test does nothing to help: the WebSocket Band reconnects and sends
+    # HELLO, the sessions survive (no epoch changed, section 7.3), and the
+    # Channels deliver both messages by retransmission without a reset.
+    relay = Relay(_build_relay())
+    await relay.start()
+    ws_side = udp_side = None
+    try:
+        ws, ws_side, udp_side = await _setup(
+            relay, f"ws://127.0.0.1:{relay.ws_port}/band", reconnect=True)
+        await _exchange(ws_side, udp_side, "before")
+        resets = []
+        for side in (ws_side, udp_side):
+            side.channel.on_reset(resets.append)
+        first_local = ws.local_address
+
+        relay.kill()
+        await _until(lambda: ws.local_address is None, 5, "ws to notice the kill")
+        ws_msg, udp_msg = b"during W" + BIG, b"during U" + BIG
+        ws_side.channel.send_message(ws_msg)
+        udp_side.channel.send_message(udp_msg)
+
+        await relay.start()
+        assert await udp_side.channel.recv_message(timeout=10) == ws_msg
+        assert await ws_side.channel.recv_message(timeout=10) == udp_msg
+        assert ws.local_address not in (None, first_local), "a new connection"
+        assert resets == []
+        assert ws_side.channel.state == udp_side.channel.state == "ESTABLISHED"
+
         await _exchange(ws_side, udp_side, "after")
     finally:
         for side in (ws_side, udp_side):
