@@ -1523,6 +1523,109 @@ alternative that was not chosen.
     epoch (§4.3). Taken by the reviewer, 13 Nov 2026.
     *Not chosen:* leave it, and Rust does not meet the §3.3 SHOULD.
 
+### Decided in implementation review, unsigned
+
+The reviewer took the decisions below, without Bake's signature, while
+approving this design (R1, R2) and while reviewing and merging pull requests 18
+to 21. Each line can be struck on its own, and a struck line is changed by a
+later pull request.
+
+- **R1.** Decisions 1 to 8 and 11 above, taken as the design recommended; 11
+  places the Rust GOODBYE fix in pull request 1b, not yet built. Decision 9
+  stays open. *Alternatives:* as listed under each decision. Pull request 17,
+  under Bake's delegation ("Review and approve it your self").
+- **R2.** Decision 10, the epoch floor not adopted, was taken against the
+  design's recommendation. *Alternative on the table:* revision 2's
+  recommendation, to keep the floor as optional text, off by default in
+  `Endpoint`. Pull request 17.
+- **R3.** SPEC.md was merged citing two sections it did not yet have: §4.11
+  in the §2 Control row and §12.6 in the §12.2 ESP32 row. §4.11 arrived with
+  pull request 20; §12.6 is still missing on main and arrives with pull
+  request 5. *Alternative on the table:* move the §2 edit into pull request 1a
+  and the ESP32 row into pull request 5. Pull request 18, merged with this item
+  under Needs Bake and no recorded answer.
+- **R4.** A CLOSED Channel takes a SYN's sequence as the start of the peer's
+  sequence space whether or not `reconnect` is on (§6.7 (d), second sentence).
+  Section 7.2 states this for Python. *Alternative:* only with `reconnect` on,
+  as for the rest of §6.7 (decision 2). Pull request 20.
+- **R5.** `ResetReason` is a `str` `Enum` in `telesthete.protocol.channel`
+  with `PEER_RESTARTED`, `PEER_LEFT`, `PEER_RESET` and `PEER_UNRESPONSIVE`,
+  whose values are `"peer_restarted"` and so on. It is not exported from the
+  package (`telesthete.__all__`). The design names `on_reset(cb(reason))` but
+  not the type. *Alternative:* none named. Pull request 20.
+- **R6.** `Channel.on_reset` fires only when a reset ends a channel that was
+  not already CLOSED. An RST to a CLOSED channel, or a newer epoch while it is
+  CLOSED, resets it without telling the application. *Alternative:* fire on
+  every reset. Pull request 20.
+- **R7.** A peer that reopens a channel (§6.7 (e)) is reported as
+  `PEER_RESET`. None of the four reasons is specific to it. *Alternative:* none
+  named. Pull request 20.
+- **R8.** With `reconnect` on, a Channel in SYN_SENT takes a SYN+ACK's
+  sequence as the start of the peer's space, as Rust does. §6.7 (d) states
+  this only for a responder in CLOSED; the reviewer decided that the
+  conformance pull request (row 5) states it in §6.7 (d). *Alternative:* do not
+  take the SYN+ACK's sequence. Pull request 20.
+- **R9.** A WebSocket client Band sends HELLO on every new connection whether
+  or not `reconnect` is on. Section 6.2 says the connected hook sends HELLO
+  "when the Band has `reconnect=True`". *Alternative on the table:* add the
+  `reconnect` condition once pull request 20 had landed. Pull request 19.
+- **R10.** The WebSocket reconnect delay goes back to `reconnect_min` only
+  after a connection has delivered a frame (a binary message of at least 43
+  bytes). A connection that ends before that counts as a failure, and the delay
+  keeps doubling. The reviewer asked for this; section 6.2 says only
+  "`reconnect_min` doubling to `reconnect_max`". *Alternative:* the delay goes
+  back to `reconnect_min` after every connection that opens, as the pull
+  request first had it. Pull request 19.
+- **R11.** The WebSocket client offers no compression extension
+  (`compression=None`) and sends no pings of its own (`ping_interval=None`).
+  *Alternative:* none named. Pull request 19, listed under "Choices I made".
+- **R12.** The `ws` extra requires `websockets>=13.0`. *Alternative:* none
+  named. Pull request 19, listed under "Choices I made".
+- **R13.** The §4.11 step 2 HELLO delays (0.5, 1, 2, 4 s) are gaps between
+  resends: resends go out 0.5, 1.5, 3.5 and 7.5 s after the first HELLO, then
+  every 5 s. *Alternative:* none named. Pull request 20, listed under "Choices
+  I made".
+- **R14.** An `on_channel` callback that raises is logged, and the SYN is
+  still processed. *Alternative:* none named. Pull request 20, listed under
+  "Choices I made".
+- **R15.** `Endpoint`: a full receive queue is counted in `dropped_full`, an
+  int beside `dropped_unknown`. §5.3 says "drops and counts when full" but names
+  no counter. *Alternative:* none named. Pull request 21.
+- **R16.** `Endpoint`: the receive queue holds 1,024 frames, set by the module
+  constant `RECEIVE_QUEUE_FRAMES`. *Alternative on the table:* a constructor
+  argument. Pull request 21.
+- **R17.** `Endpoint.stop()` sends GOODBYE for every key, because it calls
+  `Band.stop()`. Peers then reset at once instead of after `PEER_TIMEOUT`.
+  *Alternative on the table:* stop silently, as `remove_key` does. Pull request
+  21.
+- **R18.** `Endpoint`: a key's Band sends only to `Endpoint.PEER`. Frames it
+  addresses anywhere else, for example after `band.connect_peer(other)`, are
+  dropped. *Alternative:* none named. Pull request 21.
+- **R19.** `Endpoint.close_path` also drops frames from that path that are
+  still queued. §5.3 leaves this open. *Alternative:* none named. Pull request
+  21.
+- **R20.** `Endpoint.connect` with an unknown `band_id` raises `KeyError`.
+  *Alternative:* none named. Pull request 21.
+- **R21.** `Endpoint` calls come from the event loop's thread only, as the
+  class docstring states; `receive` is not thread-safe. *Alternative:* none
+  named. Pull request 21.
+- **R22.** A `send` callback that raises is caught and logged, and its frame
+  is dropped. *Alternative:* none named. Pull request 21.
+- **R23.** In UDP mode the `Endpoint` binds one socket, by default on
+  `0.0.0.0`. On a multi-homed host it may then answer from an address other
+  than the one the peer sent to, against the §5.2 MUST. The decision was to
+  document "bind a specific address on a multi-homed host" instead of building
+  it; no file on main documents it yet. *Alternative on the table:*
+  `IP_PKTINFO` or a socket per address. Pull request 21.
+- **R24.** There is no public way to read a key's current path, and no
+  `Endpoint.local_address`. *Alternative:* none named. Pull request 21.
+- **R25.** UDP mode sets no `SO_REUSEADDR` on its socket; `UDPTransport` sets
+  it. *Alternative:* none named. Pull request 21, listed under "Choices I made".
+- **R26.** An `Endpoint` is started once: `stop()` then `start()` on the same
+  `Endpoint` does not recover, as with a `Band` on main. The reviewer decided
+  that the conformance pull request (row 5) says so. *Alternative:* none named.
+  Pull request 21, in the review comment that merged it.
+
 ---
 
 ## 12. Implementation plan
