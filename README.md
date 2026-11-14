@@ -83,11 +83,11 @@ HUB_BIND=0.0.0.0:7474 telesthete-hub     # UDP relay on 7474 (the default)
 
 The relay is configured entirely by environment variables: `HUB_BIND`
 (UDP, default `0.0.0.0:7474`, `off` to disable), `HUB_PEER_TTL_SECS` (default
-15; raise it to 60 for Rook, whose peers keep alive every 20 s),
+15; raise it to about three keepalive intervals if your peers keep alive less
+often than every 5 s),
 `HUB_PRUNE_SECS`, `HUB_WS_BIND`/`HUB_WS_TLS`, `HUB_WT_BIND`, `HUB_UNIX_DIR`,
 `HUB_TLS_CERT`/`HUB_TLS_KEY`, and `RUST_LOG`. It holds no keys and cannot
-decrypt what it relays. [Rook](https://github.com/Bake-Ware/rook)'s hub
-installer and Docker image use these same assets.
+decrypt what it relays.
 
 To build it yourself instead: `cd rust && cargo build --release -p telesthitium`
 (Rust 1.88+); the binary lands in `rust/target/release/telesthete-hub`.
@@ -99,11 +99,14 @@ To build it yourself instead: `cd rust && cargo build --release -p telesthitium`
   The hub relays opaque ciphertext and cannot decrypt.
 - **Channels** — `Stream` (fire-and-forget, prioritized, lossy — HID, audio,
   video), `Channel` (reliable, ordered, TCP-like — files, clipboard), and
-  `Control` (HELLO/keepalive/negotiation). `Board` and `Drop` are reserved.
+  `Control` (HELLO/keepalive/negotiation). `Board` (replicated state) and
+  `Drop` (resumable file transfer).
 - **Capability negotiation** — every HELLO advertises capabilities + an ordered
   cipher preference list; peers select end-to-end (SPEC §3.5, §12.5).
 - **Transports** — UDP (LAN), AF_UNIX (same-host, with dmabuf fd passing),
   WebTransport (preferred for browsers), WebSocket (legacy fallback).
+  (WebSocket and WebTransport are served by the relay; library clients: see
+  PROTOCOL_STATUS.md)
 - **Replay protection** — Control and Stream reject sequences at or below a
   per-peer high-water mark (SPEC §3.3).
 - **Addressed hub routing (optional)** — a peer declares a 16-bit route id
@@ -111,6 +114,14 @@ To build it yourself instead: `cd rust && cargo build --release -p telesthitium`
   delivers only to the declarer; everything else is broadcast (SPEC §10.1).
 
 ## Changelog
+
+### Unreleased
+
+- **Documentation only.** SPEC §3.3 now states that replay protection does
+  not survive a receiver's restart, and what an application must do about it.
+  SPEC §2 no longer calls Control "always reliable". Stale implementation
+  status corrected in SPEC.md, PROTOCOL_STATUS.md, LIBRARY_COMPLETION.md and
+  this README. No code or wire change.
 
 ### 0.3.0 (unreleased)
 
