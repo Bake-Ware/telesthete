@@ -117,6 +117,12 @@ To build it yourself instead: `cd rust && cargo build --release -p telesthitium`
 
 ### Unreleased
 
+- **WebSocket client (SPEC §9.3).** `Band(..., transport=)` runs a Band over
+  a transport other than its own UDP socket.
+  `telesthete.transport.websocket.WebSocketTransport(url)` connects to a relay
+  or terminating endpoint: one frame per binary message, HELLO on every
+  (re)connect, reconnection with backoff and jitter. Needs the optional
+  extra, `pip install telesthete[ws]`.
 - **Documentation only.** SPEC §3.3 now states that replay protection does
   not survive a receiver's restart, and what an application must do about it.
   SPEC §2 no longer calls Control "always reliable". Stale implementation

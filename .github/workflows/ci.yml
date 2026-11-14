@@ -63,7 +63,7 @@ jobs:
         with:
           workspaces: rust -> target
           key: interop
-      - name: Install telesthete with the optional AES suite and test deps
-        run: python -m pip install -e ".[aes]" pytest pytest-asyncio
+      - name: Install telesthete with the optional AES suite, WebSocket client and test deps
+        run: python -m pip install -e ".[aes,ws]" pytest pytest-asyncio
       - name: pytest
         run: python -m pytest -q

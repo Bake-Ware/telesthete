@@ -34,5 +34,7 @@ setup(
     extras_require={
         # Optional AES-256-GCM suite (SPEC §3.2); baseline works without it.
         "aes": ["cryptography>=42.0"],
+        # Optional WebSocket client transport (SPEC §9.3); UDP works without it.
+        "ws": ["websockets>=13.0"],
     },
 )
