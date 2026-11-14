@@ -67,7 +67,7 @@ Big-endian: "!16s B H Q"
 
 | Value | Name      | Semantics                                | Phase |
 |-------|-----------|------------------------------------------|-------|
-| 0x00  | Control   | Band management, signaling. Always reliable. | 1   |
+| 0x00  | Control   | Band management, signaling. Not retransmitted, except that HELLO is retried under §4.11. | 1   |
 | 0x01  | Stream    | Real-time, lossy, prioritized datagrams. | 1     |
 | 0x02  | Channel   | Reliable, ordered byte streams (TCP-over-UDP). | 1  |
 | 0x03  | Board     | Replicated LWW key-value state (§7).     | v1.2  |
@@ -201,6 +201,24 @@ AAD = [channel_type (1B)] [channel_id high byte] [channel_id low byte]
   encrypted under the mandatory baseline key, which an attacker without
   the PSK cannot forge or tamper. Telesthete has no anonymous key
   exchange, so the classic TLS downgrade attacks do not apply.
+- **Receiver restart.** Replay protection holds only while the receiver
+  remembers the peer's session: its epoch (§4.3) and its high-water marks.
+  The data key depends on the sender's epoch alone (§3.1), and HELLO and
+  HELLO_ACK are under the base key. So a receiver that has restarted accepts a
+  replay of a session recorded before the restart, and delivers its messages
+  again. In both directions, and on every channel type. The same is true of a
+  receiver that has forgotten a peer in any other way. Examples: it dropped
+  the peer's state on GOODBYE, or it keys peers by address and the replay
+  comes from a new one. A receiver SHOULD keep a peer's epoch and high-water
+  marks after a GOODBYE or an eviction for as long as it can. Telesthete does
+  not otherwise prevent such a replay. An application whose messages cause
+  actions must therefore do one of two things. It uses a fresh PSK for each
+  session, one that no receiver accepts after it restarts. Or it carries its
+  own freshness, for example unique message ids with an expiry, remembered by
+  the receiver across restarts. This version of the protocol has no
+  protection across a receiver's restart. Closing the gap needs a key
+  derivation to which the receiver contributes, which this version does not
+  have.
 
 ### 3.4 Local crypto profile (v1.1)
 
@@ -970,8 +988,8 @@ rate control is the application's job, via the `RATE_HINT` /
 `KEYFRAME_REQ` loop (§4.9, §4.10). This split is deliberate: bulk
 transfer rides QUIC's loop; latency-critical media rides ours.
 
-Advertise reachability with the `webtransport` capability (§12.5). Not
-yet implemented.
+Advertise reachability with the `webtransport` capability (§12.5). The
+reference relay serves WebTransport; neither reference library has a client.
 
 ---
 
@@ -1036,12 +1054,12 @@ eligible.
 **Addressed frames (0x06).** Addressed traffic uses its own channel type,
 Addressed, whose `channel_id` is the **destination** route id. It is an
 unreliable datagram with an application-defined plaintext (no §6.1 Channel
-header, no reliability); Rook carries one §6.6 chunk per frame. A separate
-type is required because on every other type `channel_id` already means
-something — a Channel *connection* id (§6; Python `Band.channel(id)`, Rust
-`ChannelHub::open(peer, id)`), a stream, board, or drop id — and routing on
-it would black-hole that traffic whenever some peer's route id collided
-with it.
+header, no reliability). An application may carry one §6.6 chunk per
+frame. A separate type is required because on every other type
+`channel_id` already means something — a Channel *connection* id (§6;
+Python `Band.channel(id)`, Rust `ChannelHub::open(peer, id)`), a stream,
+board, or drop id — and routing on it would black-hole that traffic
+whenever some peer's route id collided with it.
 
 **Delivery.** For a frame from peer *S* in band *B*, a *declarer* of id *X*
 is a peer in *B*, other than *S*, that is currently eligible and declared
@@ -1080,26 +1098,26 @@ Addressed frame reaches a non-declaring peer only by broadcast fallback,
 and only if that peer accepts the type at all (see Compatibility).
 Addressed frames are sealed with the spec AAD `[0x06, id_hi, id_lo]`, so a
 rewritten destination fails authentication; a deployment whose receivers
-authenticate with empty AAD (the Rook profile) seals them with empty AAD
+authenticate with empty AAD seals them with empty AAD
 instead (Python `route.pack_addressed(..., associated_data=b"")`).
 
 **Compatibility.** Addressed routing is opt-in and needs no capability bit.
-"Old" below means the receivers deployed before this addendum (Rook
-`9f0d6df`); the hub column is a hub without §10.1, which relays every type
+"Old" below means receivers deployed before this addendum; the hub column is
+a hub without §10.1, which relays every type
 to every peer.
 
 | Receiver | Route (0x05) relayed by an old hub | Addressed (0x06) frame |
 |----------|------------------------------------|------------------------|
 | Spec peer (Python `Band`, Rust `Band`) | dropped: no handler (§2) | dropped unless the application registers a handler |
-| Rook worker transport (Python, empty AAD) | dropped: decrypts with empty AAD, Route is sealed with spec AAD → auth failure | **accepted** when sealed with empty AAD: it ignores `channel_type` and reports `channel_id` as the peer tuple, which nothing reads |
+| Application transport (Python, empty AAD) | dropped: decrypts with empty AAD, Route is sealed with spec AAD → auth failure | **accepted** when sealed with empty AAD: it ignores `channel_type` and reports `channel_id` as the peer tuple, which nothing reads |
 | ESP32 firmware (empty AAD) | dropped: auth failure | **accepted** when sealed with empty AAD: it ignores `channel_type` and `channel_id`; only single-chunk (`total = 1`) messages, as for any frame |
-| Rook TS/Rust example ports | dropped: `type != 0x02` | **dropped**: they accept only `channel_type == 0x02` |
+| Application example ports (TypeScript, Rust) | dropped: `type != 0x02` | **dropped**: they accept only `channel_type == 0x02` |
 
 - *Old peer ↔ routing hub.* A peer that never declares gets broadcast
   delivery of everything except Addressed frames for an id an eligible peer
   declared — which were never for it. Channel (0x02) traffic is never
-  routed by id, so library Channels and the Rook transport (which sends
-  `channel_id = 0`) see byte-for-byte the old behaviour.
+  routed by id, so library Channels and application transports that send
+  `channel_id = 0` see byte-for-byte the old behaviour.
 - *Routing peer ↔ old hub.* The old hub relays Route frames to everyone
   (dropped as above) and broadcasts Addressed frames, so every receiver
   that accepts the type gets them — the addressee included — and there is
@@ -1135,7 +1153,7 @@ None of this affects confidentiality or integrity: payloads are AEAD-sealed
 exactly as before and receivers authenticate exactly as before. It adds no
 capability against anyone who could already forge or rewrite headers on
 path (who could drop or redirect any frame). Mitigations: peers re-declare
-on a short interval (the Rook transport: every keepalive); senders treat
+on a short interval (for example with every keepalive); senders treat
 addressed delivery as best-effort and keep application-level retries; the
 hub ignores declarations from unvalidated sources and never lets a
 declaration route a frame to nobody; and the payload's own addressing (the
@@ -1154,7 +1172,7 @@ field of Channel and Stream payloads.
 
 ```
 ┌──────────────────────────────────────────────┐
-│ Application (Rook, KVM, GPU surface stream)  │
+│ Application (KVM, GPU surface stream, …)     │
 ├──────────────────────────────────────────────┤
 │ Telesthete Channel / Stream                  │
 │ (reliability, ordering, priority)            │
@@ -1173,22 +1191,21 @@ WebSocket. A browser dashboard is a first-class peer — it speaks the
 same frame over §9.6 WebTransport and decodes §5.4 codec Streams with
 WebCodecs (§5.5). No gateway transcode, no second protocol.
 
-### 11.1 Rook Protocol
+### 11.1 Application protocols
 
-Rook's agent protocol uses msgpack-encoded messages inside Telesthete payloads.
-Reliable messages (commands, events, chat, registration) use Channels.
-Real-time modality data (audio, video, sensor feeds) uses Streams.
-
-See the Rook repository for the full Rook application protocol spec.
+An application defines its own messages and carries them in Telesthete
+payloads. Requests, replies and anything else that must arrive belong on a
+Channel (§6), one application message per Channel message (§6.6 keeps the
+boundary). Real-time data that may be dropped belongs on Streams (§5).
 
 ---
 
 ## 12. Cross-Language Implementation Guide
 
-The wire format is the spec. The Python library is the original
-reference implementation; the Rust crate under `rust/telesthete` is
-the v1.1 reference implementation (adds AF_UNIX, dmabuf, capability
-negotiation). Any language can implement a conformant peer.
+The wire format is the spec. The Python package and the Rust crate are
+both v1.2 reference implementations, pinned to each other by
+`tests/vectors.json`. `rust/telesthitium` is the reference relay (§10).
+Any language can implement a conformant peer.
 
 ### 12.1 Minimal Client Requirements
 
@@ -1210,10 +1227,10 @@ peer.
 
 | Platform        | Transport          | Est. LOC | Notes                        |
 |-----------------|--------------------|----------|------------------------------|
-| Python (ref)    | UDP + AF_UNIX + asyncio | ~3000 | Full library                 |
-| Rust (ref v1.1) | UDP + AF_UNIX + tokio | ~3000 | Full library, dmabuf, fds    |
+| Python (ref)    | UDP + AF_UNIX + asyncio | ≈ 4,300 | Full library               |
+| Rust (ref v1.1) | UDP + AF_UNIX + tokio | ≈ 8,300 | Full library, dmabuf, fds  |
 | Kotlin/Android  | OkHttp WebSocket   | ~500     | Stream + Control only        |
-| ESP32/C         | WebSocket          | ~300     | Stream + Control only        |
+| ESP32/C         | UDP or WebSocket   | ≈ 1,100  | Link profile (§12.6)         |
 | Browser/JS      | Native WebSocket   | ~200     | Stream + Control only        |
 | Browser/JS      | WebTransport       | ~300     | Stream (datagrams) + Channel (streams) + Control; pairs with WebCodecs for video (§5.5) |
 
@@ -1256,7 +1273,7 @@ ROUTE_ID_DOMAIN    = "telesthete-route-v1:"   (v1.2 §10.1; route_id derivation)
 
 v1.2 is a breaking wire revision: capability announce and cipher
 negotiation are mandatory, so there is no v1.0/v1.1 fallback. The only
-deployed consumer (Rook) is upgraded in lockstep. Feature compatibility
+deployed consumer at the time was upgraded in lockstep. Feature compatibility
 *within* v1.2 is handled per-peer by capabilities (§12.5), not by version
 fallback.
 
@@ -1292,7 +1309,7 @@ Selection follows §3.5. Cipher is a separate ordered field, not a
 capability string, because preference order is significant.
 
 Codec selection (H.264 / HEVC / AV1) for §5.4 codec Streams is **not** a
-capability — it is negotiated by the application (Rook, KVM) via
+capability — it is negotiated by the application via
 `METACONTROL` (§4.7) or out of band, so the transport stays codec-
 agnostic. `webtransport` advertises reachability only; a peer may speak
 WebTransport and UDP simultaneously and the sender picks per §9.5-style
@@ -1320,6 +1337,7 @@ is used with a peer only if it advertises the matching capability/cipher.
 | `KEYFRAME_REQ` / `RATE_HINT`  | `keyframe-req` / `rate-hint`     |
 | Board (§7) / Drop (§8)        | `board-v1` / `drop-v1`           |
 | Hub addressed routing (§10.1) | none — opt-in by Route declaration + Addressed (0x06) frames; falls back to broadcast. Address only peers that declare (see §10.1 Compatibility). |
+| Receiver-restart note (§3.3) | none — it states a limit; nothing is sent differently |
 
 Absent capability ⇒ the sender restricts itself to the baseline the
 feature extends. Unknown capabilities/ciphers are ignored, so the set is
@@ -1384,5 +1402,5 @@ in every libsodium binding, Go `x/crypto`, Node `crypto`,
 |---------|------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | 1.0     | 2026-04-07 | Initial spec from Python reference implementation.                                                                                                                                                                     |
 | 1.1     | 2026-05-11 | Added §3.4 local crypto profile, §5.4 StreamHeader + dmabuf descriptor (capability-gated), §9.4 AF_UNIX transport, §9.5 send-loop priority across transports, §12.5 capability negotiation. `PROTOCOL_VERSION` → 2. Backwards-compatible: v1.0 peers continue to interoperate. |
-| 1.2     | 2026-06-30 | **Breaking wire revision** (collapsed into 1.2 — pre-adoption, sole consumer Rook upgraded in lockstep; no version spam). **Browser/edge:** §9.6 WebTransport (Stream→datagrams, Channel/Control→reliable QUIC streams, length-prefixed), §5.5 WebCodecs decode of §5.4 codec Streams, §4.9 `KEYFRAME_REQ` + §4.10 `RATE_HINT`, §9.3 TCP head-of-line caveat. **Crypto remediation:** AEAD is now a negotiated suite — ChaCha20-Poly1305 (IETF) mandatory baseline + AES-256-GCM optional (§3.2); 12-byte nonce (was 24); per-cipher key derivation (§3.1); real AEAD AAD (the pre-v1.2 Python reference wrongly used XSalsa20/`SecretBox` with AAD prepended — non-interoperable with the spec/Rust). **Capability announce is now foundational/mandatory** with an ordered `ciphers` list and end-to-end cipher negotiation (§3.5, §4.3, §12.5). Replay protection §3.3 SHOULD→MUST. Rook's Channel fragmentation envelope promoted to §6.6. **§6 Channel:** inner per-channel `seq` field added to §6.1 — the outer packet sequence is the AEAD nonce from the one shared per-session `SequenceSource` (§3.3) and is not contiguous per channel; reliability (acks, ordering, retransmits, dedup) tracks the inner `seq`, and retransmissions re-encrypt under a fresh outer sequence. **§7 Board / §8 Drop** specified (were "Future"): Board is a last-writer-wins replicated map with Lamport-clock timestamps and digest-driven anti-entropy; Drop is receiver-driven chunked, resumable file distribution; capabilities `board-v1`/`drop-v1`. Version fields reconciled to one `PROTOCOL_VERSION` (= 3; 1.0→1, 1.1→2, 1.2→3). |
+| 1.2     | 2026-06-30 | **Breaking wire revision** (collapsed into 1.2 — pre-adoption, sole consumer upgraded in lockstep; no version spam). **Browser/edge:** §9.6 WebTransport (Stream→datagrams, Channel/Control→reliable QUIC streams, length-prefixed), §5.5 WebCodecs decode of §5.4 codec Streams, §4.9 `KEYFRAME_REQ` + §4.10 `RATE_HINT`, §9.3 TCP head-of-line caveat. **Crypto remediation:** AEAD is now a negotiated suite — ChaCha20-Poly1305 (IETF) mandatory baseline + AES-256-GCM optional (§3.2); 12-byte nonce (was 24); per-cipher key derivation (§3.1); real AEAD AAD (the pre-v1.2 Python reference wrongly used XSalsa20/`SecretBox` with AAD prepended — non-interoperable with the spec/Rust). **Capability announce is now foundational/mandatory** with an ordered `ciphers` list and end-to-end cipher negotiation (§3.5, §4.3, §12.5). Replay protection §3.3 SHOULD→MUST. An application's Channel fragmentation envelope promoted to §6.6. **§6 Channel:** inner per-channel `seq` field added to §6.1 — the outer packet sequence is the AEAD nonce from the one shared per-session `SequenceSource` (§3.3) and is not contiguous per channel; reliability (acks, ordering, retransmits, dedup) tracks the inner `seq`, and retransmissions re-encrypt under a fresh outer sequence. **§7 Board / §8 Drop** specified (were "Future"): Board is a last-writer-wins replicated map with Lamport-clock timestamps and digest-driven anti-entropy; Drop is receiver-driven chunked, resumable file distribution; capabilities `board-v1`/`drop-v1`. Version fields reconciled to one `PROTOCOL_VERSION` (= 3; 1.0→1, 1.1→2, 1.2→3). |
 | 1.2 (addendum) | 2026-10-12 | **Additive, wire-compatible; `PROTOCOL_VERSION` stays 3.** §10.1 optional hub addressed routing: new channel types Route (0x05), which declares a peer's 16-bit route id (`route_id = first nonzero BE u16 of SHA-256("telesthete-route-v1:" ‖ name)`), and Addressed (0x06), an application datagram whose `channel_id` is the destination route id. A routing hub consumes Route and delivers Addressed frames only to the eligible peers that declared the id, broadcasting everything else — Channel (0x02) included — as before. §10.1 documents the receiver compatibility matrix and the targeted-denial exposure of unauthenticated declarations. §6.6 reassembly hardening guidance (per-chunk cap, declared-`total` cap, optional byte budget, evicted-id memory). |
