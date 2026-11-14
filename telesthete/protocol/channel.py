@@ -13,6 +13,7 @@ import struct
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Callable, Dict, Optional
 
 from .framing import pack_packet, unpack_packet, ChannelType
@@ -45,6 +46,14 @@ MAX_RETRIES = 10         # give up on a frame after this many RTOs (dead peer)
 _FIN_SENTINEL = object()
 
 
+class ResetReason(str, Enum):
+    """Why a Channel was reset (SPEC §6.7 (c)); passed to `on_reset`."""
+    PEER_RESTARTED = "peer_restarted"        # the peer started a new session (§4.11 step 4)
+    PEER_LEFT = "peer_left"                  # the peer said GOODBYE (§4.11 step 4)
+    PEER_RESET = "peer_reset"                # RST, or the peer reopened the channel (§6.7 (e), (f))
+    PEER_UNRESPONSIVE = "peer_unresponsive"  # gave up retransmitting (§6.7 (g))
+
+
 def pack_frame(flags: int, ack_num: int, window: int, seq: int,
                data: bytes = b"") -> bytes:
     """Pack a §6.1 Channel plaintext frame (the AEAD plaintext)."""
@@ -61,6 +70,15 @@ def unpack_frame(payload: bytes):
     if flags & _RESERVED_FLAGS:
         return None
     return flags, ack_num, window, seq, payload[FRAME_HEADER_LEN:]
+
+
+def rst_packet(band_id: bytes, channel_id: int, outer_seq: int, crypto) -> bytes:
+    """An RST for `channel_id` (SPEC §6.7 (f)): flags 0x08, ack_num 0,
+    window 0, seq 0, no data, under outer sequence `outer_seq`."""
+    aad = bytes([ChannelType.CHANNEL, channel_id >> 8, channel_id & 0xFF])
+    ciphertext = crypto.encrypt(outer_seq, pack_frame(FLAG_RST, 0, 0, 0), aad)
+    return pack_packet(band_id, ChannelType.CHANNEL, channel_id, outer_seq,
+                       ciphertext)
 
 
 @dataclass
@@ -181,12 +199,29 @@ class Channel:
         self._msg_queue: deque = deque()
         self._msg_ready = asyncio.Event()
 
+        # SPEC §6.7 (c)-(g): reset, reopen at inner seq 0, new incarnation,
+        # RST and give-up. Switched on by a Band with reconnect=True.
+        # Without it the channel behaves as before, except that a CLOSED
+        # channel always takes a SYN's seq as the start (§6.7 (d)).
+        self._lifecycle = False
+        self._on_reset: Optional[Callable[[ResetReason], None]] = None
+
     # ------------------------------------------------------------------ API
+
+    @property
+    def state(self) -> str:
+        """The §6.5 state: "CLOSED", "SYN_SENT", "ESTABLISHED" or "FIN_SENT"."""
+        return self._state
 
     async def open(self):
         """Open the channel: send SYN (§6.3) and start the retransmit task."""
         if self._state != "CLOSED":
             raise RuntimeError(f"Channel already open (state={self._state})")
+        if self._lifecycle:
+            # §6.7 (d): a reopened channel starts afresh; its SYN uses seq 0.
+            self._clear()
+            self._closing = False
+            self._closed.clear()
         self._state = "SYN_SENT"
         # Initial SYN has flags=SYN only (§6.3); it consumes inner seq 0.
         self._transmit_consuming(FLAG_SYN, b"")
@@ -260,6 +295,12 @@ class Channel:
         """Register callback for each reassembled §6.6 message."""
         self._on_message = callback
 
+    def on_reset(self, callback: Callable[[ResetReason], None]):
+        """Register callback(reason) for when the channel is reset (SPEC
+        §6.7 (c)): it is then CLOSED, its unsent and unacknowledged data is
+        discarded, and it can be opened again."""
+        self._on_reset = callback
+
     def reset_peer(self, peer_addr: tuple):
         """Forget the peer's outer-sequence watermark so its next session's
         (fresh, possibly lower) sequences are accepted (SPEC §3.3/§4.3)."""
@@ -309,6 +350,12 @@ class Channel:
         packet = pack_packet(self.band_id, ChannelType.CHANNEL,
                              self.channel_id, outer, ciphertext)
         self.transport.send(self.peer_addr, packet)
+
+    def _send_rst(self):
+        # §6.7 (f): consumes no inner seq and is never retransmitted.
+        self.transport.send(self.peer_addr, rst_packet(
+            self.band_id, self.channel_id, self._seq_source.next(),
+            self._send_crypto(self.peer_addr)))
 
     def _send_ack(self):
         # Pure ACK (§6.1): carries our next unconsumed seq WITHOUT consuming
@@ -363,8 +410,40 @@ class Channel:
 
         if flags & FLAG_RST:
             logger.warning(f"Channel {self.channel_id}: connection reset by peer")
-            self._teardown()
+            if self._lifecycle:
+                self._reset(ResetReason.PEER_RESET)
+            else:
+                self._teardown()
             return
+
+        syn_only = flags & (FLAG_SYN | FLAG_ACK) == FLAG_SYN
+        if (self._lifecycle and syn_only
+                and self._state in ("ESTABLISHED", "FIN_SENT")
+                and not any(f.flags & FLAG_SYN for f in self._send_buffer.values())):
+            # §6.7 (e): the peer has acknowledged our SYN / SYN+ACK, so a new
+            # SYN means it reopened the channel: reset, then take it as CLOSED.
+            self._reset(ResetReason.PEER_RESET)
+
+        if self._state == "CLOSED":
+            if syn_only and seq != self._rcv_next:
+                # §6.7 (d): a CLOSED channel takes the SYN's seq as the start
+                # of the peer's sequence space (always on).
+                self._rcv_next = seq
+                self._recv_buffer.clear()
+            elif (self._lifecycle and not flags & FLAG_SYN
+                  and (data or flags & FLAG_FIN)):
+                # §6.7 (f): data or FIN on a CLOSED channel draws an RST.
+                self._send_rst()
+                return
+        elif (self._lifecycle and self._state == "SYN_SENT"
+              and flags & FLAG_SYN and flags & FLAG_ACK
+              and seq != self._rcv_next):
+            # §6.7 (d): our reopened SYN used seq 0, but a responder that was
+            # closed without a reset answers from its own running sequence.
+            # Take the SYN+ACK's seq as the start, as Rust does.
+            self._rcv_next = seq
+            self._recv_buffer.clear()
+        self._remote_window = window  # again: a reset above restored the default
 
         if flags & FLAG_ACK:
             self._handle_ack(ack_num)
@@ -475,6 +554,34 @@ class Channel:
         self._send_queue.clear()
         self._closed.set()
 
+    def _clear(self):
+        # §6.7 (c): both inner sequences to 0; queued, unacknowledged,
+        # out-of-order and partially reassembled data discarded. The §3.3
+        # outer watermark is left alone.
+        self._snd_next = 0
+        self._rcv_next = 0
+        self._send_buffer.clear()
+        self._send_queue.clear()
+        self._recv_buffer.clear()
+        self._reassembler = self._fragmenter.reassembler()
+        self._remote_window = DEFAULT_WINDOW
+
+    def _reset(self, reason: ResetReason):
+        """SPEC §6.7 (c). The channel stays usable: it can be opened again.
+        The application is told when the reset ends a live channel."""
+        was_open = self._state != "CLOSED"
+        self._clear()
+        self._state = "CLOSED"
+        self._closing = False
+        self._closed.set()
+        if was_open:
+            logger.info(f"Channel {self.channel_id}: reset ({reason.value})")
+            if self._on_reset:
+                try:
+                    self._on_reset(reason)
+                except Exception as e:
+                    logger.error(f"Channel {self.channel_id}: reset callback error: {e}")
+
     # --------------------------------------------------------- retransmission
 
     def _ensure_retransmit_task(self):
@@ -507,7 +614,11 @@ class Channel:
                             logger.warning(f"Channel {self.channel_id}: peer "
                                            f"unresponsive after {MAX_RETRIES} "
                                            f"retransmits; tearing down")
-                            self._teardown()
+                            if self._lifecycle:
+                                # §6.7 (g): reset, so it can be reopened.
+                                self._reset(ResetReason.PEER_UNRESPONSIVE)
+                            else:
+                                self._teardown()
                             return
                         frame.retries += 1
                         frame.sent_at = now
