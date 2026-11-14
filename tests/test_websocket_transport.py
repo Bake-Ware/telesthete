@@ -5,7 +5,8 @@ message, HELLO as the connection's first frame and again on each new
 connection, text and short binaries ignored, frames attributed to the
 server's address, no subprotocol or extension offered, pings answered,
 frames sent while disconnected dropped, reconnection with backoff and
-jitter. `Band(transport=)` and the optional extra are checked here too.
+jitter (the delay resets only after a connection delivered a frame).
+`Band(transport=)` and the optional extra are checked here too.
 """
 
 import asyncio
@@ -247,6 +248,73 @@ async def test_backoff_doubles_with_jitter(monkeypatch):
     expected = [0.05, 0.1, 0.2, 0.2, 0.2]
     for gap, exp in zip(gaps, expected):
         assert exp * 0.8 - 0.01 <= gap <= exp * 1.2 + 0.05, (gaps, expected)
+
+
+async def _connection_gaps(behaviour, count):
+    """Run a client against a server that treats every connection with
+    `behaviour(conn)`; return the gaps between the first `count` arrivals."""
+    loop = asyncio.get_running_loop()
+    arrivals = []
+
+    async def handler(conn):
+        arrivals.append(loop.time())
+        await behaviour(conn)
+
+    server = await serve(handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    ws = WebSocketTransport(f"ws://127.0.0.1:{port}/band",
+                            reconnect_min=0.05, reconnect_max=0.4)
+    ws.start()
+    task = asyncio.create_task(ws.run())
+    try:
+        deadline = loop.time() + 10
+        while len(arrivals) < count and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+    finally:
+        await ws.stop()
+        await asyncio.gather(task, return_exceptions=True)
+        server.close()
+        await server.wait_closed()
+    assert len(arrivals) >= count, arrivals
+    return [b - a for a, b in zip(arrivals, arrivals[1:count])]
+
+
+async def _close_at_once(conn):
+    await conn.close()
+
+
+async def _send_oversized(conn):
+    # Over the client's default max_size (1 MiB): it closes with 1009.
+    await conn.send(bytes(2 * 1024 * 1024))
+    await conn.wait_closed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("behaviour", [_close_at_once, _send_oversized],
+                         ids=["closes-at-once", "oversized-message"])
+async def test_connection_without_a_frame_counts_as_failure(behaviour):
+    # The delay goes back to reconnect_min only once a connection has
+    # delivered a frame; until then it keeps doubling to reconnect_max.
+    gaps = await _connection_gaps(behaviour, 6)
+    expected = [0.05, 0.1, 0.2, 0.4, 0.4]
+    for gap, exp in zip(gaps, expected):
+        assert exp * 0.8 - 0.01 <= gap <= exp * 1.2 + 0.1, (gaps, expected)
+
+
+@pytest.mark.asyncio
+async def test_connection_that_delivered_a_frame_retries_after_reconnect_min():
+    frame = bytes(16) + bytes([ChannelType.STREAM]) + bytes(MIN_PACKET_SIZE - 17)
+
+    async def deliver_then_close(conn):
+        await conn.send(frame)
+        await asyncio.sleep(0.05)
+        await conn.close()
+
+    gaps = await _connection_gaps(deliver_then_close, 5)
+    # Each gap is the connection's 0.05 s life plus a reconnect_min retry
+    # (+-20 %), never a doubled delay.
+    for gap in gaps:
+        assert 0.05 + 0.05 * 0.8 - 0.01 <= gap <= 0.05 + 0.05 * 1.2 + 0.1, gaps
 
 
 def test_base_package_works_without_websockets():

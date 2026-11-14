@@ -73,6 +73,10 @@ class WebSocketTransport:
         # so frames sent then are dropped, as UDP loss would drop them.
         self._send_queue: Optional[asyncio.Queue] = None
 
+        # Set once the current connection delivers a frame; only then does
+        # the reconnect delay go back to reconnect_min.
+        self._delivered = False
+
         self._started = False
         self._running = False
         self._run_task: Optional[asyncio.Task] = None
@@ -92,12 +96,12 @@ class WebSocketTransport:
         delay = self.reconnect_min
         try:
             while self._running:
+                self._delivered = False
                 try:
                     async with connect(self.url, ssl=self.ssl,
                                        open_timeout=self.open_timeout,
                                        compression=None,
                                        ping_interval=None) as ws:
-                        delay = self.reconnect_min
                         await self._serve(ws)
                     logger.info(f"WebSocket to {self.url} closed")
                 except asyncio.CancelledError:
@@ -106,6 +110,12 @@ class WebSocketTransport:
                     logger.info(f"WebSocket to {self.url}: {e!r}")
                 if not self._running:
                     break
+                # A connection that delivered a frame had worked: retry soon.
+                # One that ended before delivering any (closed at once, or on
+                # an oversized message) counts as a failure, so the delay
+                # keeps doubling.
+                if self._delivered:
+                    delay = self.reconnect_min
                 await asyncio.sleep(delay * random.uniform(0.8, 1.2))
                 delay = min(delay * 2, self.reconnect_max)
         except asyncio.CancelledError:
@@ -168,6 +178,7 @@ class WebSocketTransport:
             # Text messages and binaries shorter than a frame are ignored.
             if not isinstance(message, bytes) or len(message) < MIN_PACKET_SIZE:
                 continue
+            self._delivered = True
             channel_type = message[16]
             for handler in self._handlers.get(channel_type, []):
                 try:
