@@ -13,7 +13,7 @@ phased roadmap.
 ## Locked decisions
 - **Nonce-reuse fix:** one monotonic sequence counter per sender per band
   (shared across Control/Stream/Channel), **CSPRNG-initialized** (63-bit start,
-  headroom against wrap). Generalizes rook's build-31 fix. Wire-compatible
+  headroom against wrap). Generalizes an earlier application-side fix. Wire-compatible
   (sequence is already an 8-byte cleartext, "monotonic per-sender"). `SPEC.md`
   §3.3 gains the MUST-random-init mandate + the accept-first-then-strict
   watermark rule.
@@ -62,7 +62,8 @@ Re-scoped, with rationale recorded in SPEC/commits:
   queue), so there is nothing to reorder; priority is carried per §5.1.
 - **WSS/WebTransport clients:** §9.3 remains Future; §12.2 scopes these to
   browser/Kotlin/ESP32 clients, not the reference libraries. The hub
-  serves both; the references speak UDP + AF_UNIX.
+  serves both; the references speak UDP + AF_UNIX. Superseded for
+  WebSocket by spec/terminating-endpoints.md §6.
 - **Rust AF_UNIX keeps SOCK_DGRAM for peer-to-peer** (spec-permitted;
   `telesthete-c` + consumer examples depend on the connectionless model)
   and **adds `UnixSeqClient`**, a SOCK_SEQPACKET client — the hub's
